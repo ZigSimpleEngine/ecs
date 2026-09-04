@@ -31,10 +31,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[deinit] allocator status: {s}\n", .{@tagName(status)});
     }
     const allocator = gpa.allocator();
-    const Ecs = ecs.ECS(16, 16);
+    const Ecs = ecs.ECS(16, 16, 64);
     defer Ecs.deinit(allocator);
     std.debug.print("=== 1. ECS namespace =============================\n", .{});
-    std.debug.print("Created ECS(16, 16): {s}\n", .{@typeName(Ecs)});
+    std.debug.print("Created ECS(16, 16, 64): {s}\n", .{@typeName(Ecs)});
     std.debug.print("\n=== 2. isComponent / isArchetype =================\n", .{});
     const Pos = Ecs.Component(Position);
     const Pair = Ecs.Archetype(&[_]type{ Position, Velocity });
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
         Vel,
         Position,
         Pair,
-    });
+    }, 64);
     std.debug.print("normalized count = {d} (dedup + flatten)\n", .{normalized.len});
     const Direct = Ecs.CreateArchetype(&[_]type{Position});
     std.debug.print("CreateArchetype([Pos]) == Archetype([Pos]): {}\n", .{

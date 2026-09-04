@@ -1,6 +1,7 @@
 const std = @import("std");
 /// Builds a read-only view over a standard unmanaged array list.
 /// - `Element` - element type stored in the wrapped list.
+///
 /// Returns `type` - view type exposing only read access to the list.
 pub fn ReadOnlyList(comptime Element: type) type {
     return struct {
@@ -9,6 +10,7 @@ pub fn ReadOnlyList(comptime Element: type) type {
         source: *const std.ArrayListUnmanaged(Element),
         /// Wraps an existing list without copying it.
         /// - `source` - list to observe.
+        ///
         /// Returns `Self` - read-only view bound to the given list.
         pub fn init(source: *const std.ArrayListUnmanaged(Element)) Self {
             return Self{
@@ -17,12 +19,14 @@ pub fn ReadOnlyList(comptime Element: type) type {
         }
         /// Counts stored elements.
         /// - `self` - view to inspect.
+        ///
         /// Returns `usize` - current element count.
         pub fn count(self: *const Self) usize {
             return self.source.items.len;
         }
         /// Exposes the whole backing slice for iteration.
         /// - `self` - view to inspect.
+        ///
         /// Returns `[]const Element` - read-only slice of all elements.
         pub fn items(self: *const Self) []const Element {
             return self.source.items;
@@ -30,6 +34,7 @@ pub fn ReadOnlyList(comptime Element: type) type {
         /// Fetches a single element by position.
         /// - `self` - view to inspect.
         /// - `index` - element position.
+        ///
         /// Returns `?Element` - stored value, or null when out of bounds.
         pub fn get(self: *const Self, index: usize) ?Element {
             if (index >= self.source.items.len) {
@@ -40,6 +45,7 @@ pub fn ReadOnlyList(comptime Element: type) type {
         /// Checks whether a value is stored in the list.
         /// - `self` - view to inspect.
         /// - `target` - value to search for.
+        ///
         /// Returns `bool` - true when an equal element exists.
         pub fn contains(self: *const Self, target: Element) bool {
             for (self.source.items) |current| {
@@ -54,10 +60,13 @@ pub fn ReadOnlyList(comptime Element: type) type {
 /// Builds an isolated Entity Component System namespace.
 /// - `max_archetypes` - per-component cap on tracked archetypes.
 /// - `max_supersets` - per-archetype cap on tracked supersets.
+/// - `max_components` - cap on distinct component types; sizes the id->column maps.
+///
 /// Returns `type` - ECS namespace with its own counters and storage.
 pub fn ECS(
     comptime max_archetypes: u32,
     comptime max_supersets: u32,
+    comptime max_components: usize,
 ) type {
     return struct {
         const Ecs = @This();
@@ -98,6 +107,7 @@ pub fn ECS(
             gen: u8,
             /// Checks whether this id was ever assigned to an entity.
             /// - `self` - reference to inspect.
+            ///
             /// Returns `bool` - true when a record slot exists for the id.
             pub fn exists(self: *const EntityReference) bool {
                 const entity_index: u32 = self.id;
@@ -105,6 +115,7 @@ pub fn ECS(
             }
             /// Checks whether the reference still points at a live entity.
             /// - `self` - reference to inspect.
+            ///
             /// Returns `bool` - true when the slot exists and generations match.
             pub fn isAlive(self: *const EntityReference) bool {
                 if (!self.exists()) {
@@ -116,6 +127,7 @@ pub fn ECS(
             }
             /// Loads the full entity record behind this reference.
             /// - `self` - reference to resolve.
+            ///
             /// Returns `?Entity` - stored record copy, or null when not alive.
             pub fn entity(self: *const EntityReference) ?Entity {
                 if (!self.isAlive()) {
@@ -150,6 +162,7 @@ pub fn ECS(
             /// - `allocator` - funds the destination slot.
             /// - `dest` - archetype receiving the entity.
             /// - `copy` - when true, shared component bytes are carried over.
+            ///
             /// Returns `EntityReference` - refreshed reference with a bumped generation.
             pub fn migrate(
                 self: *const EntityReference,
@@ -202,6 +215,7 @@ pub fn ECS(
             /// Creates an entity inside the given archetype, reusing a free slot when possible.
             /// - `allocator` - funds record and archetype row allocation.
             /// - `dest` - archetype receiving the new entity.
+            ///
             /// Returns `Entity` - freshly stored record copy.
             pub fn create(
                 allocator: std.mem.Allocator,
@@ -255,6 +269,7 @@ pub fn ECS(
             archetype_storage: *const std.ArrayListUnmanaged(*ArchetypeInfo),
             /// Read-only view over archetypes containing this component.
             /// - `self` - descriptor to inspect.
+            ///
             /// Returns `ReadOnlyList` - live view of the archetype list.
             pub fn archetypes(self: *const ComponentInfo) ReadOnlyList(*ArchetypeInfo) {
                 return ReadOnlyList(*ArchetypeInfo).init(self.archetype_storage);
@@ -306,6 +321,8 @@ pub fn ECS(
             id: u32,
             /// Descriptors of the stored component types.
             components: []const *const ComponentInfo,
+            /// id->column map (value = column + 1, 0 = absent). Direct O(1) lookup.
+            component_map: []u32,
             /// Archetypes strictly containing this one. Mutated during registration.
             superset_storage: std.ArrayListUnmanaged(*ArchetypeInfo),
             /// Type-erased pointer to the owned component storage.
@@ -314,12 +331,14 @@ pub fn ECS(
             vtable: *const VTable,
             /// Read-only view over registered superset archetypes.
             /// - `self` - descriptor to inspect.
+            ///
             /// Returns `ReadOnlyList` - live view of the superset list.
             pub fn supersets(self: *const ArchetypeInfo) ReadOnlyList(*ArchetypeInfo) {
                 return ReadOnlyList(*ArchetypeInfo).init(&self.superset_storage);
             }
             /// Counts entities stored in this archetype.
             /// - `self` - descriptor to inspect.
+            ///
             /// Returns `u32` - current row count.
             pub fn count(self: *const ArchetypeInfo) u32 {
                 return self.vtable.count(self.data);
@@ -328,6 +347,7 @@ pub fn ECS(
             /// - `self` - descriptor receiving the row.
             /// - `allocator` - funds row allocation.
             /// - `reference` - handle stored alongside the components.
+            ///
             /// Returns `u32` - position of the new row.
             pub fn add(
                 self: *ArchetypeInfo,
@@ -343,6 +363,7 @@ pub fn ECS(
             /// Removes the row at the given position via swap with the last row.
             /// - `self` - descriptor owning the row.
             /// - `index` - row position to remove.
+            ///
             /// Returns `?EntityReference` - relocated reference, or null when the last row was removed.
             pub fn remove(
                 self: *ArchetypeInfo,
@@ -355,15 +376,28 @@ pub fn ECS(
             }
             /// Checks whether the archetype stores the given component.
             /// - `self` - descriptor to inspect.
+            /// - `id` - component id to look up.
+            ///
+            /// Returns `bool` - true when the component is stored.
+            pub fn containsComponent(self: *const ArchetypeInfo, id: u32) bool {
+                return self.component_map[id] != 0;
+            }
+            /// Maps a component id to its column index inside this archetype.
+            /// - `self` - descriptor to inspect.
+            /// - `id` - component id to look up.
+            ///
+            /// Returns `?usize` - column index, or null when the component is absent.
+            pub fn columnOf(self: *const ArchetypeInfo, id: u32) ?usize {
+                const column: u32 = self.component_map[id];
+                return if (column == 0) null else column - 1;
+            }
+            /// Checks whether the archetype stores the given component.
+            /// - `self` - descriptor to inspect.
             /// - `info` - component descriptor to look up.
+            ///
             /// Returns `bool` - true when a matching component id is stored.
             pub fn has(self: *const ArchetypeInfo, info: *const ComponentInfo) bool {
-                for (self.components) |known| {
-                    if (known.id == info.id) {
-                        return true;
-                    }
-                }
-                return false;
+                return self.containsComponent(info.id);
             }
         };
         /// Links a superset into the owner superset list unless already present.
@@ -397,33 +431,27 @@ pub fn ECS(
             dest_index: u32,
         ) void {
             for (source.components) |src| {
-                for (dest.components) |dst| {
-                    if (src.id != dst.id) {
-                        continue;
-                    }
-                    const src_bytes: ?[]const u8 =
-                        source.vtable.raw(
-                            source.data,
-                            src,
-                            source_index,
-                        );
-                    const dst_bytes: ?[]u8 =
-                        dest.vtable.raw_mut(
-                            dest.data,
-                            dst,
-                            dest_index,
-                        );
-                    if (src_bytes) |source_part| {
-                        if (dst_bytes) |dest_part| {
-                            const byte_count: usize = @min(source_part.len, dest_part.len);
-                            @memcpy(dest_part[0..byte_count], source_part[0..byte_count]);
-                        }
-                    }
-                }
+                const dest_column: usize = dest.columnOf(src.id) orelse continue;
+                const dest_info: *const ComponentInfo = dest.components[dest_column];
+                const src_bytes: []const u8 =
+                    source.vtable.raw(
+                        source.data,
+                        src,
+                        source_index,
+                    ) orelse continue;
+                const dst_bytes: []u8 =
+                    dest.vtable.raw_mut(
+                        dest.data,
+                        dest_info,
+                        dest_index,
+                    ) orelse continue;
+                const byte_count: usize = @min(src_bytes.len, dst_bytes.len);
+                @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
             }
         }
         /// Detects types produced by the Component factory.
         /// - `Candidate` - type to inspect.
+        ///
         /// Returns `bool` - true for component wrappers only.
         pub fn isComponent(comptime Candidate: type) bool {
             const type_info = @typeInfo(Candidate);
@@ -440,6 +468,7 @@ pub fn ECS(
         }
         /// Detects types produced by the Archetype factories.
         /// - `Candidate` - type to inspect.
+        ///
         /// Returns `bool` - true for archetype types only.
         pub fn isArchetype(comptime Candidate: type) bool {
             const type_info = @typeInfo(Candidate);
@@ -456,6 +485,7 @@ pub fn ECS(
         }
         /// Builds the component wrapper for a plain struct type. Rejects archetypes at compile time.
         /// - `Raw` - struct type, or an existing component wrapper to reuse.
+        ///
         /// Returns `type` - component wrapper owning the unique id and the runtime descriptor.
         pub fn Component(comptime Raw: type) type {
             if (Ecs.isArchetype(Raw)) {
@@ -481,17 +511,24 @@ pub fn ECS(
                 var archetypes: std.ArrayListUnmanaged(*Ecs.ArchetypeInfo) = .empty;
                 /// Single cached runtime descriptor shared by all callers.
                 var cache: ?Ecs.ComponentInfo = null;
+                ///
                 /// Returns the lazily assigned component id.
+                ///
                 /// Returns `u32` - stable component id.
                 pub fn id() u32 {
                     if (Self.id_storage == null) {
+                        if (Ecs.next_component_id >= max_components) {
+                            @panic("component count exceeds max_components");
+                        }
                         Self.id_storage = Ecs.next_component_id;
                         Ecs.next_component_id += 1;
                     }
                     return Self.id_storage.?;
                 }
 
+                ///
                 /// Returns the cached runtime component descriptor.
+                ///
                 /// Returns `*const ComponentInfo` - shared descriptor, built on first call.
                 pub fn info() *const Ecs.ComponentInfo {
                     _ = Self.id();
@@ -533,10 +570,11 @@ pub fn ECS(
         }
         /// Normalizes component input: unwraps wrappers, flattens archetypes, dedups and sorts by type name.
         /// - `input` - mixed component, wrapper and archetype types.
+        /// - `max_count` - upper bound on distinct components, sizes the scratch buffers.
+        ///
         /// Returns `[]const type` - canonical, sorted, unique type list.
-        pub fn GetComponentsTypes(comptime input: []const type) []const type {
+        pub fn GetComponentsTypes(comptime input: []const type, comptime max_count: usize) []const type {
             return comptime canon: {
-                const max_count: usize = 512;
                 var flat: [max_count]type = undefined;
                 var flat_len: usize = 0;
                 for (input) |item| {
@@ -612,14 +650,16 @@ pub fn ECS(
         }
         /// Builds an archetype from input types, normalizing away input order.
         /// - `input` - component, wrapper or archetype types.
+        ///
         /// Returns `type` - canonical archetype type.
         pub fn Archetype(comptime input: []const type) type {
             const canonical: []const type =
-                Ecs.GetComponentsTypes(input);
+                Ecs.GetComponentsTypes(input, max_components);
             return Ecs.CreateArchetype(canonical);
         }
         /// Builds the SOA storage type for one archetype from a tuple of component lists.
         /// - `Tuple` - tuple type of ArrayListUnmanaged, one per component.
+        ///
         /// Returns `type` - structure-of-arrays storage with component columns and entity refs.
         pub fn ArchetypeData(comptime Tuple: type) type {
             return struct {
@@ -628,8 +668,100 @@ pub fn ECS(
                 lists: Tuple,
                 /// One row per stored entity, parallel to the component columns.
                 refs: std.ArrayListUnmanaged(EntityReference) = .empty,
+                /// id->column map (value = column + 1, 0 = absent). Built lazily.
+                var component_map: [max_components]u32 = @splat(0);
+                /// Per-column const byte accessor, indexed by column. Built lazily.
+                var raw_accessors: [column_count]RawAccessor = undefined;
+                /// Per-column mutable byte accessor, indexed by column. Built lazily.
+                var mut_accessors: [column_count]MutAccessor = undefined;
+                /// Per-column whole-list byte accessor, indexed by column. Built lazily.
+                var list_accessors: [column_count]ListAccessor = undefined;
+                /// Guards one-time accessor build.
+                var accessors_built: bool = false;
+
+                const column_count: usize = @typeInfo(Tuple).@"struct".fields.len;
+                const RawAccessor = *const fn (*const Self, u32) ?[]const u8;
+                const MutAccessor = *const fn (*Self, u32) ?[]u8;
+                const ListAccessor = *const fn (*const Self) ?[]const u8;
+
+                fn makeRawAccessor(comptime field_index: usize, comptime Element: type) type {
+                    return struct {
+                        fn get(self: *const Self, index: u32) ?[]const u8 {
+                            const column_list: *const std.ArrayListUnmanaged(Element) =
+                                &self.lists[field_index];
+                            if (index >= column_list.items.len) {
+                                return null;
+                            }
+                            const element: *const Element = &column_list.items[index];
+                            const bytes: [*]const u8 = @ptrCast(element);
+                            return bytes[0..@sizeOf(Element)];
+                        }
+                    };
+                }
+
+                fn makeMutAccessor(comptime field_index: usize, comptime Element: type) type {
+                    return struct {
+                        fn get(self: *Self, index: u32) ?[]u8 {
+                            const column_list: *std.ArrayListUnmanaged(Element) =
+                                &self.lists[field_index];
+                            if (index >= column_list.items.len) {
+                                return null;
+                            }
+                            const element: *Element = &column_list.items[index];
+                            const bytes: [*]u8 = @ptrCast(element);
+                            return bytes[0..@sizeOf(Element)];
+                        }
+                    };
+                }
+
+                fn makeListAccessor(comptime field_index: usize, comptime Element: type) type {
+                    return struct {
+                        fn get(self: *const Self) ?[]const u8 {
+                            const column_list: *const std.ArrayListUnmanaged(Element) =
+                                &self.lists[field_index];
+                            const bytes: [*]const u8 = @ptrCast(column_list.items.ptr);
+                            return bytes[0 .. column_list.items.len * @sizeOf(Element)];
+                        }
+                    };
+                }
+
+                fn ensureAccessors() void {
+                    if (Self.accessors_built) {
+                        return;
+                    }
+                    const type_info = @typeInfo(Tuple).@"struct";
+                    inline for (type_info.fields, 0..) |field, field_index| {
+                        const List: type = field.type;
+                        switch (@typeInfo(List)) {
+                            .@"struct" => |list_info| {
+                                inline for (list_info.fields) |member| {
+                                    switch (@typeInfo(member.type)) {
+                                        .pointer => |ptr| {
+                                            const Element: type = ptr.child;
+                                            const id: u32 = Ecs.Component(Element).id();
+                                            if (id >= max_components) {
+                                                @panic("component id exceeds max_components");
+                                            }
+                                            Self.component_map[id] = @intCast(field_index + 1);
+                                            Self.raw_accessors[field_index] =
+                                                Self.makeRawAccessor(field_index, Element).get;
+                                            Self.mut_accessors[field_index] =
+                                                Self.makeMutAccessor(field_index, Element).get;
+                                            Self.list_accessors[field_index] =
+                                                Self.makeListAccessor(field_index, Element).get;
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    Self.accessors_built = true;
+                }
                 /// Locates the column index storing the given component type.
                 /// - `Target` - component type to locate.
+                ///
                 /// Returns `usize` - tuple field index, or a compile error when absent.
                 fn indexOf(comptime Target: type) usize {
                     return comptime search_block: {
@@ -659,6 +791,7 @@ pub fn ECS(
                 }
                 /// Counts stored rows.
                 /// - `self` - storage to inspect.
+                ///
                 /// Returns `u32` - current row count.
                 pub fn count(self: *const Self) u32 {
                     return @intCast(self.refs.items.len);
@@ -666,6 +799,7 @@ pub fn ECS(
                 /// Checks whether a row exists at the given position.
                 /// - `self` - storage to inspect.
                 /// - `index` - row position.
+                ///
                 /// Returns `bool` - true when the position is in range.
                 pub fn exists(
                     self: *const Self,
@@ -676,6 +810,7 @@ pub fn ECS(
                 /// Fetches the entity reference stored at the given position.
                 /// - `self` - storage to inspect.
                 /// - `index` - row position.
+                ///
                 /// Returns `EntityReference` - reference stored in the row.
                 pub fn entity(
                     self: *const Self,
@@ -686,10 +821,12 @@ pub fn ECS(
                     }
                     return self.refs.items[index];
                 }
+                ///
                 /// Returns a read-only pointer to one component value.
                 /// - `self` - storage to inspect.
                 /// - `Target` - component type to fetch.
                 /// - `index` - row position.
+                ///
                 /// Returns `*const Target` - pointer into the component column.
                 pub fn get(
                     self: *const Self,
@@ -702,8 +839,7 @@ pub fn ECS(
                     if (Target == Entity or Target == EntityReference) {
                         @compileError("Use entity for EntityReference, not get.");
                     }
-                    const column: usize = comptime
-                        Self.indexOf(Target);
+                    const column: usize = comptime Self.indexOf(Target);
                     const column_list: *const std.ArrayListUnmanaged(Target) =
                         &self.lists[column];
                     if (index >= column_list.items.len) {
@@ -711,10 +847,12 @@ pub fn ECS(
                     }
                     return &column_list.items[index];
                 }
+                ///
                 /// Returns a mutable pointer to one component value.
                 /// - `self` - storage to mutate.
                 /// - `Target` - component type to fetch.
                 /// - `index` - row position.
+                ///
                 /// Returns `*Target` - mutable pointer into the component column.
                 pub fn getMut(
                     self: *Self,
@@ -727,8 +865,7 @@ pub fn ECS(
                     if (Target == Entity or Target == EntityReference) {
                         @compileError("Use entity for EntityReference, not get.");
                     }
-                    const column: usize = comptime
-                        Self.indexOf(Target);
+                    const column: usize = comptime Self.indexOf(Target);
                     const column_list: *std.ArrayListUnmanaged(Target) =
                         &self.lists[column];
                     if (index >= column_list.items.len) {
@@ -739,6 +876,7 @@ pub fn ECS(
                 /// Exposes a whole component column as a read-only list.
                 /// - `self` - storage to inspect.
                 /// - `Target` - component type to expose.
+                ///
                 /// Returns `ReadOnlyList` - live view of the component column.
                 pub fn list(
                     self: *const Self,
@@ -750,14 +888,14 @@ pub fn ECS(
                     if (Target == Entity or Target == EntityReference) {
                         @compileError("EntityReference list is accessed via entities.");
                     }
-                    const column: usize = comptime
-                        Self.indexOf(Target);
+                    const column: usize = comptime Self.indexOf(Target);
                     const column_list: *const std.ArrayListUnmanaged(Target) =
                         &self.lists[column];
                     return ReadOnlyList(Target).init(column_list);
                 }
                 /// Exposes the entity reference column as a read-only list.
                 /// - `self` - storage to inspect.
+                ///
                 /// Returns `ReadOnlyList` - live view of the reference column.
                 pub fn entities(self: *const Self) ReadOnlyList(EntityReference) {
                     return ReadOnlyList(EntityReference).init(&self.refs);
@@ -766,137 +904,59 @@ pub fn ECS(
                 /// - `self` - storage to inspect.
                 /// - `info` - component descriptor to match.
                 /// - `index` - row position.
+                ///
                 /// Returns `?[]const u8` - byte slice, or null when absent or out of range.
                 pub fn raw(
                     self: *const Self,
                     info: *const ComponentInfo,
                     index: u32,
                 ) ?[]const u8 {
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const List: type = field.type;
-                        switch (@typeInfo(List)) {
-                            .@"struct" => |list_info| {
-                                inline for (list_info.fields) |member| {
-                                    switch (@typeInfo(member.type)) {
-                                        .pointer => |ptr| {
-                                            const Element: type = ptr.child;
-                                            const wanted: u32 =
-                                                Ecs.Component(Element).id();
-                                            const matches: bool =
-                                                std.mem.eql(u8, member.name, "items");
-                                            if (matches and
-                                                wanted == info.id)
-                                            {
-                                                const column_list: *const std.ArrayListUnmanaged(Element) =
-                                                    &self.lists[field_index];
-                                                if (index >= column_list.items.len) {
-                                                    return null;
-                                                }
-                                                const element: *const Element =
-                                                    &column_list.items[index];
-                                    const bytes: [*]const u8 = @ptrCast(element);
-                                    return bytes[0..@sizeOf(Element)];
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
+                    Self.ensureAccessors();
+                    const column: u32 = Self.component_map[info.id];
+                    if (column == 0) {
+                        return null;
                     }
-                    return null;
+                    return Self.raw_accessors[column - 1](self, index);
                 }
                 /// Exposes one component value as writable raw bytes, matched by runtime descriptor.
                 /// - `self` - storage to mutate.
                 /// - `info` - component descriptor to match.
                 /// - `index` - row position.
+                ///
                 /// Returns `?[]u8` - writable byte slice, or null when absent or out of range.
                 pub fn rawMut(
                     self: *Self,
                     info: *const ComponentInfo,
                     index: u32,
                 ) ?[]u8 {
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const List: type = field.type;
-                        switch (@typeInfo(List)) {
-                            .@"struct" => |list_info| {
-                                inline for (list_info.fields) |member| {
-                                    switch (@typeInfo(member.type)) {
-                                        .pointer => |ptr| {
-                                            const Element: type = ptr.child;
-                                            const wanted: u32 =
-                                                Ecs.Component(Element).id();
-                                            const matches: bool =
-                                                std.mem.eql(u8, member.name, "items");
-                                            if (matches and
-                                                wanted == info.id)
-                                            {
-                                                const column_list: *std.ArrayListUnmanaged(Element) =
-                                                    &self.lists[field_index];
-                                                if (index >= column_list.items.len) {
-                                                    return null;
-                                                }
-                                                const element: *Element =
-                                                    &column_list.items[index];
-                                    const bytes: [*]u8 = @ptrCast(element);
-                                    return bytes[0..@sizeOf(Element)];
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
+                    Self.ensureAccessors();
+                    const column: u32 = Self.component_map[info.id];
+                    if (column == 0) {
+                        return null;
                     }
-                    return null;
+                    return Self.mut_accessors[column - 1](self, index);
                 }
                 /// Exposes a whole component column as raw bytes, matched by runtime descriptor.
                 /// - `self` - storage to inspect.
                 /// - `info` - component descriptor to match.
+                ///
                 /// Returns `?[]const u8` - byte slice of the whole column, or null when absent.
                 pub fn rawList(
                     self: *const Self,
                     info: *const ComponentInfo,
                 ) ?[]const u8 {
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const List: type = field.type;
-                        switch (@typeInfo(List)) {
-                            .@"struct" => |list_info| {
-                                inline for (list_info.fields) |member| {
-                                    switch (@typeInfo(member.type)) {
-                                        .pointer => |ptr| {
-                                            const Element: type = ptr.child;
-                                            const wanted: u32 =
-                                                Ecs.Component(Element).id();
-                                            const matches: bool =
-                                                std.mem.eql(u8, member.name, "items");
-                                            if (matches and
-                                                wanted == info.id)
-                                            {
-                                                const column_list: *const std.ArrayListUnmanaged(Element) =
-                                                    &self.lists[field_index];
-                                                const bytes: [*]const u8 = @ptrCast(column_list.items.ptr);
-                                                return bytes[0 .. column_list.items.len * @sizeOf(Element)];
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
+                    Self.ensureAccessors();
+                    const column: u32 = Self.component_map[info.id];
+                    if (column == 0) {
+                        return null;
                     }
-                    return null;
+                    return Self.list_accessors[column - 1](self);
                 }
                 /// Appends an empty row across all columns plus the reference.
                 /// - `self` - storage to mutate.
                 /// - `allocator` - funds row allocation.
                 /// - `reference` - handle stored alongside the components.
+                ///
                 /// Returns `u32` - position of the new row.
                 fn add(
                     self: *Self,
@@ -915,6 +975,7 @@ pub fn ECS(
                 /// Removes a row across all columns via swap with the last row.
                 /// - `self` - storage to mutate.
                 /// - `index` - row position to remove.
+                ///
                 /// Returns `?EntityReference` - relocated reference, or null when the last row was removed.
                 fn remove(
                     self: *Self,
@@ -953,10 +1014,11 @@ pub fn ECS(
         }
         /// Builds the concrete archetype type owning state and component storage.
         /// - `raw` - component type list; normalized internally.
+        ///
         /// Returns `type` - archetype type with storage, descriptor and mutation helpers.
         pub fn CreateArchetype(comptime raw: []const type) type {
             const canonical: []const type =
-                Ecs.GetComponentsTypes(raw);
+                Ecs.GetComponentsTypes(raw, max_components);
             const type_list: [canonical.len]type = comptime block: {
                 var scratch: [canonical.len]type = undefined;
                 for (canonical, 0..) |item, type_index| {
@@ -983,9 +1045,12 @@ pub fn ECS(
                 var state: Data = .{
                     .lists = emptyTuple(),
                 };
+                /// Backing storage for the id->column map. Filled on first info().
+                var component_map_storage: [max_components]u32 = @splat(0);
                 /// Whether registration into the ECS registry has completed.
                 var registered: bool = false;
                 /// Builds a fully zeroed tuple of component lists.
+                ///
                 /// Returns `Tuple` - tuple with every list empty.
                 fn emptyTuple() Tuple {
                     var blank: Tuple = undefined;
@@ -1074,7 +1139,9 @@ pub fn ECS(
                         }
                     }.deinitFunction,
                 };
+                ///
                 /// Returns the lazily assigned archetype id.
+                ///
                 /// Returns `u32` - stable archetype id.
                 pub fn id() u32 {
                     if (Self.id_storage == null) {
@@ -1084,13 +1151,17 @@ pub fn ECS(
                     }
                     return Self.id_storage.?;
                 }
+                ///
                 /// Returns a pointer to the owned component storage.
+                ///
                 /// Returns `*Data` - live SOA storage of this archetype.
                 pub fn data() *Data {
                     return &Self.state;
                 }
 
+                ///
                 /// Returns the cached runtime archetype descriptor.
+                ///
                 /// Returns `*ArchetypeInfo` - shared descriptor, built on first call.
                 pub fn info() *Ecs.ArchetypeInfo {
                     _ = Self.id();
@@ -1099,10 +1170,17 @@ pub fn ECS(
                             Self.infos[type_index] =
                                 Ecs.Component(item).info();
                         }
+                        for (Self.infos[0..], 0..) |meta, column| {
+                            if (meta.id >= max_components) {
+                                @panic("component id exceeds max_components");
+                            }
+                            Self.component_map_storage[meta.id] =
+                                @intCast(column + 1);
+                        }
                         Self.cache = Ecs.ArchetypeInfo{
                             .id = Self.id_storage.?,
-                            .components =
-                                Self.infos[0..],
+                            .components = Self.infos[0..],
+                            .component_map = Self.component_map_storage[0..],
                             .superset_storage = .empty,
                             .data = @ptrCast(&Self.state),
                             .vtable = &Self.vtable,
@@ -1112,6 +1190,7 @@ pub fn ECS(
                 }
                 /// Registers this archetype: links components and maintains supersets.
                 /// - `allocator` - funds registry, component and superset lists.
+                ///
                 /// Returns `*ArchetypeInfo` - registered runtime descriptor.
                 pub fn register(
                     allocator: std.mem.Allocator,
@@ -1140,22 +1219,40 @@ pub fn ECS(
                             handle,
                         );
                     }
-                    for (Ecs.registry.items) |other| {
-                        if (other == handle) {
-                            continue;
+                    var candidates: std.ArrayListUnmanaged(*Ecs.ArchetypeInfo) = .empty;
+                    defer candidates.deinit(allocator);
+                    inline for (canonical) |item| {
+                        const meta: *const Ecs.ComponentInfo =
+                            Ecs.Component(item).info();
+                        for (meta.archetypes().items()) |candidate| {
+                            if (candidate == handle) {
+                                continue;
+                            }
+                            var seen: bool = false;
+                            for (candidates.items) |known| {
+                                if (known == candidate) {
+                                    seen = true;
+                                    break;
+                                }
+                            }
+                            if (!seen) {
+                                try candidates.append(allocator, candidate);
+                            }
                         }
-                        if (covers(handle, other)) {
+                    }
+                    for (candidates.items) |candidate| {
+                        if (covers(handle, candidate)) {
                             try Ecs.addSuperset(
                                 allocator,
-                                other,
+                                candidate,
                                 handle,
                             );
                         }
-                        if (covers(other, handle)) {
+                        if (covers(candidate, handle)) {
                             try Ecs.addSuperset(
                                 allocator,
                                 handle,
-                                other,
+                                candidate,
                             );
                         }
                     }
@@ -1165,20 +1262,14 @@ pub fn ECS(
                 /// Checks whether one archetype strictly contains another component set.
                 /// - `super` - candidate superset.
                 /// - `sub` - candidate subset.
+                ///
                 /// Returns `bool` - true when sub is a strict subset of super.
                 fn covers(
                     super: *const Ecs.ArchetypeInfo,
                     sub: *const Ecs.ArchetypeInfo,
                 ) bool {
                     for (sub.components) |need| {
-                        var match: bool = false;
-                        for (super.components) |have| {
-                            if (have.id == need.id) {
-                                match = true;
-                                break;
-                            }
-                        }
-                        if (!match) {
+                        if (!super.containsComponent(need.id)) {
                             return false;
                         }
                     }
@@ -1187,6 +1278,7 @@ pub fn ECS(
                 }
                 /// Resolves a single input to its underlying struct type.
                 /// - `Single` - component, wrapper or single-component archetype.
+                ///
                 /// Returns `type` - unwrapped struct component type.
                 fn unwrap(comptime Single: type) type {
                     if (Ecs.isComponent(Single)) {
@@ -1205,6 +1297,7 @@ pub fn ECS(
                 }
                 /// Adds one component, producing a derived archetype type.
                 /// - `Single` - component, wrapper or single-component archetype.
+                ///
                 /// Returns `type` - archetype extended with the new component.
                 pub fn add(comptime Single: type) type {
                     const Unwrapped: type = unwrap(Single);
@@ -1224,6 +1317,7 @@ pub fn ECS(
                 }
                 /// Adds several components at once, producing a derived archetype type.
                 /// - `extra` - component types to add.
+                ///
                 /// Returns `type` - archetype extended with the new components.
                 pub fn addMany(comptime extra: []const type) type {
                     const merged: []const type = comptime merge: {
@@ -1246,6 +1340,7 @@ pub fn ECS(
                 }
                 /// Removes one component, producing a derived archetype type.
                 /// - `Single` - component to remove. Must be present and not the last one.
+                ///
                 /// Returns `type` - archetype narrowed by the removed component.
                 pub fn remove(comptime Single: type) type {
                     const Unwrapped: type = unwrap(Single);
@@ -1281,10 +1376,11 @@ pub fn ECS(
                 }
                 /// Removes several components at once, producing a derived archetype type.
                 /// - `removed` - component types to remove. Must leave at least one.
+                ///
                 /// Returns `type` - archetype narrowed by the removed components.
                 pub fn removeMany(comptime removed: []const type) type {
                     const targets: []const type =
-                        Ecs.GetComponentsTypes(removed);
+                        Ecs.GetComponentsTypes(removed, max_components);
                     for (targets) |target| {
                         var present: bool = false;
                         for (canonical) |existing| {
@@ -1354,7 +1450,7 @@ const Vel = struct { horizontal_speed: f32, vertical_speed: f32 };
 /// Current health amount component used by tests.
 const Health = struct { current_value: u32 };
 test "component identifier is stable per type" {
-    const Ecs = ECS(16, 16);
+    const Ecs = ECS(16, 16, 64);
     const First = Ecs.Component(Pos);
     const Second = Ecs.Component(Pos);
     const Other = Ecs.Component(Vel);
@@ -1364,7 +1460,7 @@ test "component identifier is stable per type" {
     try std.testing.expect(!Ecs.isArchetype(First));
 }
 test "archetype order does not matter" {
-    const Ecs = ECS(16, 16);
+    const Ecs = ECS(16, 16, 64);
     const Left = Ecs.Archetype(&[_]type{ Pos, Vel });
     const Right = Ecs.Archetype(&[_]type{ Vel, Pos });
     try std.testing.expect(Left == Right);
@@ -1372,7 +1468,7 @@ test "archetype order does not matter" {
     try std.testing.expect(!Ecs.isComponent(Left));
 }
 test "archetype data stores and returns components" {
-    const Ecs = ECS(16, 16);
+    const Ecs = ECS(16, 16, 64);
     const Single = Ecs.Archetype(&[_]type{Health});
     const data = Single.data();
     const allocator = std.testing.allocator;
@@ -1387,7 +1483,7 @@ test "archetype data stores and returns components" {
     data.deinit(allocator);
 }
 test "entity create destroy and slot reuse" {
-    const Ecs = ECS(24, 24);
+    const Ecs = ECS(24, 24, 64);
     const Pair = Ecs.Archetype(&[_]type{ Pos, Vel });
     const allocator = std.testing.allocator;
     const handle = try Pair.register(allocator);
@@ -1416,7 +1512,7 @@ test "entity create destroy and slot reuse" {
     try std.testing.expect(recycled.reference.isAlive());
 }
 test "entity migrate copies shared components" {
-    const Ecs = ECS(56, 56);
+    const Ecs = ECS(56, 56, 64);
     const Source = Ecs.Archetype(&[_]type{ Pos, Vel });
     const Dest = Ecs.Archetype(&[_]type{ Pos, Health });
     const allocator = std.testing.allocator;
@@ -1439,7 +1535,7 @@ test "entity migrate copies shared components" {
     try std.testing.expect(moved.horizontal_coordinate == 7);
 }
 test "archetype registration tracks supersets and component lists" {
-    const Ecs = ECS(48, 48);
+    const Ecs = ECS(48, 48, 64);
     const Small = Ecs.Archetype(&[_]type{Pos});
     const Big = Ecs.Archetype(&[_]type{ Pos, Vel });
     const allocator = std.testing.allocator;
@@ -1456,7 +1552,7 @@ test "archetype registration tracks supersets and component lists" {
     try std.testing.expect(vel_info.archetypes().count() == 1);
 }
 test "add and remove components change archetype type" {
-    const Ecs = ECS(40, 40);
+    const Ecs = ECS(40, 40, 64);
     const Base = Ecs.Archetype(&[_]type{Pos});
     const Wide = Base.add(Vel);
     const Expect = Ecs.Archetype(&[_]type{ Pos, Vel });
