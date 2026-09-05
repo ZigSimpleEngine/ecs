@@ -57,45 +57,34 @@ pub fn ReadOnlyList(comptime Element: type) type {
         }
     };
 }
-/// Builds an isolated Entity Component System namespace.
-/// - `max_archetypes` - per-component cap on tracked archetypes.
-/// - `max_supersets` - per-archetype cap on tracked supersets.
-/// - `max_components` - cap on distinct component types; sizes the id->column maps.
+/// Builds a fully static Entity Component System from a closed archetype set.
+/// - `sets` - tuple of component bundles, one bundle per archetype. A bundle is
+///   a tuple of component struct types, possibly nested: only tuples are
+///   traversed recursively, named structs are treated as leaf components.
+///   Duplicate components inside one archetype and duplicate archetypes are
+///   removed in comptime. Component order does not matter.
 ///
-/// Returns `type` - ECS namespace with its own counters and storage.
-pub fn ECS(
-    comptime max_archetypes: u32,
-    comptime max_supersets: u32,
-    comptime max_components: usize,
-) type {
+/// Example: `const Transform = .{ Pos, Vel };` then
+/// `const Ecs = ECS(.{ Transform, .{ Transform, Health } });`.
+///
+/// All metadata (`components`, `archetypes`, per-component archetype lists and
+/// per-archetype superset lists) is precomputed once in comptime and immutable.
+/// There is no dynamic component or archetype registration. Ids are dense table
+/// indices: component id = index into `components` (sorted by type name),
+/// archetype id = index into `archetypes` (first-seen input order).
+///
+/// Example: `const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });`
+///
+/// Returns `type` - ECS namespace with static metadata and runtime entity storage.
+pub fn ECS(comptime sets: anytype) type {
     return struct {
         const Ecs = @This();
-        /// Next fresh entity id. Equals the record count while no slots are recycled.
-        var next_entity_id: u32 = 0;
-        /// Next component type id. Handed out lazily on first use.
-        var next_component_id: u32 = 0;
-        /// Next archetype id. Handed out lazily on first use.
-        var next_archetype_id: u32 = 0;
-        /// All entity records by id. A record id always matches its position here.
-        var entities: std.ArrayListUnmanaged(Entity) = .empty;
-        /// Stack of freed entity ids ready for reuse.
-        var free_ids: std.ArrayListUnmanaged(u32) = .empty;
-        /// Every registered archetype. Used to maintain superset links.
-        var registry: std.ArrayListUnmanaged(*ArchetypeInfo) = .empty;
-        /// Component archetype lists, tracked here so deinit can free them.
-        var tracked: std.ArrayListUnmanaged(*std.ArrayListUnmanaged(*ArchetypeInfo)) = .empty;
         /// Failure modes of ECS operations, including allocator failures.
         pub const EcsError = std.mem.Allocator.Error || error{
-            /// Reserved for lookups of an id that was never assigned to any entity.
-            EntitySlotNeverCreated,
             /// Operation requires a live entity but the reference is stale.
             EntityIsNotAlive,
             /// Requested position lies outside the storage range.
             IndexOutOfBounds,
-            /// A component already tracks the maximum number of archetypes.
-            ArchetypeListOverflow,
-            /// An archetype already tracks the maximum number of supersets.
-            SupersetListOverflow,
             /// Requested component is not stored in this archetype.
             ComponentNotFoundInArchetype,
         };
@@ -137,657 +126,821 @@ pub fn ECS(
                 return Ecs.entities.items[entity_index];
             }
             /// Destroys the referenced entity and recycles its slot.
+            /// Private: structural changes run only via commands flushed by the scheduler.
             /// - `self` - reference to destroy. Must be alive.
             /// - `allocator` - funds the free-slot bookkeeping.
-            pub fn destroy(self: *const EntityReference, allocator: std.mem.Allocator) Ecs.EcsError!void {
+            fn destroy(self: *const EntityReference, allocator: std.mem.Allocator) EcsError!void {
                 if (!self.isAlive()) {
-                    return Ecs.EcsError.EntityIsNotAlive;
+                    return EcsError.EntityIsNotAlive;
                 }
                 const entity_index: u32 = self.id;
                 const record: *Entity = &Ecs.entities.items[entity_index];
-                const handle: *ArchetypeInfo = record.handle;
+                const arch: u32 = record.archetype;
                 const index: u32 = record.index;
-                const displaced: ?EntityReference =
-                    handle.remove(index);
+                const displaced: ?EntityReference = blk: {
+                    inline for (0..ARCH_COUNT) |k| {
+                        if (arch == k) {
+                            break :blk Ecs.storages[k].remove(index);
+                        }
+                    }
+                    unreachable;
+                };
                 if (displaced) |relocated| {
                     const relocated_index: u32 = relocated.id;
                     Ecs.entities.items[relocated_index].index = index;
                 }
-                const bumped: u8 = record.reference.gen +% 1;
-                record.reference.gen = bumped;
+                record.reference.gen +%= 1;
                 try Ecs.free_ids.append(allocator, entity_index);
             }
             /// Moves the entity into another archetype, optionally copying shared data.
             /// - `self` - reference to move. Must be alive.
             /// - `allocator` - funds the destination slot.
-            /// - `dest` - archetype receiving the entity.
-            /// - `copy` - when true, shared component bytes are carried over.
+            /// - `dest` - component bundle of the destination archetype. Must be declared in `ECS(...)`.
+            /// - `copy` - when true, shared component values are carried over.
             ///
-            /// Returns `EntityReference` - refreshed reference with a bumped generation.
-            pub fn migrate(
+            /// Returns `Entity` - refreshed record with a bumped generation.
+            /// Private: structural changes run only via commands flushed by the scheduler.
+            fn migrate(
                 self: *const EntityReference,
                 allocator: std.mem.Allocator,
-                dest: *ArchetypeInfo,
+                comptime dest: anytype,
                 copy: bool,
-            ) Ecs.EcsError!EntityReference {
+            ) EcsError!Entity {
+                const dest_id = comptime Ecs.archetypeId(dest);
+                return self.migrateById(allocator, dest_id, copy);
+            }
+            /// Moves the entity into the archetype with the given id.
+            /// - `self` - reference to move. Must be alive.
+            /// - `allocator` - funds the destination slot.
+            /// - `dest_id` - destination archetype id, an index into `archetypes`.
+            /// - `copy` - when true, shared component values are carried over.
+            ///
+            /// Returns `Entity` - refreshed record with a bumped generation.
+            /// Private: structural changes run only via commands flushed by the scheduler.
+            fn migrateById(
+                self: *const EntityReference,
+                allocator: std.mem.Allocator,
+                dest_id: u32,
+                copy: bool,
+            ) EcsError!Entity {
                 if (!self.isAlive()) {
-                    return Ecs.EcsError.EntityIsNotAlive;
+                    return EcsError.EntityIsNotAlive;
                 }
                 const entity_index: u32 = self.id;
                 const record: *Entity = &Ecs.entities.items[entity_index];
-                const source: *ArchetypeInfo = record.handle;
+                const source_id: u32 = record.archetype;
                 const source_index: u32 = record.index;
                 const next = EntityReference{
                     .id = self.id,
                     .gen = self.gen +% 1,
                 };
-                const dest_index: u32 =
-                    try dest.add(allocator, &next);
+                const dest_index: u32 = blk: {
+                    inline for (0..ARCH_COUNT) |k| {
+                        if (dest_id == k) {
+                            break :blk try Ecs.storages[k].add(allocator, &next);
+                        }
+                    }
+                    unreachable;
+                };
                 if (copy) {
-                    copyShared(
-                        source,
+                    Ecs.copyShared(
+                        source_id,
                         source_index,
-                        dest,
+                        dest_id,
                         dest_index,
                     );
                 }
-                const displaced: ?EntityReference =
-                    source.remove(source_index);
+                const displaced: ?EntityReference = blk: {
+                    inline for (0..ARCH_COUNT) |k| {
+                        if (source_id == k) {
+                            break :blk Ecs.storages[k].remove(source_index);
+                        }
+                    }
+                    unreachable;
+                };
                 if (displaced) |relocated| {
                     const relocated_index: u32 = relocated.id;
                     Ecs.entities.items[relocated_index].index =
                         source_index;
                 }
                 record.reference = next;
-                record.handle = dest;
+                record.archetype = dest_id;
                 record.index = dest_index;
-                return record.reference;
+                return record.*;
             }
         };
         /// Full entity record stored in global storage.
         pub const Entity = struct {
             /// Handle identifying this entity. Stale copies compare unequal.
             reference: EntityReference,
-            /// Archetype currently owning the component data.
-            handle: *ArchetypeInfo,
+            /// Id of the archetype currently owning the component data.
+            archetype: u32,
             /// Row position inside the owning archetype storage.
             index: u32,
-            /// Creates an entity inside the given archetype, reusing a free slot when possible.
-            /// - `allocator` - funds record and archetype row allocation.
-            /// - `dest` - archetype receiving the new entity.
+            /// Checks whether this id was ever assigned to an entity.
+            /// - `self` - entity copy to inspect.
             ///
-            /// Returns `Entity` - freshly stored record copy.
-            pub fn create(
-                allocator: std.mem.Allocator,
-                dest: *ArchetypeInfo,
-            ) Ecs.EcsError!Entity {
-                var new_id: u32 = 0;
-                var new_gen: u8 = 0;
-                var slot: *Entity = undefined;
-                if (Ecs.free_ids.pop()) |recycled| {
-                    new_id = recycled;
-                    slot = &Ecs.entities.items[new_id];
-                    new_gen = slot.reference.gen;
-                } else {
-                    new_id = Ecs.next_entity_id;
-                    Ecs.next_entity_id += 1;
-                    const placeholder = Entity{
-                        .reference = EntityReference{
-                            .id = @intCast(new_id),
-                            .gen = 0,
-                        },
-                        .handle = dest,
-                        .index = 0,
-                    };
-                    try Ecs.entities.append(allocator, placeholder);
-                    slot = &Ecs.entities.items[new_id];
-                    new_gen = 0;
-                }
-                const reference = EntityReference{
-                    .id = @intCast(new_id),
-                    .gen = new_gen,
-                };
-                const index: u32 =
-                    try dest.add(allocator, &reference);
-                slot.reference = reference;
-                slot.handle = dest;
-                slot.index = index;
-                return slot.*;
+            /// Returns `bool` - true when a record slot exists for the id.
+            pub fn exists(self: *const Entity) bool {
+                return self.reference.exists();
+            }
+            /// Checks whether the entity still points at a live record.
+            /// - `self` - entity copy to inspect.
+            ///
+            /// Returns `bool` - true when the slot exists and generations match.
+            pub fn isAlive(self: *const Entity) bool {
+                return self.reference.isAlive();
+            }
+            /// Loads a fresh copy of the entity record behind this reference.
+            /// Useful to refresh a stale copy after a migrate.
+            /// - `self` - entity copy to resolve.
+            ///
+            /// Returns `?Entity` - fresh record copy, or null when not alive.
+            pub fn entity(self: *const Entity) ?Entity {
+                return self.reference.entity();
             }
         };
-        /// Runtime descriptor of a single component type.
+        /// Static descriptor of a single component type. Immutable, built once in comptime.
         pub const ComponentInfo = struct {
-            /// Unique component id assigned on first use.
+            /// Dense component id. Always equals the index into `components`.
             id: u32,
-            /// Byte size of one component value. Drives raw copies.
+            /// Byte size of one component value.
             size: usize,
             /// Byte alignment of the component type.
             alignment: usize,
-            /// Fully qualified component type name. Used for canonical sorting.
+            /// Fully qualified component type name.
             name: []const u8,
-            /// Live list of archetypes containing this component.
-            archetype_storage: *const std.ArrayListUnmanaged(*ArchetypeInfo),
-            /// Read-only view over archetypes containing this component.
-            /// - `self` - descriptor to inspect.
-            ///
-            /// Returns `ReadOnlyList` - live view of the archetype list.
-            pub fn archetypes(self: *const ComponentInfo) ReadOnlyList(*ArchetypeInfo) {
-                return ReadOnlyList(*ArchetypeInfo).init(self.archetype_storage);
-            }
+            /// Ids of every archetype containing this component.
+            archetype_ids: []const u32,
         };
-        /// Type-erased operation set of one archetype storage.
-        pub const VTable = struct {
-            /// Appends a row for the given reference.
-            add: *const fn (
-                data: *anyopaque,
-                allocator: std.mem.Allocator,
-                reference: *const EntityReference,
-            ) Ecs.EcsError!u32,
-            /// Removes the row at the given position via swap with the last row.
-            remove: *const fn (
-                data: *anyopaque,
-                index: u32,
-            ) ?EntityReference,
-            /// Counts stored rows.
-            count: *const fn (
-                data: *const anyopaque,
-            ) u32,
-            /// Fetches the reference stored at the given position.
-            entity: *const fn (
-                data: *const anyopaque,
-                index: u32,
-            ) ?EntityReference,
-            /// Reads one component value as raw bytes.
-            raw: *const fn (
-                data: *const anyopaque,
-                info: *const ComponentInfo,
-                index: u32,
-            ) ?[]const u8,
-            /// Exposes one component value as writable raw bytes.
-            raw_mut: *const fn (
-                data: *anyopaque,
-                info: *const ComponentInfo,
-                index: u32,
-            ) ?[]u8,
-            /// Releases every list owned by the storage.
-            deinit: *const fn (
-                data: *anyopaque,
-                allocator: std.mem.Allocator,
-            ) void,
-        };
-        /// Runtime descriptor of a single archetype.
+        /// Static descriptor of a single archetype. Immutable, built once in comptime.
+        /// `component_ids` is sorted ascending and also defines the column order.
         pub const ArchetypeInfo = struct {
-            /// Unique archetype id assigned on first use.
+            /// Dense archetype id. Always equals the index into `archetypes`.
             id: u32,
-            /// Descriptors of the stored component types.
-            components: []const *const ComponentInfo,
-            /// id->column map (value = column + 1, 0 = absent). Direct O(1) lookup.
-            component_map: []u32,
-            /// Archetypes strictly containing this one. Mutated during registration.
-            superset_storage: std.ArrayListUnmanaged(*ArchetypeInfo),
-            /// Type-erased pointer to the owned component storage.
-            data: *anyopaque,
-            /// Operation set dispatching to the concrete storage type.
-            vtable: *const VTable,
-            /// Read-only view over registered superset archetypes.
-            /// - `self` - descriptor to inspect.
-            ///
-            /// Returns `ReadOnlyList` - live view of the superset list.
-            pub fn supersets(self: *const ArchetypeInfo) ReadOnlyList(*ArchetypeInfo) {
-                return ReadOnlyList(*ArchetypeInfo).init(&self.superset_storage);
-            }
-            /// Counts entities stored in this archetype.
-            /// - `self` - descriptor to inspect.
-            ///
-            /// Returns `u32` - current row count.
-            pub fn count(self: *const ArchetypeInfo) u32 {
-                return self.vtable.count(self.data);
-            }
-            /// Appends a row for the given reference.
-            /// - `self` - descriptor receiving the row.
-            /// - `allocator` - funds row allocation.
-            /// - `reference` - handle stored alongside the components.
-            ///
-            /// Returns `u32` - position of the new row.
-            pub fn add(
-                self: *ArchetypeInfo,
-                allocator: std.mem.Allocator,
-                reference: *const EntityReference,
-            ) Ecs.EcsError!u32 {
-                return try self.vtable.add(
-                    self.data,
-                    allocator,
-                    reference,
-                );
-            }
-            /// Removes the row at the given position via swap with the last row.
-            /// - `self` - descriptor owning the row.
-            /// - `index` - row position to remove.
-            ///
-            /// Returns `?EntityReference` - relocated reference, or null when the last row was removed.
-            pub fn remove(
-                self: *ArchetypeInfo,
-                index: u32,
-            ) ?EntityReference {
-                return self.vtable.remove(
-                    self.data,
-                    index,
-                );
-            }
-            /// Checks whether the archetype stores the given component.
-            /// - `self` - descriptor to inspect.
-            /// - `id` - component id to look up.
-            ///
-            /// Returns `bool` - true when the component is stored.
-            pub fn containsComponent(self: *const ArchetypeInfo, id: u32) bool {
-                return self.component_map[id] != 0;
-            }
-            /// Maps a component id to its column index inside this archetype.
-            /// - `self` - descriptor to inspect.
-            /// - `id` - component id to look up.
-            ///
-            /// Returns `?usize` - column index, or null when the component is absent.
-            pub fn columnOf(self: *const ArchetypeInfo, id: u32) ?usize {
-                const column: u32 = self.component_map[id];
-                return if (column == 0) null else column - 1;
-            }
-            /// Checks whether the archetype stores the given component.
-            /// - `self` - descriptor to inspect.
-            /// - `info` - component descriptor to look up.
-            ///
-            /// Returns `bool` - true when a matching component id is stored.
-            pub fn has(self: *const ArchetypeInfo, info: *const ComponentInfo) bool {
-                return self.containsComponent(info.id);
-            }
+            /// Sorted ids of the stored component types.
+            component_ids: []const u32,
+            /// Ids of archetypes strictly containing this one. Precomputed in comptime.
+            superset_ids: []const u32,
         };
-        /// Links a superset into the owner superset list unless already present.
-        /// - `allocator` - funds list growth.
-        /// - `owner` - archetype receiving the link.
-        /// - `super` - strictly larger archetype to link.
-        fn addSuperset(
-            allocator: std.mem.Allocator,
-            owner: *ArchetypeInfo,
-            super: *ArchetypeInfo,
-        ) EcsError!void {
-            for (owner.superset_storage.items) |known| {
-                if (known == super) {
-                    return;
+        /// Number of input archetype tuples. Validated to be a tuple below.
+        const input_count: usize = blk: {
+            const info = @typeInfo(@TypeOf(sets));
+            if (info != .@"struct" or !info.@"struct".is_tuple) {
+                @compileError("ECS expects a tuple of archetype tuples, e.g. ECS(.{ .{Pos, Vel}, .{Pos} }).");
+            }
+            break :blk info.@"struct".fields.len;
+        };
+        /// Largest leaf count over all archetype bundles. Statically frozen so it
+        /// can size comptime buffers. Nested tuples are counted recursively.
+        const max_len: usize = blk: {
+            if (input_count == 0) {
+                @compileError("ECS needs at least one archetype.");
+            }
+            var biggest: usize = 0;
+            for (0..input_count) |i| {
+                const inner_info = @typeInfo(@TypeOf(sets[i]));
+                if (inner_info != .@"struct" or !inner_info.@"struct".is_tuple) {
+                    @compileError("Each archetype must be a tuple of component types; tuples may be nested.");
+                }
+                const leaf_count = flattenTypes(sets[i]).len;
+                if (leaf_count > biggest) {
+                    biggest = leaf_count;
                 }
             }
-            if (owner.superset_storage.items.len >= max_supersets) {
-                return EcsError.SupersetListOverflow;
-            }
-            try owner.superset_storage.append(allocator, super);
-        }
-        /// Copies bytes of components shared by two archetype rows.
-        /// - `source` - archetype to read from.
-        /// - `source_index` - row position in the source storage.
-        /// - `dest` - archetype to write to.
-        /// - `dest_index` - row position in the destination storage.
-        fn copyShared(
-            source: *const ArchetypeInfo,
-            source_index: u32,
-            dest: *ArchetypeInfo,
-            dest_index: u32,
-        ) void {
-            for (source.components) |src| {
-                const dest_column: usize = dest.columnOf(src.id) orelse continue;
-                const dest_info: *const ComponentInfo = dest.components[dest_column];
-                const src_bytes: []const u8 =
-                    source.vtable.raw(
-                        source.data,
-                        src,
-                        source_index,
-                    ) orelse continue;
-                const dst_bytes: []u8 =
-                    dest.vtable.raw_mut(
-                        dest.data,
-                        dest_info,
-                        dest_index,
-                    ) orelse continue;
-                const byte_count: usize = @min(src_bytes.len, dst_bytes.len);
-                @memcpy(dst_bytes[0..byte_count], src_bytes[0..byte_count]);
-            }
-        }
-        /// Detects types produced by the Component factory.
-        /// - `Candidate` - type to inspect.
-        ///
-        /// Returns `bool` - true for component wrappers only.
-        pub fn isComponent(comptime Candidate: type) bool {
-            const type_info = @typeInfo(Candidate);
-            if (type_info != .@"struct") {
-                return false;
-            }
-            if (!@hasDecl(Candidate, "kind")) {
-                return false;
-            }
-            if (!@hasDecl(Candidate, "ComponentType")) {
-                return false;
-            }
-            return Candidate.kind == .component;
-        }
-        /// Detects types produced by the Archetype factories.
-        /// - `Candidate` - type to inspect.
-        ///
-        /// Returns `bool` - true for archetype types only.
-        pub fn isArchetype(comptime Candidate: type) bool {
-            const type_info = @typeInfo(Candidate);
-            if (type_info != .@"struct") {
-                return false;
-            }
-            if (!@hasDecl(Candidate, "kind")) {
-                return false;
-            }
-            if (!@hasDecl(Candidate, "components")) {
-                return false;
-            }
-            return Candidate.kind == .archetype;
-        }
-        /// Builds the component wrapper for a plain struct type. Rejects archetypes at compile time.
-        /// - `Raw` - struct type, or an existing component wrapper to reuse.
-        ///
-        /// Returns `type` - component wrapper owning the unique id and the runtime descriptor.
-        pub fn Component(comptime Raw: type) type {
-            if (Ecs.isArchetype(Raw)) {
-                @compileError("Archetype cannot be used as a component. Pass a plain struct instead.");
-            }
-            return struct {
-                const Self = @This();
-                /// Marks this type as a component for isComponent checks.
-                pub const kind = .component;
-                /// The unwrapped struct type carrying the payload.
-                pub const ComponentType: type = if (Ecs.isComponent(Raw))
-                    Raw.ComponentType
-                else
-                    Raw;
-                comptime {
-                    if (@typeInfo(ComponentType) != .@"struct") {
-                        @compileError("Component must be a struct type.");
-                    }
-                }
-                /// Lazily assigned component id. Stable for the same underlying type.
-                var id_storage: ?u32 = null;
-                /// Archetypes currently holding this component.
-                var archetypes: std.ArrayListUnmanaged(*Ecs.ArchetypeInfo) = .empty;
-                /// Single cached runtime descriptor shared by all callers.
-                var cache: ?Ecs.ComponentInfo = null;
-                ///
-                /// Returns the lazily assigned component id.
-                ///
-                /// Returns `u32` - stable component id.
-                pub fn id() u32 {
-                    if (Self.id_storage == null) {
-                        if (Ecs.next_component_id >= max_components) {
-                            @panic("component count exceeds max_components");
-                        }
-                        Self.id_storage = Ecs.next_component_id;
-                        Ecs.next_component_id += 1;
-                    }
-                    return Self.id_storage.?;
-                }
-
-                ///
-                /// Returns the cached runtime component descriptor.
-                ///
-                /// Returns `*const ComponentInfo` - shared descriptor, built on first call.
-                pub fn info() *const Ecs.ComponentInfo {
-                    _ = Self.id();
-                    if (Self.cache == null) {
-                        Self.cache = Ecs.ComponentInfo{
-                            .id = Self.id_storage.?,
-                            .size = @sizeOf(Self.ComponentType),
-                            .alignment = @alignOf(Self.ComponentType),
-                            .name = @typeName(Self.ComponentType),
-                            .archetype_storage = &Self.archetypes,
-                        };
-                    }
-                    return &Self.cache.?;
-                }
-                /// Records an archetype as a holder of this component.
-                /// - `allocator` - funds list growth.
-                /// - `handle` - archetype to record.
-                fn attach(
-                    allocator: std.mem.Allocator,
-                    handle: *Ecs.ArchetypeInfo,
-                ) Ecs.EcsError!void {
-                    for (Self.archetypes.items) |known| {
-                        if (known == handle) {
-                            return;
-                        }
-                    }
-                    if (Self.archetypes.items.len >= max_archetypes) {
-                        return Ecs.EcsError.ArchetypeListOverflow;
-                    }
-                    if (Self.archetypes.items.len == 0) {
-                        try Ecs.tracked.append(
-                            allocator,
-                            &Self.archetypes,
-                        );
-                    }
-                    try Self.archetypes.append(allocator, handle);
-                }
+            const Keep = struct {
+                const value: usize = biggest;
             };
-        }
-        /// Normalizes component input: unwraps wrappers, flattens archetypes, dedups and sorts by type name.
-        /// - `input` - mixed component, wrapper and archetype types.
-        /// - `max_count` - upper bound on distinct components, sizes the scratch buffers.
-        ///
-        /// Returns `[]const type` - canonical, sorted, unique type list.
-        pub fn GetComponentsTypes(comptime input: []const type, comptime max_count: usize) []const type {
-            return comptime canon: {
-                var flat: [max_count]type = undefined;
-                var flat_len: usize = 0;
-                for (input) |item| {
-                    if (Ecs.isArchetype(item)) {
-                        for (item.components) |nested| {
-                            if (flat_len >= max_count) {
-                                @compileError("Too many components after archetype flattening.");
-                            }
-                            flat[flat_len] = nested;
-                            flat_len += 1;
-                        }
-                    } else if (Ecs.isComponent(item)) {
-                        if (flat_len >= max_count) {
-                            @compileError("Too many components.");
-                        }
-                        flat[flat_len] = item.ComponentType;
-                        flat_len += 1;
-                    } else {
-                        if (@typeInfo(item) != .@"struct") {
-                            @compileError("Every component must be a struct type.");
-                        }
-                        if (item == Entity or item == EntityReference) {
-                            @compileError("Entity and EntityReference cannot be components.");
-                        }
-                        if (flat_len >= max_count) {
-                            @compileError("Too many components.");
-                        }
-                        flat[flat_len] = item;
-                        flat_len += 1;
-                    }
-                }
-                var unique: [max_count]type = undefined;
+            break :blk Keep.value;
+        };
+        /// Every comptime table: canonical types, deduplicated archetypes, components,
+        /// superset links and component->archetype links. Frozen once, read-only after.
+        const Tables = blk: {
+            var canon_types: [input_count][max_len]type = undefined;
+            var canon_lens: [input_count]usize = [_]usize{0} ** input_count;
+            for (0..input_count) |i| {
+                const flat = flattenTypes(sets[i]);
+                var uniq: [max_len]type = undefined;
                 var total: usize = 0;
-                for (flat[0..flat_len]) |candidate| {
+                for (flat) |candidate| {
                     var duplicate: bool = false;
-                    for (unique[0..total]) |existing| {
+                    for (uniq[0..total]) |existing| {
                         if (existing == candidate) {
                             duplicate = true;
                             break;
                         }
                     }
                     if (!duplicate) {
-                        unique[total] = candidate;
+                        uniq[total] = candidate;
                         total += 1;
                     }
                 }
                 var outer: usize = 0;
                 while (outer < total) : (outer += 1) {
-                    var inner: usize = outer + 1;
-                    while (inner < total) : (inner += 1) {
-                        const left: []const u8 = @typeName(unique[outer]);
-                        const right: []const u8 = @typeName(unique[inner]);
+                    var inner_cursor: usize = outer + 1;
+                    while (inner_cursor < total) : (inner_cursor += 1) {
+                        const left: []const u8 = @typeName(uniq[outer]);
+                        const right: []const u8 = @typeName(uniq[inner_cursor]);
                         if (std.mem.order(u8, right, left) == .lt) {
-                            const swap: type = unique[outer];
-                            unique[outer] = unique[inner];
-                            unique[inner] = swap;
+                            const swap: type = uniq[outer];
+                            uniq[outer] = uniq[inner_cursor];
+                            uniq[inner_cursor] = swap;
                         }
                     }
                 }
-                if (total == 0) {
-                    @compileError("Archetype must contain at least one component.");
+                canon_types[i] = uniq;
+                canon_lens[i] = total;
+            }
+            var arch_types: [input_count][max_len]type = undefined;
+            var arch_lens: [input_count]usize = [_]usize{0} ** input_count;
+            var uniq_count: usize = 0;
+            for (0..input_count) |i| {
+                var duplicate: bool = false;
+                for (0..uniq_count) |u| {
+                    if (canon_lens[i] != arch_lens[u]) {
+                        continue;
+                    }
+                    var same: bool = true;
+                    for (0..canon_lens[i]) |k| {
+                        if (canon_types[i][k] != arch_types[u][k]) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (same) {
+                        duplicate = true;
+                        break;
+                    }
                 }
-                var ordered: [max_count]type = undefined;
-                for (unique[0..total], 0..) |value, offset| {
-                    ordered[offset] = value;
+                if (!duplicate) {
+                    arch_types[uniq_count] = canon_types[i];
+                    arch_lens[uniq_count] = canon_lens[i];
+                    uniq_count += 1;
+                }
+            }
+            var comp_types: [input_count * max_len]type = undefined;
+            var comp_count: usize = 0;
+            for (0..uniq_count) |a| {
+                for (0..arch_lens[a]) |k| {
+                    const T: type = arch_types[a][k];
+                    var seen: bool = false;
+                    for (0..comp_count) |c| {
+                        if (comp_types[c] == T) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) {
+                        comp_types[comp_count] = T;
+                        comp_count += 1;
+                    }
+                }
+            }
+            var comp_outer: usize = 0;
+            while (comp_outer < comp_count) : (comp_outer += 1) {
+                var comp_inner: usize = comp_outer + 1;
+                while (comp_inner < comp_count) : (comp_inner += 1) {
+                    const left: []const u8 = @typeName(comp_types[comp_outer]);
+                    const right: []const u8 = @typeName(comp_types[comp_inner]);
+                    if (std.mem.order(u8, right, left) == .lt) {
+                        const swap: type = comp_types[comp_outer];
+                        comp_types[comp_outer] = comp_types[comp_inner];
+                        comp_types[comp_inner] = swap;
+                    }
+                }
+            }
+            var arch_comp: [input_count][max_len]u32 = undefined;
+            for (0..uniq_count) |a| {
+                for (0..arch_lens[a]) |k| {
+                    var found: ?usize = null;
+                    for (0..comp_count) |c| {
+                        if (comp_types[c] == arch_types[a][k]) {
+                            found = c;
+                            break;
+                        }
+                    }
+                    arch_comp[a][k] = @intCast(found.?);
+                }
+            }
+            var sup: [input_count][input_count]u32 = undefined;
+            var sup_lens: [input_count]usize = [_]usize{0} ** input_count;
+            var total_sup: usize = 0;
+            for (0..uniq_count) |a| {
+                var n: usize = 0;
+                for (0..uniq_count) |b| {
+                    if (a == b) {
+                        continue;
+                    }
+                    if (arch_lens[b] <= arch_lens[a]) {
+                        continue;
+                    }
+                    var covers: bool = true;
+                    for (0..arch_lens[a]) |k| {
+                        var has: bool = false;
+                        for (0..arch_lens[b]) |j| {
+                            if (arch_comp[b][j] == arch_comp[a][k]) {
+                                has = true;
+                                break;
+                            }
+                        }
+                        if (!has) {
+                            covers = false;
+                            break;
+                        }
+                    }
+                    if (covers) {
+                        sup[a][n] = @intCast(b);
+                        n += 1;
+                    }
+                }
+                sup_lens[a] = n;
+                total_sup += n;
+            }
+            var ca: [input_count * max_len][input_count]u32 = undefined;
+            var ca_lens: [input_count * max_len]usize = [_]usize{0} ** (input_count * max_len);
+            var total_ca: usize = 0;
+            for (0..comp_count) |c| {
+                var n: usize = 0;
+                for (0..uniq_count) |a| {
+                    var has: bool = false;
+                    for (0..arch_lens[a]) |k| {
+                        if (arch_comp[a][k] == @as(u32, @intCast(c))) {
+                            has = true;
+                            break;
+                        }
+                    }
+                    if (has) {
+                        ca[c][n] = @intCast(a);
+                        n += 1;
+                    }
+                }
+                ca_lens[c] = n;
+                total_ca += n;
+            }
+            var total_arch_entries: usize = 0;
+            for (0..uniq_count) |a| {
+                total_arch_entries += arch_lens[a];
+            }
+            break :blk .{
+                .uniq_count = uniq_count,
+                .comp_count = comp_count,
+                .arch_types = arch_types,
+                .arch_comp = arch_comp,
+                .arch_lens = arch_lens,
+                .sup = sup,
+                .sup_lens = sup_lens,
+                .ca = ca,
+                .ca_lens = ca_lens,
+                .comp_types = comp_types,
+                .total_arch_entries = total_arch_entries,
+                .total_sup = total_sup,
+                .total_ca = total_ca,
+            };
+        };
+        /// Number of unique archetypes. Ids are `0..archetype_count-1`.
+        pub const archetype_count: usize = Tables.uniq_count;
+        /// Number of unique components. Ids are `0..component_count-1`.
+        pub const component_count: usize = Tables.comp_count;
+        /// Alias used by dispatch loops.
+        const ARCH_COUNT: usize = Tables.uniq_count;
+        /// Flat component ids of every archetype, concatenated in archetype order.
+        const arch_comp_flat: [Tables.total_arch_entries]u32 = blk: {
+            var flat: [Tables.total_arch_entries]u32 = undefined;
+            var cursor: usize = 0;
+            for (0..ARCH_COUNT) |a| {
+                for (0..Tables.arch_lens[a]) |k| {
+                    flat[cursor] = Tables.arch_comp[a][k];
+                    cursor += 1;
+                }
+            }
+            break :blk flat;
+        };
+        /// Flat superset ids of every archetype, concatenated in archetype order.
+        const arch_sup_flat: [Tables.total_sup]u32 = blk: {
+            var flat: [Tables.total_sup]u32 = undefined;
+            var cursor: usize = 0;
+            for (0..ARCH_COUNT) |a| {
+                for (0..Tables.sup_lens[a]) |k| {
+                    flat[cursor] = Tables.sup[a][k];
+                    cursor += 1;
+                }
+            }
+            break :blk flat;
+        };
+        /// Flat archetype ids of every component, concatenated in component order.
+        const comp_arch_flat: [Tables.total_ca]u32 = blk: {
+            var flat: [Tables.total_ca]u32 = undefined;
+            var cursor: usize = 0;
+            for (0..component_count) |c| {
+                for (0..Tables.ca_lens[c]) |k| {
+                    flat[cursor] = Tables.ca[c][k];
+                    cursor += 1;
+                }
+            }
+            break :blk flat;
+        };
+        /// Static component descriptors. `components[id].id == id` always holds.
+        pub const components: [component_count]ComponentInfo = blk: {
+            var out: [component_count]ComponentInfo = undefined;
+            var cursor: usize = 0;
+            for (0..component_count) |c| {
+                const T: type = Tables.comp_types[c];
+                const len: usize = Tables.ca_lens[c];
+                out[c] = ComponentInfo{
+                    .id = @intCast(c),
+                    .size = @sizeOf(T),
+                    .alignment = @alignOf(T),
+                    .name = @typeName(T),
+                    .archetype_ids = comp_arch_flat[cursor..][0..len],
+                };
+                cursor += len;
+            }
+            break :blk out;
+        };
+        /// Static archetype descriptors. `archetypes[id].id == id` always holds.
+        pub const archetypes: [archetype_count]ArchetypeInfo = blk: {
+            var out: [archetype_count]ArchetypeInfo = undefined;
+            var comp_cursor: usize = 0;
+            var sup_cursor: usize = 0;
+            for (0..archetype_count) |a| {
+                const comp_len: usize = Tables.arch_lens[a];
+                const sup_len: usize = Tables.sup_lens[a];
+                out[a] = ArchetypeInfo{
+                    .id = @intCast(a),
+                    .component_ids = arch_comp_flat[comp_cursor..][0..comp_len],
+                    .superset_ids = arch_sup_flat[sup_cursor..][0..sup_len],
+                };
+                comp_cursor += comp_len;
+                sup_cursor += sup_len;
+            }
+            break :blk out;
+        };
+        /// Checks whether a comptime type list contains a type.
+        /// - `list` - types to search.
+        /// - `Item` - type to look up.
+        ///
+        /// Returns `bool` - true when an equal type is present.
+        fn hasType(comptime list: []const type, comptime Item: type) bool {
+            for (list) |T| {
+                if (T == Item) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        /// Maps a type to its column index inside a comptime type list.
+        /// - `list` - types defining the column order.
+        /// - `Item` - type to locate. Must be present.
+        ///
+        /// Returns `usize` - column index of the type.
+        fn indexOfType(comptime list: []const type, comptime Item: type) usize {
+            for (list, 0..) |T, i| {
+                if (T == Item) {
+                    return i;
+                }
+            }
+            @compileError("Type is not part of this archetype.");
+        }
+        /// Finds the component id of a type. Works at comptime and runtime.
+        /// - `T` - component type to look up.
+        ///
+        /// Returns `?usize` - component id, or null when the type was never declared.
+        fn componentIndex(comptime T: type) ?usize {
+            for (0..component_count) |c| {
+                if (Tables.comp_types[c] == T) {
+                    return c;
+                }
+            }
+            return null;
+        }
+        /// Counts leaf component types inside a possibly nested bundle.
+        /// Only tuples and arrays are traversed; named structs count as one leaf.
+        /// - `node` - a type, a tuple/array of types, or a pointer to either.
+        ///
+        /// Returns `usize` - number of leaf entries in the bundle.
+        fn countLeafTypes(comptime node: anytype) usize {
+            const Info = @typeInfo(@TypeOf(node));
+            if (Info == .pointer and Info.pointer.size == .slice) {
+                var total: usize = 0;
+                for (0..node.len) |i| {
+                    total += countLeafTypes(node[i]);
+                }
+                return total;
+            }
+            if (Info == .pointer) {
+                return countLeafTypes(node.*);
+            }
+            if (Info == .@"struct" and Info.@"struct".is_tuple) {
+                var total: usize = 0;
+                for (0..Info.@"struct".fields.len) |i| {
+                    total += countLeafTypes(node[i]);
+                }
+                return total;
+            }
+            if (Info == .array) {
+                var total: usize = 0;
+                for (0..Info.array.len) |i| {
+                    total += countLeafTypes(node[i]);
+                }
+                return total;
+            }
+            return 1;
+        }
+        /// Collects leaf component types from a possibly nested bundle.
+        /// Only tuples and arrays are traversed; named structs are leaves.
+        /// - `node` - a type, a tuple/array of types, or a pointer to either.
+        /// - `buf` - backing storage for the collected types.
+        /// - `start` - position in `buf` where collection begins.
+        ///
+        /// Returns `usize` - position in `buf` just past the collected types.
+        fn collectLeafTypes(comptime node: anytype, buf: []type, start: usize) usize {
+            const Info = @typeInfo(@TypeOf(node));
+            if (Info == .pointer and Info.pointer.size == .slice) {
+                var cursor: usize = start;
+                for (0..node.len) |i| {
+                    cursor = collectLeafTypes(node[i], buf, cursor);
+                }
+                return cursor;
+            }
+            if (Info == .pointer) {
+                return collectLeafTypes(node.*, buf, start);
+            }
+            if (Info == .@"struct" and Info.@"struct".is_tuple) {
+                var cursor: usize = start;
+                for (0..Info.@"struct".fields.len) |i| {
+                    cursor = collectLeafTypes(node[i], buf, cursor);
+                }
+                return cursor;
+            }
+            if (Info == .array) {
+                var cursor: usize = start;
+                for (0..Info.array.len) |i| {
+                    cursor = collectLeafTypes(node[i], buf, cursor);
+                }
+                return cursor;
+            }
+            if (@TypeOf(node) != type) {
+                @compileError("Every entry must be a component type or a tuple of component types.");
+            }
+            const T: type = node;
+            if (@typeInfo(T) != .@"struct") {
+                @compileError("Every component must be a struct type.");
+            }
+            if (T == Entity or T == EntityReference) {
+                @compileError("Entity and EntityReference cannot be components.");
+            }
+            buf[start] = T;
+            return start + 1;
+        }
+        /// Flattens a possibly nested component bundle into a plain type list.
+        /// Accepts single types, tuples of types nested arbitrarily, arrays and
+        /// pointers to either (as produced by `&.{...}`).
+        /// - `input` - component bundle to flatten.
+        ///
+        /// Returns `[]const type` - flat type list, order preserved, duplicates kept.
+        fn flattenTypes(comptime input: anytype) []const type {
+            return flattenTypesInner(input, false);
+        }
+        /// Flattens a bundle like `flattenTypes`, but an empty bundle is allowed
+        /// and yields an empty list instead of a compile error.
+        /// - `input` - component bundle to flatten.
+        ///
+        /// Returns `[]const type` - flat type list, possibly empty.
+        fn flattenTypesAllowEmpty(comptime input: anytype) []const type {
+            return flattenTypesInner(input, true);
+        }
+        /// Shared implementation of `flattenTypes` and `flattenTypesAllowEmpty`.
+        /// - `input` - component bundle to flatten.
+        /// - `allow_empty` - when false, an empty bundle is a compile error.
+        ///
+        /// Returns `[]const type` - flat type list, order preserved, duplicates kept.
+        fn flattenTypesInner(comptime input: anytype, comptime allow_empty: bool) []const type {
+            const total = blk: {
+                const n = countLeafTypes(input);
+                const Keep = struct {
+                    const value: usize = n;
+                };
+                break :blk Keep.value;
+            };
+            if (total == 0 and !allow_empty) {
+                @compileError("Archetype or query must contain at least one component type.");
+            }
+            return comptime flat: {
+                var buf: [total]type = undefined;
+                const end = collectLeafTypes(input, buf[0..], 0);
+                const Keep = struct {
+                    const values: [total]type = buf;
+                    const count: usize = end;
+                };
+                break :flat Keep.values[0..Keep.count];
+            };
+        }
+        /// Canonicalizes a component bundle: flattens nested tuples, dedups
+        /// and sorts by type name.
+        /// - `input` - component bundle: types, tuples, arrays or pointers to either.
+        ///
+        /// Returns `[]const type` - canonical, sorted, unique type list.
+        fn canonicalQuery(comptime input: anytype) []const type {
+            return canonicalQueryInner(input, false);
+        }
+        /// Canonicalizes a bundle like `canonicalQuery`, but an empty bundle is
+        /// allowed and yields an empty list instead of a compile error.
+        /// - `input` - component bundle to canonicalize.
+        ///
+        /// Returns `[]const type` - canonical list, possibly empty.
+        fn canonicalQueryAllowEmpty(comptime input: anytype) []const type {
+            return canonicalQueryInner(input, true);
+        }
+        /// Shared implementation of `canonicalQuery` and `canonicalQueryAllowEmpty`.
+        /// - `input` - component bundle to canonicalize.
+        /// - `allow_empty` - when false, an empty bundle is a compile error.
+        ///
+        /// Returns `[]const type` - canonical, sorted, unique type list.
+        fn canonicalQueryInner(comptime input: anytype, comptime allow_empty: bool) []const type {
+            return comptime canon: {
+                const flat_input = if (allow_empty)
+                    flattenTypesAllowEmpty(input)
+                else
+                    flattenTypes(input);
+                var uniq: [flat_input.len]type = undefined;
+                var total: usize = 0;
+                for (flat_input) |candidate| {
+                    var duplicate: bool = false;
+                    for (uniq[0..total]) |existing| {
+                        if (existing == candidate) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        uniq[total] = candidate;
+                        total += 1;
+                    }
+                }
+                var outer: usize = 0;
+                while (outer < total) : (outer += 1) {
+                    var inner_cursor: usize = outer + 1;
+                    while (inner_cursor < total) : (inner_cursor += 1) {
+                        const left: []const u8 = @typeName(uniq[outer]);
+                        const right: []const u8 = @typeName(uniq[inner_cursor]);
+                        if (std.mem.order(u8, right, left) == .lt) {
+                            const swap: type = uniq[outer];
+                            uniq[outer] = uniq[inner_cursor];
+                            uniq[inner_cursor] = swap;
+                        }
+                    }
+                }
+                for (uniq[0..total]) |T| {
+                    if (componentIndex(T) == null) {
+                        @compileError("Component type was not declared in ECS(...).");
+                    }
                 }
                 const Keep = struct {
-                    const values: [max_count]type = ordered;
+                    const values: [flat_input.len]type = uniq;
                     const count: usize = total;
                 };
                 break :canon Keep.values[0..Keep.count];
             };
         }
-        /// Builds an archetype from input types, normalizing away input order.
-        /// - `input` - component, wrapper or archetype types.
+        /// Checks whether one archetype stores a type, by archetype id.
+        /// - `k` - archetype id. Must be comptime-known.
+        /// - `Item` - component type to look up.
         ///
-        /// Returns `type` - canonical archetype type.
-        pub fn Archetype(comptime input: []const type) type {
-            const canonical: []const type =
-                Ecs.GetComponentsTypes(input, max_components);
-            return Ecs.CreateArchetype(canonical);
+        /// Returns `bool` - true when the archetype stores the type.
+        fn archHasType(comptime k: usize, comptime Item: type) bool {
+            for (0..Tables.arch_lens[k]) |i| {
+                if (Tables.arch_types[k][i] == Item) {
+                    return true;
+                }
+            }
+            return false;
         }
-        /// Builds the SOA storage type for one archetype from a tuple of component lists.
-        /// - `Tuple` - tuple type of ArrayListUnmanaged, one per component.
+        /// Maps a type to its column index inside one archetype, by archetype id.
+        /// - `k` - archetype id. Must be comptime-known.
+        /// - `Item` - component type to locate. Must be stored in the archetype.
+        ///
+        /// Returns `usize` - column index of the type.
+        fn archIndexOf(comptime k: usize, comptime Item: type) usize {
+            for (0..Tables.arch_lens[k]) |i| {
+                if (Tables.arch_types[k][i] == Item) {
+                    return i;
+                }
+            }
+            @compileError("Type is not part of this archetype.");
+        }
+        /// Compares one archetype against a canonical query for exact equality.
+        /// - `k` - archetype id. Must be comptime-known.
+        /// - `q` - canonical query types.
+        ///
+        /// Returns `bool` - true when the sets match exactly.
+        fn archTypesEqual(comptime k: usize, comptime q: []const type) bool {
+            if (Tables.arch_lens[k] != q.len) {
+                return false;
+            }
+            for (0..Tables.arch_lens[k]) |i| {
+                if (Tables.arch_types[k][i] != q[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        /// Component ids of one archetype, sorted ascending.
+        /// - `k` - archetype id. Must be comptime-known.
+        ///
+        /// Returns `[]const u32` - component id list of the archetype.
+        fn archetypeCompIds(comptime k: usize) []const u32 {
+            return Tables.arch_comp[k][0..Tables.arch_lens[k]];
+        }
+        /// Checks whether a sorted id list contains a component id.
+        /// - `ids` - sorted component ids.
+        /// - `target` - component id to look up.
+        ///
+        /// Returns `bool` - true when the id is present.
+        fn containsId(comptime ids: []const u32, comptime target: u32) bool {
+            for (ids) |id| {
+                if (id == target) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        /// Resolves a component type to its dense id.
+        /// - `T` - component type. Must be declared in `ECS(...)`.
+        ///
+        /// Returns `u32` - component id, an index into `components`.
+        pub fn componentId(comptime T: type) u32 {
+            const idx = comptime componentIndex(T) orelse
+                @compileError("Unknown component: type was not declared in ECS(...).");
+            return @intCast(idx);
+        }
+        /// Resolves a component type to its static descriptor.
+        /// - `T` - component type. Must be declared in `ECS(...)`.
+        ///
+        /// Returns `*const ComponentInfo` - shared static descriptor.
+        pub fn componentInfo(comptime T: type) *const ComponentInfo {
+            return &Ecs.components[Ecs.componentId(T)];
+        }
+        /// Resolves a component bundle to its archetype id. Order does not matter,
+        /// nested tuples are flattened.
+        /// - `types` - component bundle. Must exactly match a declared archetype.
+        ///
+        /// Returns `u32` - archetype id, an index into `archetypes`.
+        pub fn archetypeId(comptime types: anytype) u32 {
+            const q = comptime canonicalQuery(types);
+            inline for (0..ARCH_COUNT) |k| {
+                if (comptime archTypesEqual(k, q)) {
+                    return @intCast(k);
+                }
+            }
+            @compileError("Unknown archetype: this combination was not declared in ECS(...).");
+        }
+        /// Returns the static descriptor of the archetype with the given id.
+        /// - `id` - archetype id, an index into `archetypes`.
+        ///
+        /// Returns `*const ArchetypeInfo` - shared static descriptor.
+        pub fn archetypeInfoById(id: u32) *const ArchetypeInfo {
+            return &Ecs.archetypes[id];
+        }
+        /// Builds the SOA storage type for one archetype from its component types.
+        /// - `arch_types_fixed` - canonical component types padded to `max_len`, defining the column order.
+        /// - `arch_len` - number of valid entries in `arch_types_fixed`.
         ///
         /// Returns `type` - structure-of-arrays storage with component columns and entity refs.
-        pub fn ArchetypeData(comptime Tuple: type) type {
+        fn MakeData(comptime arch_types_fixed: [max_len]type, comptime arch_len: usize) type {
+            const ArchTypes: []const type = arch_types_fixed[0..arch_len];
+            const ListTypes: [ArchTypes.len]type = blk: {
+                var tmp: [ArchTypes.len]type = undefined;
+                for (ArchTypes, 0..) |T, i| {
+                    tmp[i] = std.ArrayListUnmanaged(T);
+                }
+                break :blk tmp;
+            };
+            const Lists = std.meta.Tuple(&ListTypes);
             return struct {
                 const Self = @This();
-                /// One column per component type. Indexed by the tuple position.
-                lists: Tuple,
+                /// One column per component type. Indexed by the canonical position.
+                lists: Lists,
                 /// One row per stored entity, parallel to the component columns.
                 refs: std.ArrayListUnmanaged(EntityReference) = .empty,
-                /// id->column map (value = column + 1, 0 = absent). Built lazily.
-                var component_map: [max_components]u32 = @splat(0);
-                /// Per-column const byte accessor, indexed by column. Built lazily.
-                var raw_accessors: [column_count]RawAccessor = undefined;
-                /// Per-column mutable byte accessor, indexed by column. Built lazily.
-                var mut_accessors: [column_count]MutAccessor = undefined;
-                /// Per-column whole-list byte accessor, indexed by column. Built lazily.
-                var list_accessors: [column_count]ListAccessor = undefined;
-                /// Guards one-time accessor build.
-                var accessors_built: bool = false;
-
-                const column_count: usize = @typeInfo(Tuple).@"struct".fields.len;
-                const RawAccessor = *const fn (*const Self, u32) ?[]const u8;
-                const MutAccessor = *const fn (*Self, u32) ?[]u8;
-                const ListAccessor = *const fn (*const Self) ?[]const u8;
-
-                fn makeRawAccessor(comptime field_index: usize, comptime Element: type) type {
-                    return struct {
-                        fn get(self: *const Self, index: u32) ?[]const u8 {
-                            const column_list: *const std.ArrayListUnmanaged(Element) =
-                                &self.lists[field_index];
-                            if (index >= column_list.items.len) {
-                                return null;
-                            }
-                            const element: *const Element = &column_list.items[index];
-                            const bytes: [*]const u8 = @ptrCast(element);
-                            return bytes[0..@sizeOf(Element)];
-                        }
-                    };
-                }
-
-                fn makeMutAccessor(comptime field_index: usize, comptime Element: type) type {
-                    return struct {
-                        fn get(self: *Self, index: u32) ?[]u8 {
-                            const column_list: *std.ArrayListUnmanaged(Element) =
-                                &self.lists[field_index];
-                            if (index >= column_list.items.len) {
-                                return null;
-                            }
-                            const element: *Element = &column_list.items[index];
-                            const bytes: [*]u8 = @ptrCast(element);
-                            return bytes[0..@sizeOf(Element)];
-                        }
-                    };
-                }
-
-                fn makeListAccessor(comptime field_index: usize, comptime Element: type) type {
-                    return struct {
-                        fn get(self: *const Self) ?[]const u8 {
-                            const column_list: *const std.ArrayListUnmanaged(Element) =
-                                &self.lists[field_index];
-                            const bytes: [*]const u8 = @ptrCast(column_list.items.ptr);
-                            return bytes[0 .. column_list.items.len * @sizeOf(Element)];
-                        }
-                    };
-                }
-
-                fn ensureAccessors() void {
-                    if (Self.accessors_built) {
-                        return;
+                /// Builds empty storage. Usable in comptime initializers.
+                ///
+                /// Returns `Self` - storage with every list empty.
+                pub fn empty() Self {
+                    var lists: Lists = undefined;
+                    inline for (0..ArchTypes.len) |i| {
+                        lists[i] = .empty;
                     }
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const List: type = field.type;
-                        switch (@typeInfo(List)) {
-                            .@"struct" => |list_info| {
-                                inline for (list_info.fields) |member| {
-                                    switch (@typeInfo(member.type)) {
-                                        .pointer => |ptr| {
-                                            const Element: type = ptr.child;
-                                            const id: u32 = Ecs.Component(Element).id();
-                                            if (id >= max_components) {
-                                                @panic("component id exceeds max_components");
-                                            }
-                                            Self.component_map[id] = @intCast(field_index + 1);
-                                            Self.raw_accessors[field_index] =
-                                                Self.makeRawAccessor(field_index, Element).get;
-                                            Self.mut_accessors[field_index] =
-                                                Self.makeMutAccessor(field_index, Element).get;
-                                            Self.list_accessors[field_index] =
-                                                Self.makeListAccessor(field_index, Element).get;
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
-                    }
-                    Self.accessors_built = true;
+                    return Self{
+                        .lists = lists,
+                        .refs = .empty,
+                    };
                 }
                 /// Locates the column index storing the given component type.
-                /// - `Target` - component type to locate.
+                /// - `Target` - component type to locate. Must be stored here.
                 ///
-                /// Returns `usize` - tuple field index, or a compile error when absent.
+                /// Returns `usize` - canonical column index.
                 fn indexOf(comptime Target: type) usize {
-                    return comptime search_block: {
-                        const type_info = @typeInfo(Tuple).@"struct";
-                        for (type_info.fields, 0..) |field, field_index| {
-                            const List: type = field.type;
-                            switch (@typeInfo(List)) {
-                                .@"struct" => |list_info| {
-                                    for (list_info.fields) |member| {
-                                        switch (@typeInfo(member.type)) {
-                                            .pointer => |ptr| {
-                                                if (std.mem.eql(u8, member.name, "items") and
-                                                    ptr.child == Target)
-                                                {
-                                                    break :search_block field_index;
-                                                }
-                                            },
-                                            else => {},
-                                        }
-                                    }
-                                },
-                                else => {},
-                            }
-                        }
-                        @compileError("Requested component type is not stored in this archetype.");
-                    };
+                    return Ecs.indexOfType(ArchTypes, Target);
                 }
                 /// Counts stored rows.
                 /// - `self` - storage to inspect.
@@ -801,10 +954,7 @@ pub fn ECS(
                 /// - `index` - row position.
                 ///
                 /// Returns `bool` - true when the position is in range.
-                pub fn exists(
-                    self: *const Self,
-                    index: u32,
-                ) bool {
+                pub fn exists(self: *const Self, index: u32) bool {
                     return index < self.refs.items.len;
                 }
                 /// Fetches the entity reference stored at the given position.
@@ -812,86 +962,46 @@ pub fn ECS(
                 /// - `index` - row position.
                 ///
                 /// Returns `EntityReference` - reference stored in the row.
-                pub fn entity(
-                    self: *const Self,
-                    index: u32,
-                ) Ecs.EcsError!EntityReference {
+                pub fn entity(self: *const Self, index: u32) EcsError!EntityReference {
                     if (!self.exists(index)) {
-                        return Ecs.EcsError.IndexOutOfBounds;
+                        return EcsError.IndexOutOfBounds;
                     }
                     return self.refs.items[index];
                 }
-                ///
-                /// Returns a read-only pointer to one component value.
+                /// Returns a pointer to one component value. The pointer is mutable
+                /// even though the receiver is const: columns live in global
+                /// storage, the storage header itself is never modified.
                 /// - `self` - storage to inspect.
-                /// - `Target` - component type to fetch.
+                /// - `Target` - component type to fetch. Must be stored here.
                 /// - `index` - row position.
                 ///
-                /// Returns `*const Target` - pointer into the component column.
+                /// Returns `*Target` - pointer into the component column.
                 pub fn get(
                     self: *const Self,
                     comptime Target: type,
                     index: u32,
-                ) Ecs.EcsError!*const Target {
-                    if (@typeInfo(Target) != .@"struct") {
-                        @compileError("Requested component must be a struct type.");
+                ) EcsError!*Target {
+                    const column: *const std.ArrayListUnmanaged(Target) =
+                        &self.lists[comptime Self.indexOf(Target)];
+                    if (index >= column.items.len) {
+                        return EcsError.IndexOutOfBounds;
                     }
-                    if (Target == Entity or Target == EntityReference) {
-                        @compileError("Use entity for EntityReference, not get.");
-                    }
-                    const column: usize = comptime Self.indexOf(Target);
-                    const column_list: *const std.ArrayListUnmanaged(Target) =
-                        &self.lists[column];
-                    if (index >= column_list.items.len) {
-                        return Ecs.EcsError.IndexOutOfBounds;
-                    }
-                    return &column_list.items[index];
-                }
-                ///
-                /// Returns a mutable pointer to one component value.
-                /// - `self` - storage to mutate.
-                /// - `Target` - component type to fetch.
-                /// - `index` - row position.
-                ///
-                /// Returns `*Target` - mutable pointer into the component column.
-                pub fn getMut(
-                    self: *Self,
-                    comptime Target: type,
-                    index: u32,
-                ) Ecs.EcsError!*Target {
-                    if (@typeInfo(Target) != .@"struct") {
-                        @compileError("Requested component must be a struct type.");
-                    }
-                    if (Target == Entity or Target == EntityReference) {
-                        @compileError("Use entity for EntityReference, not get.");
-                    }
-                    const column: usize = comptime Self.indexOf(Target);
-                    const column_list: *std.ArrayListUnmanaged(Target) =
-                        &self.lists[column];
-                    if (index >= column_list.items.len) {
-                        return Ecs.EcsError.IndexOutOfBounds;
-                    }
-                    return &column_list.items[index];
+                    // Safe: every Data instance lives in the mutable global
+                    // `storages` tuple, so the column is never truly immutable.
+                    return @constCast(&column.items[index]);
                 }
                 /// Exposes a whole component column as a read-only list.
                 /// - `self` - storage to inspect.
-                /// - `Target` - component type to expose.
+                /// - `Target` - component type to expose. Must be stored here.
                 ///
                 /// Returns `ReadOnlyList` - live view of the component column.
                 pub fn list(
                     self: *const Self,
                     comptime Target: type,
                 ) ReadOnlyList(Target) {
-                    if (@typeInfo(Target) != .@"struct") {
-                        @compileError("Requested component must be a struct type.");
-                    }
-                    if (Target == Entity or Target == EntityReference) {
-                        @compileError("EntityReference list is accessed via entities.");
-                    }
-                    const column: usize = comptime Self.indexOf(Target);
-                    const column_list: *const std.ArrayListUnmanaged(Target) =
-                        &self.lists[column];
-                    return ReadOnlyList(Target).init(column_list);
+                    const column: *const std.ArrayListUnmanaged(Target) =
+                        &self.lists[comptime Self.indexOf(Target)];
+                    return ReadOnlyList(Target).init(column);
                 }
                 /// Exposes the entity reference column as a read-only list.
                 /// - `self` - storage to inspect.
@@ -900,57 +1010,12 @@ pub fn ECS(
                 pub fn entities(self: *const Self) ReadOnlyList(EntityReference) {
                     return ReadOnlyList(EntityReference).init(&self.refs);
                 }
-                /// Reads one component value as raw bytes, matched by runtime descriptor.
+                /// Exposes the entity reference column.
                 /// - `self` - storage to inspect.
-                /// - `info` - component descriptor to match.
-                /// - `index` - row position.
                 ///
-                /// Returns `?[]const u8` - byte slice, or null when absent or out of range.
-                pub fn raw(
-                    self: *const Self,
-                    info: *const ComponentInfo,
-                    index: u32,
-                ) ?[]const u8 {
-                    Self.ensureAccessors();
-                    const column: u32 = Self.component_map[info.id];
-                    if (column == 0) {
-                        return null;
-                    }
-                    return Self.raw_accessors[column - 1](self, index);
-                }
-                /// Exposes one component value as writable raw bytes, matched by runtime descriptor.
-                /// - `self` - storage to mutate.
-                /// - `info` - component descriptor to match.
-                /// - `index` - row position.
-                ///
-                /// Returns `?[]u8` - writable byte slice, or null when absent or out of range.
-                pub fn rawMut(
-                    self: *Self,
-                    info: *const ComponentInfo,
-                    index: u32,
-                ) ?[]u8 {
-                    Self.ensureAccessors();
-                    const column: u32 = Self.component_map[info.id];
-                    if (column == 0) {
-                        return null;
-                    }
-                    return Self.mut_accessors[column - 1](self, index);
-                }
-                /// Exposes a whole component column as raw bytes, matched by runtime descriptor.
-                /// - `self` - storage to inspect.
-                /// - `info` - component descriptor to match.
-                ///
-                /// Returns `?[]const u8` - byte slice of the whole column, or null when absent.
-                pub fn rawList(
-                    self: *const Self,
-                    info: *const ComponentInfo,
-                ) ?[]const u8 {
-                    Self.ensureAccessors();
-                    const column: u32 = Self.component_map[info.id];
-                    if (column == 0) {
-                        return null;
-                    }
-                    return Self.list_accessors[column - 1](self);
+                /// Returns `[]const EntityReference` - read-only reference list.
+                pub fn entityList(self: *const Self) []const EntityReference {
+                    return self.refs.items;
                 }
                 /// Appends an empty row across all columns plus the reference.
                 /// - `self` - storage to mutate.
@@ -962,12 +1027,9 @@ pub fn ECS(
                     self: *Self,
                     allocator: std.mem.Allocator,
                     reference: *const EntityReference,
-                ) !u32 {
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const column_list = &self.lists[field_index];
-                        _ = field;
-                        try column_list.append(allocator, undefined);
+                ) EcsError!u32 {
+                    inline for (0..ArchTypes.len) |i| {
+                        try self.lists[i].append(allocator, undefined);
                     }
                     try self.refs.append(allocator, reference.*);
                     return @intCast(self.refs.items.len - 1);
@@ -977,19 +1039,13 @@ pub fn ECS(
                 /// - `index` - row position to remove.
                 ///
                 /// Returns `?EntityReference` - relocated reference, or null when the last row was removed.
-                fn remove(
-                    self: *Self,
-                    index: u32,
-                ) ?EntityReference {
+                fn remove(self: *Self, index: u32) ?EntityReference {
                     const previous_count: usize = self.refs.items.len;
                     if (index >= previous_count) {
                         return null;
                     }
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const column_list = &self.lists[field_index];
-                        _ = field;
-                        _ = column_list.swapRemove(index);
+                    inline for (0..ArchTypes.len) |i| {
+                        _ = self.lists[i].swapRemove(index);
                     }
                     _ = self.refs.swapRemove(index);
                     const last: usize = previous_count - 1;
@@ -1002,444 +1058,801 @@ pub fn ECS(
                 /// - `self` - storage to release.
                 /// - `allocator` - allocator that funded the lists.
                 fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-                    const type_info = @typeInfo(Tuple).@"struct";
-                    inline for (type_info.fields, 0..) |field, field_index| {
-                        const column_list = &self.lists[field_index];
-                        _ = field;
-                        column_list.deinit(allocator);
+                    inline for (0..ArchTypes.len) |i| {
+                        self.lists[i].deinit(allocator);
                     }
                     self.refs.deinit(allocator);
                 }
             };
         }
-        /// Builds the concrete archetype type owning state and component storage.
-        /// - `raw` - component type list; normalized internally.
+        /// Concrete storage types, one per archetype, in archetype id order.
+        const DataTypes: [ARCH_COUNT]type = blk: {
+            var tmp: [ARCH_COUNT]type = undefined;
+            for (0..ARCH_COUNT) |j| {
+                tmp[j] = MakeData(Tables.arch_types[j], Tables.arch_lens[j]);
+            }
+            break :blk tmp;
+        };
+        /// Heterogeneous tuple holding every archetype storage.
+        const Storages = std.meta.Tuple(&DataTypes);
+        /// Every archetype storage. Starts empty; rows are added at runtime.
+        var storages: Storages = blk: {
+            var tmp: Storages = undefined;
+            for (0..ARCH_COUNT) |j| {
+                tmp[j] = DataTypes[j].empty();
+            }
+            break :blk tmp;
+        };
+        /// Next fresh entity id. Equals the record count while no slots are recycled.
+        var next_entity_id: u32 = 0;
+        /// All entity records by id. A record id always matches its position here.
+        var entities: std.ArrayListUnmanaged(Entity) = .empty;
+        /// Stack of freed entity ids ready for reuse.
+        var free_ids: std.ArrayListUnmanaged(u32) = .empty;
+        /// Names the storage type of one archetype id. Useful to name the
+        /// pointer returned by `storage` without repeating the lookup.
+        /// - `id` - archetype id. Must be comptime-known.
         ///
-        /// Returns `type` - archetype type with storage, descriptor and mutation helpers.
-        pub fn CreateArchetype(comptime raw: []const type) type {
-            const canonical: []const type =
-                Ecs.GetComponentsTypes(raw, max_components);
-            const type_list: [canonical.len]type = comptime block: {
-                var scratch: [canonical.len]type = undefined;
-                for (canonical, 0..) |item, type_index| {
-                    scratch[type_index] = std.ArrayListUnmanaged(item);
-                }
-                break :block scratch;
+        /// Returns `type` - concrete SOA storage type of the archetype.
+        /// Private: direct storage access can reallocate; use `SystemHandler`.
+        fn Storage(comptime id: usize) type {
+            return DataTypes[id];
+        }
+        /// Returns a direct pointer to the storage of the given component bundle.
+        /// Zero-cost typed access with no dispatch.
+        /// Private: direct storage access can reallocate; use `SystemHandler`.
+        /// - `types` - component bundle. Must exactly match a declared archetype.
+        ///
+        /// Returns `*Storage` - live SOA storage of the archetype.
+        fn storage(comptime types: anytype) *Storage(archetypeId(types)) {
+            const id = comptime archetypeId(types);
+            return &Ecs.storages[id];
+        }
+        /// Creates an entity inside the given archetype, reusing a free slot when possible.
+        /// Private: immediate creation can reallocate; systems use `cmdCreate`.
+        /// - `allocator` - funds record and archetype row allocation.
+        /// - `types` - component bundle of the destination archetype. Must be declared in `ECS(...)`.
+        ///
+        /// Returns `Entity` - freshly stored record copy.
+        fn create(
+            allocator: std.mem.Allocator,
+            comptime types: anytype,
+        ) EcsError!Entity {
+            const id = comptime archetypeId(types);
+            return Ecs.createById(allocator, id);
+        }
+        /// Creates an entity inside the archetype with the given id.
+        /// Private: used by command flushing.
+        /// - `allocator` - funds record and archetype row allocation.
+        /// - `id` - destination archetype id, an index into `archetypes`.
+        ///
+        /// Returns `Entity` - freshly stored record copy.
+        fn createById(allocator: std.mem.Allocator, id: u32) EcsError!Entity {
+            var new_id: u32 = 0;
+            var new_gen: u8 = 0;
+            var slot: *Entity = undefined;
+            if (Ecs.free_ids.pop()) |recycled| {
+                new_id = recycled;
+                slot = &Ecs.entities.items[new_id];
+                new_gen = slot.reference.gen;
+            } else {
+                new_id = Ecs.next_entity_id;
+                Ecs.next_entity_id += 1;
+                const placeholder = Entity{
+                    .reference = EntityReference{
+                        .id = @intCast(new_id),
+                        .gen = 0,
+                    },
+                    .archetype = id,
+                    .index = 0,
+                };
+                try Ecs.entities.append(allocator, placeholder);
+                slot = &Ecs.entities.items[new_id];
+                new_gen = 0;
+            }
+            const reference = EntityReference{
+                .id = @intCast(new_id),
+                .gen = new_gen,
             };
-            const Tuple: type = std.meta.Tuple(&type_list);
-            const Data: type = Ecs.ArchetypeData(Tuple);
+            const index: u32 = blk: {
+                inline for (0..ARCH_COUNT) |k| {
+                    if (id == k) {
+                        break :blk try Ecs.storages[k].add(allocator, &reference);
+                    }
+                }
+                unreachable;
+            };
+            slot.reference = reference;
+            slot.archetype = id;
+            slot.index = index;
+            return slot.*;
+        }
+        /// Counts entities stored in the given archetype.
+        /// - `types` - component bundle. Must exactly match a declared archetype.
+        ///
+        /// Returns `u32` - current row count.
+        pub fn count(comptime types: anytype) u32 {
+            const id = comptime archetypeId(types);
+            return Ecs.storages[id].count();
+        }
+        /// Counts entities stored in the archetype with the given id.
+        /// - `id` - archetype id, an index into `archetypes`.
+        ///
+        /// Returns `u32` - current row count.
+        pub fn countById(id: u32) u32 {
+            inline for (0..ARCH_COUNT) |k| {
+                if (id == k) {
+                    return Ecs.storages[k].count();
+                }
+            }
+            unreachable;
+        }
+        /// Returns a pointer to one component value at a row. The pointer is
+        /// mutable: component data lives in global storage, no handle state
+        /// is modified by the lookup.
+        /// - `arch_id` - archetype id owning the row.
+        /// - `T` - component type, must be stored in the archetype.
+        /// - `index` - row position.
+        ///
+        /// Returns `*T` - pointer into the component column.
+        /// Private: use `SystemHandler.getComponent`.
+        fn getComponent(
+            arch_id: u32,
+            comptime T: type,
+            index: u32,
+        ) EcsError!*T {
+            inline for (0..ARCH_COUNT) |k| {
+                if (arch_id == k) {
+                    if (comptime !archHasType(k, T)) {
+                        return EcsError.ComponentNotFoundInArchetype;
+                    }
+                    const col = comptime archIndexOf(k, T);
+                    const column = &Ecs.storages[k].lists[col];
+                    if (index >= column.items.len) {
+                        return EcsError.IndexOutOfBounds;
+                    }
+                    return &column.items[index];
+                }
+            }
+            unreachable;
+        }
+        /// Copies values of components shared by two archetype rows.
+        /// Every shared component is copied with a typed struct assignment.
+        /// - `src_id` - archetype to read from.
+        /// - `src_index` - row position in the source storage.
+        /// - `dst_id` - archetype to write to.
+        /// - `dst_index` - row position in the destination storage.
+        fn copyShared(
+            src_id: u32,
+            src_index: u32,
+            dst_id: u32,
+            dst_index: u32,
+        ) void {
+            inline for (0..ARCH_COUNT) |s| {
+                inline for (0..ARCH_COUNT) |d| {
+                    if (src_id == s and dst_id == d) {
+                        Ecs.copyBetween(s, d, src_index, dst_index);
+                        return;
+                    }
+                }
+            }
+            unreachable;
+        }
+        /// Copies shared components between two comptime-known archetypes.
+        /// - `s` - source archetype id. Must be comptime-known.
+        /// - `d` - destination archetype id. Must be comptime-known.
+        /// - `src_index` - row position in the source storage.
+        /// - `dst_index` - row position in the destination storage.
+        fn copyBetween(
+            comptime s: usize,
+            comptime d: usize,
+            src_index: u32,
+            dst_index: u32,
+        ) void {
+            inline for (0..Tables.arch_lens[d]) |ti| {
+                const T: type = Tables.arch_types[d][ti];
+                if (comptime archHasType(s, T)) {
+                    const sc = comptime archIndexOf(s, T);
+                    Ecs.storages[d].lists[ti].items[dst_index] =
+                        Ecs.storages[s].lists[sc].items[src_index];
+                }
+            }
+        }
+        /// Binary-searches a sorted component id list.
+        /// - `ids` - sorted component ids.
+        /// - `target` - component id to look up.
+        ///
+        /// Returns `?usize` - position inside the list, or null when absent.
+        fn binarySearchIds(ids: []const u32, target: u32) ?usize {
+            var low: usize = 0;
+            var high: usize = ids.len;
+            while (low < high) {
+                const mid: usize = low + (high - low) / 2;
+                if (ids[mid] < target) {
+                    low = mid + 1;
+                } else if (ids[mid] > target) {
+                    high = mid;
+                } else {
+                    return mid;
+                }
+            }
+            return null;
+        }
+        /// Maps a component id to its column index inside an archetype.
+        /// - `arch_id` - archetype id, an index into `archetypes`.
+        /// - `comp_id` - component id to look up.
+        ///
+        /// Returns `?usize` - column index, or null when the component is absent.
+        pub fn columnOf(arch_id: u32, comp_id: u32) ?usize {
+            return binarySearchIds(Ecs.archetypes[arch_id].component_ids, comp_id);
+        }
+        /// Checks whether the archetype stores the given component.
+        /// - `arch_id` - archetype id, an index into `archetypes`.
+        /// - `comp_id` - component id to look up.
+        ///
+        /// Returns `bool` - true when the component is stored.
+        pub fn hasComponent(arch_id: u32, comp_id: u32) bool {
+            return Ecs.columnOf(arch_id, comp_id) != null;
+        }
+        /// Typed view over one archetype, exposing mutable component columns.
+        /// - `include` - component bundle; the matched archetype is found via
+        ///   `getPages` or `getArchetypePage`.
+        ///
+        /// Returns `type` - page type holding a single archetype id.
+        /// Private: pages are only issued by `SystemHandler`.
+        fn Page(comptime include: anytype) type {
+            const query = comptime canonicalQuery(include);
             return struct {
-                const Self = @This();
-                /// Marks this type as an archetype for isArchetype checks.
-                pub const kind = .archetype;
-                /// Canonical component types held by this archetype.
-                pub const components: []const type = canonical;
-                /// Lazily assigned archetype id. Stable for the same type set.
-                var id_storage: ?u32 = null;
-                /// Component descriptors, one per canonical component.
-                var infos: [canonical.len]*const Ecs.ComponentInfo =
-                    undefined;
-                /// Single cached runtime descriptor shared by all callers.
-                var cache: ?Ecs.ArchetypeInfo = null;
-                /// Owned SOA storage holding component columns and entity refs.
-                var state: Data = .{
-                    .lists = emptyTuple(),
-                };
-                /// Backing storage for the id->column map. Filled on first info().
-                var component_map_storage: [max_components]u32 = @splat(0);
-                /// Whether registration into the ECS registry has completed.
-                var registered: bool = false;
-                /// Builds a fully zeroed tuple of component lists.
+                const PageNamespace = @This();
+                /// Archetype this page reads and writes.
+                arch_id: u32,
+                /// Returns the whole mutable column of one component.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
                 ///
-                /// Returns `Tuple` - tuple with every list empty.
-                fn emptyTuple() Tuple {
-                    var blank: Tuple = undefined;
-                    inline for (@typeInfo(Tuple).@"struct".fields, 0..) |_, field_index| {
-                        blank[field_index] = .empty;
+                /// Returns `[]T` - mutable slice over the component column.
+                pub fn get(self: *const PageNamespace, comptime T: type) []T {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
                     }
-                    return blank;
-                }
-                const vtable = Ecs.VTable{
-                    .add = struct {
-                        fn addFunction(
-                            erased: *anyopaque,
-                            allocator: std.mem.Allocator,
-                            reference: *const Ecs.EntityReference,
-                        ) Ecs.EcsError!u32 {
-                            const concrete: *Data =
-                                @ptrCast(@alignCast(erased));
-                            return concrete.add(allocator, reference);
-                        }
-                    }.addFunction,
-                    .remove = struct {
-                        fn removeFunction(
-                            erased: *anyopaque,
-                            index: u32,
-                        ) ?Ecs.EntityReference {
-                            const concrete: *Data =
-                                @ptrCast(@alignCast(erased));
-                            return concrete.remove(index);
-                        }
-                    }.removeFunction,
-                    .count = struct {
-                        fn countFunction(
-                            erased: *const anyopaque,
-                        ) u32 {
-                            const concrete: *const Data =
-                                @ptrCast(@alignCast(erased));
-                            return concrete.count();
-                        }
-                    }.countFunction,
-                    .entity = struct {
-                        fn entityReferenceFunction(
-                            erased: *const anyopaque,
-                            index: u32,
-                        ) ?Ecs.EntityReference {
-                            const concrete: *const Data =
-                                @ptrCast(@alignCast(erased));
-                            return concrete.entity(index) catch null;
-                        }
-                    }.entityReferenceFunction,
-                    .raw = struct {
-                        fn getBytesFunction(
-                            erased: *const anyopaque,
-                            meta: *const Ecs.ComponentInfo,
-                            index: u32,
-                        ) ?[]const u8 {
-                            const concrete: *const Data =
-                                @ptrCast(@alignCast(erased));
-                            return concrete.raw(
-                                meta,
-                                index,
-                            );
-                        }
-                    }.getBytesFunction,
-                    .raw_mut = struct {
-                        fn getBytesMutableFunction(
-                            erased: *anyopaque,
-                            meta: *const Ecs.ComponentInfo,
-                            index: u32,
-                        ) ?[]u8 {
-                            const concrete: *Data =
-                                @ptrCast(@alignCast(erased));
-                            return concrete.rawMut(
-                                meta,
-                                index,
-                            );
-                        }
-                    }.getBytesMutableFunction,
-                    .deinit = struct {
-                        fn deinitFunction(
-                            erased: *anyopaque,
-                            allocator: std.mem.Allocator,
-                        ) void {
-                            const concrete: *Data =
-                                @ptrCast(@alignCast(erased));
-                            concrete.deinit(allocator);
-                        }
-                    }.deinitFunction,
-                };
-                ///
-                /// Returns the lazily assigned archetype id.
-                ///
-                /// Returns `u32` - stable archetype id.
-                pub fn id() u32 {
-                    if (Self.id_storage == null) {
-                        Self.id_storage =
-                            Ecs.next_archetype_id;
-                        Ecs.next_archetype_id += 1;
-                    }
-                    return Self.id_storage.?;
-                }
-                ///
-                /// Returns a pointer to the owned component storage.
-                ///
-                /// Returns `*Data` - live SOA storage of this archetype.
-                pub fn data() *Data {
-                    return &Self.state;
-                }
-
-                ///
-                /// Returns the cached runtime archetype descriptor.
-                ///
-                /// Returns `*ArchetypeInfo` - shared descriptor, built on first call.
-                pub fn info() *Ecs.ArchetypeInfo {
-                    _ = Self.id();
-                    if (Self.cache == null) {
-                        inline for (canonical, 0..) |item, type_index| {
-                            Self.infos[type_index] =
-                                Ecs.Component(item).info();
-                        }
-                        for (Self.infos[0..], 0..) |meta, column| {
-                            if (meta.id >= max_components) {
-                                @panic("component id exceeds max_components");
+                    inline for (0..ARCH_COUNT) |k| {
+                        if (self.arch_id == k) {
+                            if (comptime !archHasType(k, T)) {
+                                return &[0]T{};
                             }
-                            Self.component_map_storage[meta.id] =
-                                @intCast(column + 1);
+                            const col = comptime archIndexOf(k, T);
+                            return Ecs.storages[k].lists[col].items;
                         }
-                        Self.cache = Ecs.ArchetypeInfo{
-                            .id = Self.id_storage.?,
-                            .components = Self.infos[0..],
-                            .component_map = Self.component_map_storage[0..],
-                            .superset_storage = .empty,
-                            .data = @ptrCast(&Self.state),
-                            .vtable = &Self.vtable,
-                        };
                     }
-                    return &Self.cache.?;
+                    unreachable;
                 }
-                /// Registers this archetype: links components and maintains supersets.
-                /// - `allocator` - funds registry, component and superset lists.
+                /// Returns the entity reference column, read-only.
+                /// - `self` - page to inspect.
                 ///
-                /// Returns `*ArchetypeInfo` - registered runtime descriptor.
-                pub fn register(
-                    allocator: std.mem.Allocator,
-                ) Ecs.EcsError!*Ecs.ArchetypeInfo {
-                    if (Self.registered) {
-                        return &Self.cache.?;
-                    }
-                    const handle: *Ecs.ArchetypeInfo =
-                        Self.info();
-                    inline for (canonical) |item| {
-                        try Ecs.Component(item).attach(
-                            allocator,
-                            handle,
-                        );
-                    }
-                    var present: bool = false;
-                    for (Ecs.registry.items) |known| {
-                        if (known == handle) {
-                            present = true;
-                            break;
+                /// Returns `[]const EntityReference` - read-only reference list.
+                pub fn entities(self: *const PageNamespace) []const EntityReference {
+                    inline for (0..ARCH_COUNT) |k| {
+                        if (self.arch_id == k) {
+                            return Ecs.storages[k].refs.items;
                         }
                     }
-                    if (!present) {
-                        try Ecs.registry.append(
-                            allocator,
-                            handle,
-                        );
-                    }
-                    var candidates: std.ArrayListUnmanaged(*Ecs.ArchetypeInfo) = .empty;
-                    defer candidates.deinit(allocator);
-                    inline for (canonical) |item| {
-                        const meta: *const Ecs.ComponentInfo =
-                            Ecs.Component(item).info();
-                        for (meta.archetypes().items()) |candidate| {
-                            if (candidate == handle) {
-                                continue;
-                            }
-                            var seen: bool = false;
-                            for (candidates.items) |known| {
-                                if (known == candidate) {
-                                    seen = true;
-                                    break;
-                                }
-                            }
-                            if (!seen) {
-                                try candidates.append(allocator, candidate);
-                            }
-                        }
-                    }
-                    for (candidates.items) |candidate| {
-                        if (covers(handle, candidate)) {
-                            try Ecs.addSuperset(
-                                allocator,
-                                candidate,
-                                handle,
-                            );
-                        }
-                        if (covers(candidate, handle)) {
-                            try Ecs.addSuperset(
-                                allocator,
-                                handle,
-                                candidate,
-                            );
-                        }
-                    }
-                    Self.registered = true;
-                    return handle;
+                    unreachable;
                 }
-                /// Checks whether one archetype strictly contains another component set.
-                /// - `super` - candidate superset.
-                /// - `sub` - candidate subset.
+                /// Returns an immutable reference to the source archetype info.
+                /// - `self` - page to inspect.
                 ///
-                /// Returns `bool` - true when sub is a strict subset of super.
-                fn covers(
-                    super: *const Ecs.ArchetypeInfo,
-                    sub: *const Ecs.ArchetypeInfo,
-                ) bool {
-                    for (sub.components) |need| {
-                        if (!super.containsComponent(need.id)) {
-                            return false;
-                        }
-                    }
-                    return super.components.len >
-                        sub.components.len;
-                }
-                /// Resolves a single input to its underlying struct type.
-                /// - `Single` - component, wrapper or single-component archetype.
-                ///
-                /// Returns `type` - unwrapped struct component type.
-                fn unwrap(comptime Single: type) type {
-                    if (Ecs.isComponent(Single)) {
-                        return Single.ComponentType;
-                    }
-                    if (Ecs.isArchetype(Single)) {
-                        if (Single.components.len != 1) {
-                            @compileError("Single-component operation requires exactly one component type.");
-                        }
-                        return Single.components[0];
-                    }
-                    if (@typeInfo(Single) != .@"struct") {
-                        @compileError("Component must be a struct type.");
-                    }
-                    return Single;
-                }
-                /// Adds one component, producing a derived archetype type.
-                /// - `Single` - component, wrapper or single-component archetype.
-                ///
-                /// Returns `type` - archetype extended with the new component.
-                pub fn add(comptime Single: type) type {
-                    const Unwrapped: type = unwrap(Single);
-                    const merged: []const type = comptime merge: {
-                        var scratch: [canonical.len + 1]type = undefined;
-                        for (canonical, 0..) |existing, existing_index| {
-                            scratch[existing_index] = existing;
-                        }
-                        scratch[canonical.len] = Unwrapped;
-                        const Merge = struct {
-                            const table: [canonical.len + 1]type =
-                                scratch;
-                        };
-                        break :merge Merge.table[0..];
-                    };
-                    return Ecs.Archetype(merged);
-                }
-                /// Adds several components at once, producing a derived archetype type.
-                /// - `extra` - component types to add.
-                ///
-                /// Returns `type` - archetype extended with the new components.
-                pub fn addMany(comptime extra: []const type) type {
-                    const merged: []const type = comptime merge: {
-                        var scratch: [canonical.len + extra.len]type =
-                            undefined;
-                        for (canonical, 0..) |existing, existing_index| {
-                            scratch[existing_index] = existing;
-                        }
-                        for (extra, 0..) |item, item_index| {
-                            scratch[canonical.len + item_index] =
-                                item;
-                        }
-                        const Merge = struct {
-                            const table: [canonical.len + extra.len]type =
-                                scratch;
-                        };
-                        break :merge Merge.table[0..];
-                    };
-                    return Ecs.Archetype(merged);
-                }
-                /// Removes one component, producing a derived archetype type.
-                /// - `Single` - component to remove. Must be present and not the last one.
-                ///
-                /// Returns `type` - archetype narrowed by the removed component.
-                pub fn remove(comptime Single: type) type {
-                    const Unwrapped: type = unwrap(Single);
-                    comptime var found: ?usize = null;
-                    inline for (canonical, 0..) |existing, existing_index| {
-                        if (existing == Unwrapped) {
-                            found = existing_index;
-                        }
-                    }
-                    if (found == null) {
-                        @compileError("Cannot remove a component that is not part of this archetype.");
-                    }
-                    if (canonical.len <= 1) {
-                        @compileError("Archetype must keep at least one component after removal.");
-                    }
-                    const rest: []const type = comptime rest: {
-                        var scratch: [canonical.len - 1]type = undefined;
-                        var cursor: usize = 0;
-                        for (canonical, 0..) |existing, existing_index| {
-                            if (existing_index == found.?) {
-                                continue;
-                            }
-                            scratch[cursor] = existing;
-                            cursor += 1;
-                        }
-                        const Rest = struct {
-                            const table: [canonical.len - 1]type =
-                                scratch;
-                        };
-                        break :rest Rest.table[0..];
-                    };
-                    return Ecs.Archetype(rest);
-                }
-                /// Removes several components at once, producing a derived archetype type.
-                /// - `removed` - component types to remove. Must leave at least one.
-                ///
-                /// Returns `type` - archetype narrowed by the removed components.
-                pub fn removeMany(comptime removed: []const type) type {
-                    const targets: []const type =
-                        Ecs.GetComponentsTypes(removed, max_components);
-                    for (targets) |target| {
-                        var present: bool = false;
-                        for (canonical) |existing| {
-                            if (existing == target) {
-                                present = true;
-                                break;
-                            }
-                        }
-                        if (!present) {
-                            @compileError("Cannot remove a component that is not part of this archetype.");
-                        }
-                    }
-                    const rest: []const type = comptime rest: {
-                        var scratch: [canonical.len]type = undefined;
-                        var cursor: usize = 0;
-                        for (canonical) |existing| {
-                            var skip: bool = false;
-                            for (targets) |target| {
-                                if (existing == target) {
-                                    skip = true;
-                                    break;
-                                }
-                            }
-                            if (!skip) {
-                                scratch[cursor] = existing;
-                                cursor += 1;
-                            }
-                        }
-                        if (cursor == 0) {
-                            @compileError("Archetype must keep at least one component after removal.");
-                        }
-                        const Rest = struct {
-                            const table: [canonical.len]type =
-                                scratch;
-                            const total: usize = cursor;
-                        };
-                        break :rest Rest.table[0..Rest.total];
-                    };
-                    return Ecs.Archetype(rest);
+                /// Returns `*const ArchetypeInfo` - source archetype descriptor.
+                pub fn archetypeInfo(self: *const PageNamespace) *const ArchetypeInfo {
+                    return &Ecs.archetypes[self.arch_id];
                 }
             };
         }
-        /// Releases every registry, tracked and entity list owned by the namespace.
+        /// Iterator over pages of archetypes containing all `include` components
+        /// and none of the `exclude` components.
+        /// The match list is precomputed in comptime; iteration needs no allocator.
+        /// - `include` - component bundle that must be present.
+        /// - `exclude` - component bundle that must be absent. `null` and empty
+        ///   bundles are equivalent to no exclusion.
+        ///
+        /// Returns `type` - iterator over the matched archetype ids.
+        /// Private: iterators are only issued by `SystemHandler`.
+        fn PageIterator(comptime include: anytype, comptime exclude: anytype) type {
+            const query = comptime canonicalQuery(include);
+            const qids: [query.len]u32 = blk: {
+                var tmp: [query.len]u32 = undefined;
+                for (query, 0..) |T, i| {
+                    tmp[i] = @intCast(componentIndex(T).?);
+                }
+                break :blk tmp;
+            };
+            // Exclusion is checked for emptiness up front: `null` or an empty
+            // bundle means no exclusion at all.
+            const deny = comptime blk: {
+                if (@TypeOf(exclude) == @TypeOf(null)) {
+                    break :blk &[_]type{};
+                }
+                const flat = canonicalQueryAllowEmpty(exclude);
+                if (flat.len == 0) {
+                    break :blk &[_]type{};
+                }
+                break :blk flat;
+            };
+            comptime {
+                for (query) |T| {
+                    for (deny) |D| {
+                        if (T == D) {
+                            @compileError("A component cannot be both included and excluded.");
+                        }
+                    }
+                }
+            }
+            const deny_ids: [deny.len]u32 = blk: {
+                var tmp: [deny.len]u32 = undefined;
+                for (deny, 0..) |T, i| {
+                    tmp[i] = @intCast(componentIndex(T).?);
+                }
+                break :blk tmp;
+            };
+            const matched = blk: {
+                var list: [ARCH_COUNT]u32 = undefined;
+                var total: usize = 0;
+                for (0..ARCH_COUNT) |k| {
+                    const ids = Tables.arch_comp[k][0..Tables.arch_lens[k]];
+                    var ok: bool = true;
+                    for (qids) |qid| {
+                        var has: bool = false;
+                        for (ids) |id| {
+                            if (id == qid) {
+                                has = true;
+                                break;
+                            }
+                        }
+                        if (!has) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    for (deny_ids) |did| {
+                        for (ids) |id| {
+                            if (id == did) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (!ok) {
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        list[total] = @intCast(k);
+                        total += 1;
+                    }
+                }
+                break :blk .{ .list = list, .len = total };
+            };
+            return struct {
+                /// Current match position.
+                index: usize = 0,
+                /// Returns the next matching page, or null when exhausted.
+                /// - `self` - iterator to advance.
+                ///
+                /// Returns `?Page(include)` - next page, or null at the end.
+                pub fn next(self: *@This()) ?Page(include) {
+                    if (self.index >= matched.len) {
+                        return null;
+                    }
+                    const id: u32 = matched.list[self.index];
+                    self.index += 1;
+                    return Page(include){
+                        .arch_id = id,
+                    };
+                }
+            };
+        }
+        /// Handle passed to every system function. It is the only way to read
+        /// page data and the only way to schedule structural changes.
+        /// Data obtained through the handler (pointers, slices, pages) is valid
+        /// only until the current system returns: queued commands are applied
+        /// between systems and may reallocate storages.
+        pub const SystemHandler = struct {
+            /// Allocator funding the command queue and flushed changes.
+            allocator: std.mem.Allocator,
+            /// Builds an iterator over pages of archetypes containing all `include`
+            /// components and none of the `exclude` components.
+            /// - `self` - handler of the running system.
+            /// - `include` - component bundle that must be present.
+            /// - `exclude` - component bundle that must be absent. `null` and empty
+            ///   bundles are equivalent to no exclusion.
+            ///
+            /// Returns `PageIterator` - stack-owned iterator, no allocator needed.
+            pub fn pages(
+                self: *const SystemHandler,
+                comptime include: anytype,
+                comptime exclude: anytype,
+            ) PageIterator(include, exclude) {
+                _ = self;
+                return .{};
+            }
+            /// Returns the page of one exact archetype.
+            /// - `self` - handler of the running system.
+            /// - `bundle` - component bundle. Must exactly match a declared archetype.
+            ///
+            /// Returns `Page(bundle)` - page of the matched archetype.
+            pub fn page(
+                self: *const SystemHandler,
+                comptime bundle: anytype,
+            ) Page(bundle) {
+                _ = self;
+                return Page(bundle){
+                    .arch_id = comptime archetypeId(bundle),
+                };
+            }
+            /// Counts entities in archetypes containing all `include` components
+            /// and none of the `exclude` components.
+            /// - `self` - handler of the running system.
+            /// - `include` - component bundle that must be present.
+            /// - `exclude` - component bundle that must be absent.
+            ///
+            /// Returns `u32` - total row count over the matched archetypes.
+            pub fn count(
+                self: *const SystemHandler,
+                comptime include: anytype,
+                comptime exclude: anytype,
+            ) u32 {
+                var total: u32 = 0;
+                var it = self.pages(include, exclude);
+                while (it.next()) |p| {
+                    total += Ecs.countById(p.arch_id);
+                }
+                return total;
+            }
+            /// Returns a pointer to one component of the referenced entity.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            ///
+            /// Returns `*T` - pointer into the owning component column.
+            pub fn getComponent(
+                self: *const SystemHandler,
+                ref: EntityReference,
+                comptime T: type,
+            ) EcsError!*T {
+                _ = self;
+                if (!ref.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                const entity_index: u32 = ref.id;
+                const record: *const Entity = &Ecs.entities.items[entity_index];
+                return Ecs.getComponent(record.archetype, T, record.index);
+            }
+            /// Queues entity creation. Applied after the current system finishes.
+            /// - `self` - handler of the running system.
+            /// - `bundle` - component bundle of the new entity. Must be declared in `ECS(...)`.
+            /// - `values` - tuple of component values, one per bundle component,
+            ///   in any order. Types must match the bundle exactly.
+            pub fn cmdCreate(
+                self: *const SystemHandler,
+                comptime bundle: anytype,
+                values: anytype,
+            ) EcsError!void {
+                const arch = comptime archetypeId(bundle);
+                const blob = try Ecs.packValues(arch, values, self.allocator);
+                errdefer self.allocator.free(blob);
+                try Ecs.commands.append(self.allocator, .{ .create = .{
+                    .arch = @intCast(arch),
+                    .bytes = blob,
+                } });
+            }
+            /// Queues creation of `n` entities with identical component values.
+            /// - `self` - handler of the running system.
+            /// - `bundle` - component bundle of the new entities.
+            /// - `values` - tuple of component values shared by all `n` entities.
+            /// - `n` - number of entities to create.
+            pub fn cmdCreateN(
+                self: *const SystemHandler,
+                comptime bundle: anytype,
+                values: anytype,
+                n: u32,
+            ) EcsError!void {
+                const arch: u32 = @intCast(comptime archetypeId(bundle));
+                const blob = try Ecs.packValues(arch, values, self.allocator);
+                defer self.allocator.free(blob);
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    const dup = try self.allocator.dupe(u8, blob);
+                    errdefer self.allocator.free(dup);
+                    try Ecs.commands.append(self.allocator, .{ .create = .{
+                        .arch = arch,
+                        .bytes = dup,
+                    } });
+                }
+            }
+            /// Queues entity destruction. Applied after the current system finishes.
+            /// Stale references are silently skipped at apply time.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to destroy.
+            pub fn cmdDestroy(self: *const SystemHandler, ref: EntityReference) EcsError!void {
+                try Ecs.commands.append(self.allocator, .{ .destroy = ref });
+            }
+            /// Queues entity migration into another archetype.
+            /// Stale references are silently skipped at apply time.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to move.
+            /// - `dest` - component bundle of the destination archetype.
+            /// - `copy` - when true, shared component values are carried over.
+            pub fn cmdMigrate(
+                self: *const SystemHandler,
+                ref: EntityReference,
+                comptime dest: anytype,
+                copy: bool,
+            ) EcsError!void {
+                const dest_id: u32 = @intCast(comptime archetypeId(dest));
+                try Ecs.commands.append(self.allocator, .{ .migrate = .{
+                    .ref = ref,
+                    .dest = dest_id,
+                    .copy = copy,
+                } });
+            }
+            /// Queues destruction of every entity on pages matching `include`
+            /// and `exclude`. Applied after the current system finishes.
+            /// - `self` - handler of the running system.
+            /// - `include` - component bundle that must be present.
+            /// - `exclude` - component bundle that must be absent.
+            pub fn cmdDestroyPages(
+                self: *const SystemHandler,
+                comptime include: anytype,
+                comptime exclude: anytype,
+            ) EcsError!void {
+                var it = self.pages(include, exclude);
+                while (it.next()) |p| {
+                    for (p.entities()) |ref| {
+                        try Ecs.commands.append(self.allocator, .{ .destroy = ref });
+                    }
+                }
+            }
+            /// Queues destruction of every entity in one exact archetype.
+            /// Applied after the current system finishes.
+            /// - `self` - handler of the running system.
+            /// - `bundle` - component bundle. Must exactly match a declared archetype.
+            pub fn cmdDestroyPage(
+                self: *const SystemHandler,
+                comptime bundle: anytype,
+            ) EcsError!void {
+                const id: u32 = @intCast(comptime archetypeId(bundle));
+                try Ecs.commands.append(self.allocator, .{ .destroy_page = id });
+            }
+        };
+        /// Deferred structural change, applied between systems in FIFO order.
+        const Command = union(enum) {
+            /// Create an entity; `bytes` holds packed component values in column order.
+            create: struct {
+                arch: u32,
+                bytes: []u8,
+            },
+            /// Destroy an entity; skipped when the reference is stale.
+            destroy: EntityReference,
+            /// Migrate an entity; skipped when the reference is stale.
+            migrate: struct {
+                ref: EntityReference,
+                dest: u32,
+                copy: bool,
+            },
+            /// Destroy every entity in one exact archetype.
+            destroy_page: u32,
+        };
+        /// Queued structural changes of the running system.
+        var commands: std.ArrayListUnmanaged(Command) = .empty;
+        /// Finds the values-tuple field holding the given component type.
+        /// - `V` - values tuple type.
+        /// - `T` - component type to locate. Must be present exactly once.
+        ///
+        /// Returns `usize` - field index inside the values tuple.
+        fn valuesFieldIndex(comptime V: type, comptime T: type) usize {
+            const fields = @typeInfo(V).@"struct".fields;
+            inline for (0..fields.len) |j| {
+                if (fields[j].type == T) {
+                    return j;
+                }
+            }
+            unreachable;
+        }
+        /// Packs component values into a byte blob in canonical column order.
+        /// - `arch` - destination archetype id. Must be comptime-known.
+        /// - `values` - tuple of component values matching the archetype exactly.
+        /// - `allocator` - funds the blob.
+        ///
+        /// Returns `[]u8` - owned blob, freed by the caller.
+        fn packValues(
+            comptime arch: usize,
+            values: anytype,
+            allocator: std.mem.Allocator,
+        ) EcsError![]u8 {
+            const Ar = Tables.arch_lens[arch];
+            const VType = @TypeOf(values);
+            const VInfo = @typeInfo(VType);
+            comptime {
+                if (VInfo != .@"struct" or !VInfo.@"struct".is_tuple) {
+                    @compileError("values must be a tuple of component values matching the bundle.");
+                }
+                if (VInfo.@"struct".fields.len != Ar) {
+                    @compileError("values count must match the bundle component count.");
+                }
+                for (0..Ar) |i| {
+                    const T = Tables.arch_types[arch][i];
+                    var found: usize = 0;
+                    for (0..VInfo.@"struct".fields.len) |j| {
+                        const FT = VInfo.@"struct".fields[j].type;
+                        if (FT == type) {
+                            @compileError("values must hold component values, not types.");
+                        }
+                        if (@typeInfo(FT) != .@"struct") {
+                            @compileError("Every value must be a struct value.");
+                        }
+                        if (FT == Entity or FT == EntityReference) {
+                            @compileError("Entity and EntityReference cannot be components.");
+                        }
+                        if (FT == T) {
+                            found += 1;
+                        }
+                    }
+                    if (found != 1) {
+                        @compileError("values must contain each bundle component exactly once.");
+                    }
+                }
+            }
+            const total_size = comptime blk: {
+                var s: usize = 0;
+                for (0..Ar) |i| {
+                    s += @sizeOf(Tables.arch_types[arch][i]);
+                }
+                break :blk s;
+            };
+            const blob = try allocator.alloc(u8, total_size);
+            errdefer allocator.free(blob);
+            // NOTE: `values` is a comptime-known generic parameter, so field
+            // addresses are unusable at runtime. `toBytes` copies by value.
+            var cursor: usize = 0;
+            inline for (0..Ar) |i| {
+                const T = Tables.arch_types[arch][i];
+                const j = comptime valuesFieldIndex(VType, T);
+                const bytes = std.mem.toBytes(values[j]);
+                @memcpy(blob[cursor..][0..bytes.len], &bytes);
+                cursor += bytes.len;
+            }
+            return blob;
+        }
+        /// Applies every queued command in FIFO order, then clears the queue.
+        /// Private: runs automatically between systems; never call it directly,
+        /// or pages held by user code may dangle after reallocation.
+        /// - `allocator` - allocator that funded the queue and the changes.
+        fn flushCommands(allocator: std.mem.Allocator) EcsError!void {
+            defer Ecs.commands.clearRetainingCapacity();
+            for (Ecs.commands.items) |cmd| {
+                switch (cmd) {
+                    .create => |c| {
+                        errdefer allocator.free(c.bytes);
+                        const created = try Ecs.createById(allocator, c.arch);
+                        inline for (0..ARCH_COUNT) |k| {
+                            if (c.arch == k) {
+                                var off: usize = 0;
+                                inline for (0..Tables.arch_lens[k]) |col| {
+                                    const dst = std.mem.asBytes(&Ecs.storages[k].lists[col].items[created.index]);
+                                    @memcpy(dst, c.bytes[off..][0..dst.len]);
+                                    off += dst.len;
+                                }
+                            }
+                        }
+                        allocator.free(c.bytes);
+                    },
+                    .destroy => |ref| {
+                        if (ref.isAlive()) {
+                            try ref.destroy(allocator);
+                        }
+                    },
+                    .migrate => |m| {
+                        if (m.ref.isAlive()) {
+                            _ = try m.ref.migrateById(allocator, m.dest, m.copy);
+                        }
+                    },
+                    .destroy_page => |arch| {
+                        inline for (0..ARCH_COUNT) |k| {
+                            if (arch == k) {
+                                for (Ecs.storages[k].refs.items) |ref| {
+                                    const entity_index: u32 = ref.id;
+                                    Ecs.entities.items[entity_index].reference.gen +%= 1;
+                                    try Ecs.free_ids.append(allocator, entity_index);
+                                }
+                                inline for (0..Tables.arch_lens[k]) |col| {
+                                    Ecs.storages[k].lists[col].items.len = 0;
+                                }
+                                Ecs.storages[k].refs.items.len = 0;
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        /// Drops every queued command without applying it, freeing create blobs.
+        /// Used when a system fails and on teardown.
+        /// - `allocator` - allocator that funded the queue.
+        fn discardCommands(allocator: std.mem.Allocator) void {
+            for (Ecs.commands.items) |cmd| {
+                if (cmd == .create) {
+                    allocator.free(cmd.create.bytes);
+                }
+            }
+            Ecs.commands.clearRetainingCapacity();
+        }
+        /// Builds a schedule: a fixed, explicit order of system functions.
+        /// Every system takes exactly one `*SystemHandler` parameter and returns
+        /// `anyerror!void`. Queued commands are applied automatically after each
+        /// system and before the next one.
+        /// - `systems` - tuple of system functions, executed in tuple order.
+        ///
+        /// Returns `type` - runner namespace with a single `run` function.
+        pub fn Schedule(comptime systems: anytype) type {
+            const info = @typeInfo(@TypeOf(systems));
+            if (info != .@"struct" or !info.@"struct".is_tuple) {
+                @compileError("Schedule expects a tuple of system functions.");
+            }
+            for (0..info.@"struct".fields.len) |i| {
+                const S = @TypeOf(systems[i]);
+                const finfo = @typeInfo(S);
+                if (finfo != .@"fn") {
+                    @compileError("Every schedule entry must be a system function.");
+                }
+                const Fn = finfo.@"fn";
+                if (Fn.params.len != 1) {
+                    @compileError("Every system must take exactly one *SystemHandler parameter.");
+                }
+                const P = Fn.params[0].type orelse
+                    @compileError("System parameter type must be known.");
+                if (P != *SystemHandler) {
+                    @compileError("Every system must take exactly one *SystemHandler parameter.");
+                }
+                const RT = Fn.return_type orelse
+                    @compileError("System return type must be known.");
+                const rinfo = @typeInfo(RT);
+                if (rinfo != .error_union or rinfo.error_union.payload != void) {
+                    @compileError("Every system must return an error union with void payload, e.g. anyerror!void.");
+                }
+            }
+            return struct {
+                const order = systems;
+                /// Runs every system in schedule order, applying queued commands
+                /// automatically after each system and before the next one.
+                /// If a system fails, its unapplied commands are discarded and
+                /// the error propagates; already applied changes stay applied.
+                /// - `allocator` - funds the command queue and flushed changes.
+                pub fn run(allocator: std.mem.Allocator) anyerror!void {
+                    var handler = Ecs.SystemHandler{ .allocator = allocator };
+                    errdefer Ecs.discardCommands(allocator);
+                    inline for (order) |sys| {
+                        try sys(&handler);
+                        try Ecs.flushCommands(allocator);
+                    }
+                }
+            };
+        }
+        /// Releases every storage and entity list owned by the namespace,
+        /// then resets all runtime state so the ECS can be reused or safely
+        /// deinitialized again.
         /// - `allocator` - allocator that funded all storage.
         pub fn deinit(allocator: std.mem.Allocator) void {
-            for (Ecs.registry.items) |handle| {
-                handle.vtable.deinit(
-                    handle.data,
-                    allocator,
-                );
-                handle.superset_storage.deinit(allocator);
+            inline for (0..ARCH_COUNT) |k| {
+                Ecs.storages[k].deinit(allocator);
+                Ecs.storages[k] = DataTypes[k].empty();
             }
-            for (Ecs.tracked.items) |entry| {
-                entry.deinit(allocator);
-            }
-            Ecs.registry.deinit(allocator);
-            Ecs.tracked.deinit(allocator);
+            Ecs.discardCommands(allocator);
+            Ecs.commands.deinit(allocator);
+            Ecs.commands = .empty;
             Ecs.entities.deinit(allocator);
+            Ecs.entities = .empty;
             Ecs.free_ids.deinit(allocator);
+            Ecs.free_ids = .empty;
+            Ecs.next_entity_id = 0;
         }
     };
 }
@@ -1449,120 +1862,383 @@ const Pos = struct { horizontal_coordinate: i32, vertical_coordinate: i32 };
 const Vel = struct { horizontal_speed: f32, vertical_speed: f32 };
 /// Current health amount component used by tests.
 const Health = struct { current_value: u32 };
-test "component identifier is stable per type" {
-    const Ecs = ECS(16, 16, 64);
-    const First = Ecs.Component(Pos);
-    const Second = Ecs.Component(Pos);
-    const Other = Ecs.Component(Vel);
-    try std.testing.expect(First.id() == Second.id());
-    try std.testing.expect(First.id() != Other.id());
-    try std.testing.expect(Ecs.isComponent(First));
-    try std.testing.expect(!Ecs.isArchetype(First));
+test "component identifiers are stable and dense" {
+    const Ecs = ECS(.{ .{Pos}, .{Vel} });
+    try std.testing.expect(Ecs.componentId(Pos) == Ecs.componentId(Pos));
+    try std.testing.expect(Ecs.componentId(Pos) != Ecs.componentId(Vel));
+    try std.testing.expect(Ecs.component_count == 2);
+    const pos_info = Ecs.componentInfo(Pos);
+    try std.testing.expect(pos_info.id == Ecs.componentId(Pos));
+    try std.testing.expect(pos_info.size == @sizeOf(Pos));
+    try std.testing.expect(pos_info.alignment == @alignOf(Pos));
+    try std.testing.expect(std.mem.eql(u8, pos_info.name, @typeName(Pos)));
+    try std.testing.expect(Ecs.components[Ecs.componentId(Pos)].id == Ecs.componentId(Pos));
 }
 test "archetype order does not matter" {
-    const Ecs = ECS(16, 16, 64);
-    const Left = Ecs.Archetype(&[_]type{ Pos, Vel });
-    const Right = Ecs.Archetype(&[_]type{ Vel, Pos });
-    try std.testing.expect(Left == Right);
-    try std.testing.expect(Ecs.isArchetype(Left));
-    try std.testing.expect(!Ecs.isComponent(Left));
+    const Ecs = ECS(.{.{ Pos, Vel }});
+    try std.testing.expect(Ecs.archetypeId(&[_]type{ Pos, Vel }) == Ecs.archetypeId(&[_]type{ Vel, Pos }));
+    try std.testing.expect(Ecs.archetype_count == 1);
+}
+test "duplicate archetype sets are deduplicated" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{ Vel, Pos }, .{Pos} });
+    try std.testing.expect(Ecs.archetype_count == 2);
+    try std.testing.expect(Ecs.component_count == 2);
 }
 test "archetype data stores and returns components" {
-    const Ecs = ECS(16, 16, 64);
-    const Single = Ecs.Archetype(&[_]type{Health});
-    const data = Single.data();
+    const Ecs = ECS(.{.{Health}});
+    const data = Ecs.storage(&[_]type{Health});
     const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
     const sample = Ecs.EntityReference{ .id = 0, .gen = 0 };
     const index: u32 = try data.add(allocator, &sample);
     try std.testing.expect(index == 0);
     try std.testing.expect(data.count() == 1);
-    const health_mut: *Health = try data.getMut(Health, 0);
+    const health_mut: *Health = try data.get(Health, 0);
     health_mut.current_value = 42;
     const health: *const Health = try data.get(Health, 0);
     try std.testing.expect(health.current_value == 42);
-    data.deinit(allocator);
 }
 test "entity create destroy and slot reuse" {
-    const Ecs = ECS(24, 24, 64);
-    const Pair = Ecs.Archetype(&[_]type{ Pos, Vel });
+    const Ecs = ECS(.{.{ Pos, Vel }});
     const allocator = std.testing.allocator;
-    const handle = try Pair.register(allocator);
     defer Ecs.deinit(allocator);
-    const created = try Ecs.Entity.create(allocator, handle);
+    const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
     try std.testing.expect(created.reference.exists());
     try std.testing.expect(created.reference.isAlive());
-    try std.testing.expect(handle.count() == 1);
-    const data = Pair.data();
-    const pos: *Pos =
-        try data.getMut(Pos, created.index);
+    try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 1);
+    const data = Ecs.storage(&[_]type{ Pos, Vel });
+    const pos: *Pos = try data.get(Pos, created.index);
     pos.horizontal_coordinate = 10;
     try created.reference.destroy(allocator);
     try std.testing.expect(created.reference.exists());
     try std.testing.expect(!created.reference.isAlive());
-    try std.testing.expect(handle.count() == 0);
+    try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 0);
     try std.testing.expectError(
         Ecs.EcsError.EntityIsNotAlive,
         created.reference.destroy(allocator),
     );
-    const recycled = try Ecs.Entity.create(allocator, handle);
-    try std.testing.expect(recycled.reference.id ==
-        created.reference.id);
-    try std.testing.expect(recycled.reference.gen ==
-        created.reference.gen +% 1);
+    const recycled = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    try std.testing.expect(recycled.reference.id == created.reference.id);
+    try std.testing.expect(recycled.reference.gen == created.reference.gen +% 1);
     try std.testing.expect(recycled.reference.isAlive());
 }
 test "entity migrate copies shared components" {
-    const Ecs = ECS(56, 56, 64);
-    const Source = Ecs.Archetype(&[_]type{ Pos, Vel });
-    const Dest = Ecs.Archetype(&[_]type{ Pos, Health });
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{ Pos, Health } });
     const allocator = std.testing.allocator;
-    const source_info = try Source.register(allocator);
-    const dest_info = try Dest.register(allocator);
     defer Ecs.deinit(allocator);
-    const created = try Ecs.Entity.create(allocator, source_info);
-    const source_data = Source.data();
-    (try source_data.getMut(Pos, 0)).horizontal_coordinate = 7;
-    (try source_data.getMut(Vel, 0)).horizontal_speed = 1.5;
-    const migrated =
-        try created.reference.migrate(allocator, dest_info, true);
+    const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    const source_data = Ecs.storage(&[_]type{ Pos, Vel });
+    (try source_data.get(Pos, 0)).horizontal_coordinate = 7;
+    (try source_data.get(Vel, 0)).horizontal_speed = 1.5;
+    const migrated = try created.reference.migrate(allocator, &[_]type{ Pos, Health }, true);
     try std.testing.expect(migrated.isAlive());
     try std.testing.expect(!created.reference.isAlive());
-    try std.testing.expect(source_info.count() == 0);
-    try std.testing.expect(dest_info.count() == 1);
-    const dest_data = Dest.data();
-    const moved: *const Pos =
-        try dest_data.get(Pos, 0);
+    try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 0);
+    try std.testing.expect(Ecs.count(&[_]type{ Pos, Health }) == 1);
+    const dest_data = Ecs.storage(&[_]type{ Pos, Health });
+    const moved: *const Pos = try dest_data.get(Pos, 0);
     try std.testing.expect(moved.horizontal_coordinate == 7);
 }
-test "archetype registration tracks supersets and component lists" {
-    const Ecs = ECS(48, 48, 64);
-    const Small = Ecs.Archetype(&[_]type{Pos});
-    const Big = Ecs.Archetype(&[_]type{ Pos, Vel });
-    const allocator = std.testing.allocator;
-    const small_info = try Small.register(allocator);
-    const big_info = try Big.register(allocator);
-    defer Ecs.deinit(allocator);
-    const supersets = small_info.supersets();
-    try std.testing.expect(supersets.count() == 1);
-    try std.testing.expect(supersets.get(0).? == big_info);
-    try std.testing.expect(big_info.supersets().count() == 0);
-    const pos_info = Ecs.Component(Pos).info();
-    try std.testing.expect(pos_info.archetypes().count() == 2);
-    const vel_info = Ecs.Component(Vel).info();
-    try std.testing.expect(vel_info.archetypes().count() == 1);
+test "supersets and component archetype lists are precomputed" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const small_id = Ecs.archetypeId(&[_]type{Pos});
+    const big_id = Ecs.archetypeId(&[_]type{ Pos, Vel });
+    try std.testing.expect(Ecs.archetypes[small_id].superset_ids.len == 1);
+    try std.testing.expect(Ecs.archetypes[small_id].superset_ids[0] == big_id);
+    try std.testing.expect(Ecs.archetypes[big_id].superset_ids.len == 0);
+    const pos_id = Ecs.componentId(Pos);
+    const vel_id = Ecs.componentId(Vel);
+    try std.testing.expect(Ecs.components[pos_id].archetype_ids.len == 2);
+    try std.testing.expect(Ecs.components[vel_id].archetype_ids.len == 1);
+    try std.testing.expect(Ecs.hasComponent(small_id, pos_id));
+    try std.testing.expect(!Ecs.hasComponent(small_id, vel_id));
+    try std.testing.expect(Ecs.columnOf(big_id, vel_id) != null);
+    try std.testing.expect(Ecs.columnOf(small_id, vel_id) == null);
 }
-test "add and remove components change archetype type" {
-    const Ecs = ECS(40, 40, 64);
-    const Base = Ecs.Archetype(&[_]type{Pos});
-    const Wide = Base.add(Vel);
-    const Expect = Ecs.Archetype(&[_]type{ Pos, Vel });
-    try std.testing.expect(Wide == Expect);
-    const Slim = Wide.remove(Vel);
-    try std.testing.expect(Slim == Base);
-    const MultiWide = Base.addMany(&[_]type{ Vel, Health });
-    const MultiExpect =
-        Ecs.Archetype(&[_]type{ Pos, Vel, Health });
-    try std.testing.expect(MultiWide == MultiExpect);
-    const MultiSlim = MultiWide.removeMany(&[_]type{ Health, Vel });
-    try std.testing.expect(MultiSlim == Base);
+test "handler page returns the exact archetype" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel }, .{ Pos, Vel, Health } });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+
+    const page = handler.page(&[_]type{ Pos, Vel });
+    try std.testing.expect(page.archetypeInfo().component_ids.len == 2);
+    try std.testing.expect(page.get(Pos).len == 0);
+    _ = page.entities();
+}
+test "handler pages match supersets and honor exclude" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel }, .{ Pos, Vel, Health } });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+
+    var all_iterator = handler.pages(&[_]type{ Pos, Vel }, null);
+    var all_count: usize = 0;
+    while (all_iterator.next()) |page| {
+        all_count += 1;
+        _ = page.get(Pos);
+        _ = page.entities();
+    }
+    try std.testing.expect(all_count == 2);
+
+    var filtered_iterator = handler.pages(&[_]type{Pos}, &[_]type{Vel});
+    var filtered_count: usize = 0;
+    while (filtered_iterator.next()) |page| {
+        filtered_count += 1;
+        try std.testing.expect(page.archetypeInfo().component_ids.len == 1);
+    }
+    try std.testing.expect(filtered_count == 1);
+
+    var null_iterator = handler.pages(&[_]type{Pos}, null);
+    var null_count: usize = 0;
+    while (null_iterator.next()) |_| {
+        null_count += 1;
+    }
+    try std.testing.expect(null_count == 3);
+
+    var empty_iterator = handler.pages(&[_]type{Pos}, &[_]type{});
+    var empty_count: usize = 0;
+    while (empty_iterator.next()) |_| {
+        empty_count += 1;
+    }
+    try std.testing.expect(empty_count == 3);
+
+    try std.testing.expect(handler.count(&[_]type{Pos}, null) == 0);
+}
+test "page get returns mutable column and mutates data" {
+    const Ecs = ECS(.{.{ Pos, Vel }});
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    _ = created;
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+
+    var iterator = handler.pages(&[_]type{ Pos, Vel }, null);
+    var found_page: bool = false;
+    while (iterator.next()) |page| {
+        found_page = true;
+        const positions = page.get(Pos);
+        try std.testing.expect(positions.len == 1);
+        positions[0].horizontal_coordinate = 77;
+        const velocities = page.get(Vel);
+        velocities[0].horizontal_speed = 3.5;
+    }
+    try std.testing.expect(found_page);
+
+    const data = Ecs.storage(&[_]type{ Pos, Vel });
+    const pos: *const Pos = try data.get(Pos, 0);
+    try std.testing.expect(pos.horizontal_coordinate == 77);
+    const vel: *const Vel = try data.get(Vel, 0);
+    try std.testing.expect(vel.horizontal_speed == 3.5);
+}
+test "nested tuples flatten into component sets" {
+    const Transform = .{ Pos, Vel };
+    const Ecs = ECS(.{ Transform, .{ Transform, Health }, .{Pos} });
+    try std.testing.expect(Ecs.component_count == 3);
+    try std.testing.expect(Ecs.archetype_count == 3);
+    try std.testing.expect(Ecs.archetypeId(Transform) == Ecs.archetypeId(&[_]type{ Pos, Vel }));
+    try std.testing.expect(Ecs.archetypeId(&.{ Transform, Health }) == Ecs.archetypeId(&[_]type{ Pos, Vel, Health }));
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const created = try Ecs.create(allocator, Transform);
+    _ = created;
+    try std.testing.expect(Ecs.count(Transform) == 1);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    var iterator = handler.pages(Transform, null);
+    var matched: usize = 0;
+    while (iterator.next()) |_| {
+        matched += 1;
+    }
+    try std.testing.expect(matched == 2);
+}
+test "entity mirrors reference methods" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    var created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    try std.testing.expect(created.exists());
+    try std.testing.expect(created.isAlive());
+
+    const refreshed = created.entity().?;
+    try std.testing.expect(refreshed.reference.gen == created.reference.gen);
+
+    const moved_record = try created.reference.migrate(allocator, &[_]type{Pos}, true);
+    try std.testing.expect(moved_record.isAlive());
+    try std.testing.expect(moved_record.archetype == Ecs.archetypeId(&[_]type{Pos}));
+    try std.testing.expect(!created.isAlive());
+    const moved = created.entity();
+    try std.testing.expect(moved == null);
+    const fresh = Ecs.entities.items[created.reference.id];
+    try std.testing.expect(fresh.isAlive());
+    try std.testing.expect(fresh.reference.gen == moved_record.reference.gen);
+
+    try fresh.reference.destroy(allocator);
+    try std.testing.expect(!fresh.isAlive());
+    try std.testing.expect(fresh.exists());
+    try std.testing.expect(fresh.entity() == null);
+}
+test "handler getComponent accesses a specific row" {
+    const Ecs = ECS(.{.{ Pos, Vel }});
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+
+    const pos_mut: *Pos = try handler.getComponent(created.reference, Pos);
+    pos_mut.horizontal_coordinate = 123;
+    const pos_const: *const Pos = try handler.getComponent(created.reference, Pos);
+    try std.testing.expect(pos_const.horizontal_coordinate == 123);
+
+    const vel: *const Vel = try handler.getComponent(created.reference, Vel);
+    try std.testing.expect(vel.horizontal_speed == 0.0);
+
+    try std.testing.expectError(
+        Ecs.EcsError.ComponentNotFoundInArchetype,
+        handler.getComponent(created.reference, Health),
+    );
+
+    try created.reference.destroy(allocator);
+    try std.testing.expectError(
+        Ecs.EcsError.EntityIsNotAlive,
+        handler.getComponent(created.reference, Pos),
+    );
+}
+test "schedule runs systems in order and applies commands between them" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const S = struct {
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 2,
+            }});
+        }
+        fn check_and_spawn(h: *Ecs.SystemHandler) anyerror!void {
+            // Spawned by the previous system, flushed before this one.
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 4,
+            }});
+            // Queued, not yet visible.
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 2);
+            var it = h.pages(&[_]type{Pos}, null);
+            var sum: i32 = 0;
+            while (it.next()) |page| {
+                for (page.get(Pos)) |*pos| {
+                    sum += pos.horizontal_coordinate;
+                }
+            }
+            try std.testing.expect(sum == 4);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.check_and_spawn, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+    try std.testing.expect(Ecs.count(&[_]type{Pos}) == 2);
+}
+test "deferred migrate and destroy apply between systems, stale skipped" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
+    const S = struct {
+        fn setup(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 9, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn move_and_kill(h: *Ecs.SystemHandler) anyerror!void {
+            var it = h.pages(&[_]type{ Pos, Vel }, null);
+            var target: ?Ecs.EntityReference = null;
+            while (it.next()) |page| {
+                for (page.entities()) |ref| {
+                    if (target == null) {
+                        target = ref;
+                    }
+                }
+            }
+            const ref = target.?;
+            try h.cmdMigrate(ref, &[_]type{Pos}, true);
+            // Same reference destroyed right after: stale at apply time.
+            try h.cmdDestroy(ref);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{ Pos, Vel }, null) == 0);
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+            var it = h.pages(&[_]type{Pos}, null);
+            var found = false;
+            while (it.next()) |page| {
+                for (page.get(Pos)) |*pos| {
+                    try std.testing.expect(pos.horizontal_coordinate == 9);
+                    found = true;
+                }
+            }
+            try std.testing.expect(found);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.setup, S.move_and_kill, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "bulk commands create and destroy pages" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const S = struct {
+        fn spawn_many(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 6,
+            }}, 3);
+            try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 7, .vertical_coordinate = 8 },
+                Vel{ .horizontal_speed = 1, .vertical_speed = 2 },
+            });
+        }
+        fn wipe_small(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 4);
+            try h.cmdDestroyPages(&[_]type{Pos}, &[_]type{Vel});
+        }
+        fn wipe_rest(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+            try h.cmdDestroyPage(&[_]type{ Pos, Vel });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn_many, S.wipe_small, S.wipe_rest, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "failing system discards its commands and propagates anyerror" {
+    const Ecs = ECS(.{.{Pos}});
+    const CustomError = error{Boom};
+    const S = struct {
+        fn ok_spawn(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 1,
+            }});
+        }
+        fn failing(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 2,
+            }});
+            return CustomError.Boom;
+        }
+    };
+    const App = Ecs.Schedule(.{ S.ok_spawn, S.failing });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try std.testing.expectError(CustomError.Boom, App.run(allocator));
+    // First system applied, failing system's command discarded.
+    try std.testing.expect(Ecs.count(&[_]type{Pos}) == 1);
+    // Scheduler is reusable after a failure.
+    const Clean = Ecs.Schedule(.{S.ok_spawn});
+    try Clean.run(allocator);
+    try std.testing.expect(Ecs.count(&[_]type{Pos}) == 2);
 }
