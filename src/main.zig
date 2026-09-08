@@ -5,14 +5,26 @@ const ECS = @import("ecs.zig").ECS(.{
     Transform,
     .{Player},
     .{ Player, Enemy },
+    .{ Player, Empty1 },
+    .{ Player, Empty2 },
+    .{ Player, Empty3 },
+    .{ Player, Empty4 },
+    .{ Player, Empty5 },
+    .{ Player, Empty1, Empty2 },
+    .{ Player, Empty1, Empty2, Empty3 },
 });
 
 const Position = struct { x: f32 = 0, y: f32 = 0 };
 const Scale = struct { w: f32 = 0, h: f32 = 0 };
 const Health = struct { value: f32 = 0 };
 const Enemy = struct {};
+const Empty1 = struct {};
+const Empty2 = struct {};
+const Empty3 = struct {};
+const Empty4 = struct {};
+const Empty5 = struct {};
 
-const App = ECS.Schedule(.{ setup, print });
+const App = ECS.Schedule(.{ setup, print, print_all_vs_nonempty });
 
 fn setup(h: *ECS.SystemHandler) anyerror!void {
     try h.cmdCreate(Player, .{
@@ -29,18 +41,24 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
 }
 
 fn print(h: *ECS.SystemHandler) anyerror!void {
-    var it = h.pages(.{Position}, .{Enemy});
-    while (it.next()) |p| {
+    for (h.pages(.{Position}, .{Enemy}).nonEmptyPages()) |p| {
         for (p.get(Position)) |value| {
             std.debug.print("Pos: {any}\n", .{value});
         }
     }
 }
 
+fn print_all_vs_nonempty(h: *ECS.SystemHandler) !void {
+    const nonempty_len = h.pages(.{Position}, null).nonEmptyPages().len;
+    const pages_container = h.pages(.{Position}, null);
+    const all_len = pages_container.allPages().len;
+    std.debug.print("All: {}; Nonempty: {}\n", .{ all_len, nonempty_len });
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     defer ECS.deinit(gpa);
-
+    //
     std.debug.print("Id: {}\n", .{ECS.archetypeId(.{ Position, Scale, Health })});
 
     try App.run(gpa);

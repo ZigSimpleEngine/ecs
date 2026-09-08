@@ -1,4 +1,4 @@
-const std = @import("std");
+﻿const std = @import("std");
 /// Builds a read-only view over a standard unmanaged array list.
 /// - `Element` - element type stored in the wrapped list.
 ///
@@ -67,8 +67,8 @@ pub fn ReadOnlyList(comptime Element: type) type {
 /// Example: `const Transform = .{ Pos, Vel };` then
 /// `const Ecs = ECS(.{ Transform, .{ Transform, Health } });`.
 ///
-/// All metadata (`components`, `archetypes`, per-component archetype lists and
-/// per-archetype superset lists) is precomputed once in comptime and immutable.
+/// All metadata (`components`, `archetypes` and per-component archetype lists)
+/// is precomputed once in comptime and immutable.
 /// There is no dynamic component or archetype registration. Ids are dense table
 /// indices: component id = index into `components` (sorted by type name),
 /// archetype id = index into `archetypes` (first-seen input order).
@@ -174,6 +174,7 @@ pub fn ECS(comptime sets: anytype) type {
             /// - `self` - reference to destroy. Must be alive.
             /// - `allocator` - funds the free-slot bookkeeping.
             fn destroy(self: *const EntityReference, allocator: std.mem.Allocator) EcsError!void {
+                @setEvalBranchQuota(10_000_000);
                 if (!self.isAlive()) {
                     return EcsError.EntityIsNotAlive;
                 }
@@ -183,7 +184,11 @@ pub fn ECS(comptime sets: anytype) type {
                 const displaced: ?EntityReference = blk: {
                     inline for (0..ARCH_COUNT) |k| {
                         if (arch == k) {
-                            break :blk Ecs.storages[k].remove(index);
+                            const moved = Ecs.storages[k].remove(index);
+                            if (Ecs.storages[k].count() == 0) {
+                                Ecs.clearArchetypeNonEmpty(arch);
+                            }
+                            break :blk moved;
                         }
                     }
                     unreachable;
@@ -227,6 +232,7 @@ pub fn ECS(comptime sets: anytype) type {
                 dest_id: u32,
                 copy: bool,
             ) EcsError!EntityReference {
+                @setEvalBranchQuota(10_000_000);
                 if (!self.isAlive()) {
                     return EcsError.EntityIsNotAlive;
                 }
@@ -240,7 +246,11 @@ pub fn ECS(comptime sets: anytype) type {
                 const dest_index: u32 = blk: {
                     inline for (0..ARCH_COUNT) |k| {
                         if (dest_id == k) {
-                            break :blk try Ecs.storages[k].add(allocator, &next);
+                            const idx = try Ecs.storages[k].add(allocator, &next);
+                            if (Ecs.storages[k].count() == 1) {
+                                Ecs.setArchetypeNonEmpty(dest_id);
+                            }
+                            break :blk idx;
                         }
                     }
                     unreachable;
@@ -256,7 +266,11 @@ pub fn ECS(comptime sets: anytype) type {
                 const displaced: ?EntityReference = blk: {
                     inline for (0..ARCH_COUNT) |k| {
                         if (source_id == k) {
-                            break :blk Ecs.storages[k].remove(source_index);
+                            const moved = Ecs.storages[k].remove(source_index);
+                            if (Ecs.storages[k].count() == 0) {
+                                Ecs.clearArchetypeNonEmpty(source_id);
+                            }
+                            break :blk moved;
                         }
                     }
                     unreachable;
@@ -292,8 +306,6 @@ pub fn ECS(comptime sets: anytype) type {
             id: u32,
             /// Sorted ids of the stored component types.
             component_ids: []const u32,
-            /// Ids of archetypes strictly containing this one. Precomputed in comptime.
-            superset_ids: []const u32,
         };
         /// Number of input archetype tuples. Validated to be a tuple below.
         const input_count: usize = blk: {
@@ -306,6 +318,7 @@ pub fn ECS(comptime sets: anytype) type {
         /// Largest leaf count over all archetype bundles. Statically frozen so it
         /// can size comptime buffers. Nested tuples are counted recursively.
         const max_len: usize = blk: {
+            @setEvalBranchQuota(10_000_000);
             if (input_count == 0) {
                 @compileError("ECS needs at least one archetype.");
             }
@@ -315,7 +328,8 @@ pub fn ECS(comptime sets: anytype) type {
                 if (inner_info != .@"struct" or !inner_info.@"struct".is_tuple) {
                     @compileError("Each archetype must be a tuple of component types; tuples may be nested.");
                 }
-                const leaf_count = flattenTypes(sets[i]).len;
+                // Cheap leaf count only; the full flatten happens once in Tables.
+                const leaf_count = countLeafTypes(sets[i]);
                 if (leaf_count > biggest) {
                     biggest = leaf_count;
                 }
@@ -325,9 +339,10 @@ pub fn ECS(comptime sets: anytype) type {
             };
             break :blk Keep.value;
         };
-        /// Every comptime table: canonical types, deduplicated archetypes, components,
-        /// superset links and component->archetype links. Frozen once, read-only after.
+        /// Every comptime table: canonical types, deduplicated archetypes, components
+        /// and component->archetype links. Frozen once, read-only after.
         const Tables = blk: {
+            @setEvalBranchQuota(10_000_000);
             var canon_types: [input_count][max_len]type = undefined;
             var canon_lens: [input_count]usize = [_]usize{0} ** input_count;
             for (0..input_count) |i| {
@@ -347,57 +362,73 @@ pub fn ECS(comptime sets: anytype) type {
                         total += 1;
                     }
                 }
-                var outer: usize = 0;
-                while (outer < total) : (outer += 1) {
-                    var inner_cursor: usize = outer + 1;
-                    while (inner_cursor < total) : (inner_cursor += 1) {
-                        const left: []const u8 = @typeName(uniq[outer]);
-                        const right: []const u8 = @typeName(uniq[inner_cursor]);
-                        if (std.mem.order(u8, right, left) == .lt) {
-                            const swap: type = uniq[outer];
-                            uniq[outer] = uniq[inner_cursor];
-                            uniq[inner_cursor] = swap;
-                        }
-                    }
-                }
+                sortTypesByName(uniq[0..total]);
                 canon_types[i] = uniq;
                 canon_lens[i] = total;
+            }
+            // Hash-bucketed dedup: sort input indices by set hash, compare
+            // exactly only inside equal-hash runs, emit in first-seen order
+            // so archetype ids stay stable. O(I log I) instead of O(I^2).
+            var order: [input_count]HashIndex = undefined;
+            for (0..input_count) |i| {
+                order[i] = .{
+                    .hash = hashTypeSet(canon_types[i][0..canon_lens[i]]),
+                    .index = i,
+                };
+            }
+            sortHashIndices(order[0..]);
+            var is_dup: [input_count]bool = [_]bool{false} ** input_count;
+            var run: usize = 0;
+            while (run < input_count) {
+                var run_end: usize = run + 1;
+                while (run_end < input_count and order[run_end].hash == order[run].hash) : (run_end += 1) {}
+                var k: usize = run + 1;
+                while (k < run_end) : (k += 1) {
+                    const ki: usize = order[k].index;
+                    var m: usize = run;
+                    var same: bool = false;
+                    while (m < k) : (m += 1) {
+                        const mi: usize = order[m].index;
+                        if (is_dup[mi]) {
+                            continue;
+                        }
+                        if (canon_lens[mi] != canon_lens[ki]) {
+                            continue;
+                        }
+                        var eq: bool = true;
+                        for (0..canon_lens[ki]) |t| {
+                            if (canon_types[mi][t] != canon_types[ki][t]) {
+                                eq = false;
+                                break;
+                            }
+                        }
+                        if (eq) {
+                            same = true;
+                            break;
+                        }
+                    }
+                    is_dup[ki] = same;
+                }
+                run = run_end;
             }
             var arch_types: [input_count][max_len]type = undefined;
             var arch_lens: [input_count]usize = [_]usize{0} ** input_count;
             var uniq_count: usize = 0;
             for (0..input_count) |i| {
-                var duplicate: bool = false;
-                for (0..uniq_count) |u| {
-                    if (canon_lens[i] != arch_lens[u]) {
-                        continue;
-                    }
-                    var same: bool = true;
-                    for (0..canon_lens[i]) |k| {
-                        if (canon_types[i][k] != arch_types[u][k]) {
-                            same = false;
-                            break;
-                        }
-                    }
-                    if (same) {
-                        duplicate = true;
-                        break;
-                    }
+                if (is_dup[i]) {
+                    continue;
                 }
-                if (!duplicate) {
-                    arch_types[uniq_count] = canon_types[i];
-                    arch_lens[uniq_count] = canon_lens[i];
-                    uniq_count += 1;
-                }
+                arch_types[uniq_count] = canon_types[i];
+                arch_lens[uniq_count] = canon_lens[i];
+                uniq_count += 1;
             }
             var comp_types: [input_count * max_len]type = undefined;
             var comp_count: usize = 0;
             for (0..uniq_count) |a| {
-                for (0..arch_lens[a]) |k| {
-                    const T: type = arch_types[a][k];
+                for (arch_types[a][0..arch_lens[a]]) |T| {
                     var seen: bool = false;
-                    for (0..comp_count) |c| {
-                        if (comp_types[c] == T) {
+                    for (comp_types[0..comp_count]) |C| {
+                        if (C == T) {
                             seen = true;
                             break;
                         }
@@ -408,90 +439,29 @@ pub fn ECS(comptime sets: anytype) type {
                     }
                 }
             }
-            var comp_outer: usize = 0;
-            while (comp_outer < comp_count) : (comp_outer += 1) {
-                var comp_inner: usize = comp_outer + 1;
-                while (comp_inner < comp_count) : (comp_inner += 1) {
-                    const left: []const u8 = @typeName(comp_types[comp_outer]);
-                    const right: []const u8 = @typeName(comp_types[comp_inner]);
-                    if (std.mem.order(u8, right, left) == .lt) {
-                        const swap: type = comp_types[comp_outer];
-                        comp_types[comp_outer] = comp_types[comp_inner];
-                        comp_types[comp_inner] = swap;
-                    }
-                }
-            }
+            sortTypesByName(comp_types[0..comp_count]);
             var arch_comp: [input_count][max_len]u32 = undefined;
             for (0..uniq_count) |a| {
-                for (0..arch_lens[a]) |k| {
-                    var found: ?usize = null;
-                    for (0..comp_count) |c| {
-                        if (comp_types[c] == arch_types[a][k]) {
-                            found = c;
-                            break;
-                        }
+                var prev: u32 = 0;
+                for (arch_types[a][0..arch_lens[a]], 0..) |T, k| {
+                    const c: u32 = @intCast(componentIndexInSorted(T, comp_types[0..comp_count]).?);
+                    // Both sides share the (hash, name) order, so rows stay
+                    // ascending; merge-based query checks rely on this.
+                    if (k > 0 and prev >= c) {
+                        @compileError("arch_comp row is not sorted; merge checks are invalid.");
                     }
-                    arch_comp[a][k] = @intCast(found.?);
+                    prev = c;
+                    arch_comp[a][k] = c;
                 }
-            }
-            var sup: [input_count][input_count]u32 = undefined;
-            var sup_lens: [input_count]usize = [_]usize{0} ** input_count;
-            var total_sup: usize = 0;
-            for (0..uniq_count) |a| {
-                var n: usize = 0;
-                for (0..uniq_count) |b| {
-                    if (a == b) {
-                        continue;
-                    }
-                    if (arch_lens[b] <= arch_lens[a]) {
-                        continue;
-                    }
-                    var covers: bool = true;
-                    for (0..arch_lens[a]) |k| {
-                        var has: bool = false;
-                        for (0..arch_lens[b]) |j| {
-                            if (arch_comp[b][j] == arch_comp[a][k]) {
-                                has = true;
-                                break;
-                            }
-                        }
-                        if (!has) {
-                            covers = false;
-                            break;
-                        }
-                    }
-                    if (covers) {
-                        sup[a][n] = @intCast(b);
-                        n += 1;
-                    }
-                }
-                sup_lens[a] = n;
-                total_sup += n;
-            }
-            var ca: [input_count * max_len][input_count]u32 = undefined;
-            var ca_lens: [input_count * max_len]usize = [_]usize{0} ** (input_count * max_len);
-            var total_ca: usize = 0;
-            for (0..comp_count) |c| {
-                var n: usize = 0;
-                for (0..uniq_count) |a| {
-                    var has: bool = false;
-                    for (0..arch_lens[a]) |k| {
-                        if (arch_comp[a][k] == @as(u32, @intCast(c))) {
-                            has = true;
-                            break;
-                        }
-                    }
-                    if (has) {
-                        ca[c][n] = @intCast(a);
-                        n += 1;
-                    }
-                }
-                ca_lens[c] = n;
-                total_ca += n;
             }
             var total_arch_entries: usize = 0;
             for (0..uniq_count) |a| {
                 total_arch_entries += arch_lens[a];
+            }
+            // Set hashes for O(1)-filter exact lookup in archetypeId.
+            var arch_hashes: [input_count]u64 = undefined;
+            for (0..uniq_count) |a| {
+                arch_hashes[a] = hashTypeSet(arch_types[a][0..arch_lens[a]]);
             }
             break :blk .{
                 .uniq_count = uniq_count,
@@ -499,14 +469,9 @@ pub fn ECS(comptime sets: anytype) type {
                 .arch_types = arch_types,
                 .arch_comp = arch_comp,
                 .arch_lens = arch_lens,
-                .sup = sup,
-                .sup_lens = sup_lens,
-                .ca = ca,
-                .ca_lens = ca_lens,
+                .arch_hashes = arch_hashes,
                 .comp_types = comp_types,
                 .total_arch_entries = total_arch_entries,
-                .total_sup = total_sup,
-                .total_ca = total_ca,
             };
         };
         /// Number of unique archetypes. Ids are `0..archetype_count-1`.
@@ -517,6 +482,7 @@ pub fn ECS(comptime sets: anytype) type {
         const ARCH_COUNT: usize = Tables.uniq_count;
         /// Flat component ids of every archetype, concatenated in archetype order.
         const arch_comp_flat: [Tables.total_arch_entries]u32 = blk: {
+            @setEvalBranchQuota(10_000_000);
             var flat: [Tables.total_arch_entries]u32 = undefined;
             var cursor: usize = 0;
             for (0..ARCH_COUNT) |a| {
@@ -527,63 +493,110 @@ pub fn ECS(comptime sets: anytype) type {
             }
             break :blk flat;
         };
-        /// Flat superset ids of every archetype, concatenated in archetype order.
-        const arch_sup_flat: [Tables.total_sup]u32 = blk: {
-            var flat: [Tables.total_sup]u32 = undefined;
-            var cursor: usize = 0;
+        /// Inverted index component -> archetypes, built in two linear passes
+        /// over `arch_comp` (count, then fill). Rows are ascending in `a`
+        /// because archetypes are visited in order. Backs both
+        /// `ComponentInfo.archetype_ids` and rarest-seed query matching.
+        /// Flat layout is component-major and contiguous: component `c`
+        /// owns `flat[offsets[c]..offsets[c]+lens[c]]`.
+        const CompArchetypes = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var lens: [input_count * max_len]usize = [_]usize{0} ** (input_count * max_len);
             for (0..ARCH_COUNT) |a| {
-                for (0..Tables.sup_lens[a]) |k| {
-                    flat[cursor] = Tables.sup[a][k];
-                    cursor += 1;
+                for (Tables.arch_comp[a][0..Tables.arch_lens[a]]) |c| {
+                    lens[c] += 1;
                 }
             }
-            break :blk flat;
-        };
-        /// Flat archetype ids of every component, concatenated in component order.
-        const comp_arch_flat: [Tables.total_ca]u32 = blk: {
-            var flat: [Tables.total_ca]u32 = undefined;
-            var cursor: usize = 0;
+            var offsets: [input_count * max_len + 1]usize = undefined;
+            var acc: usize = 0;
             for (0..component_count) |c| {
-                for (0..Tables.ca_lens[c]) |k| {
-                    flat[cursor] = Tables.ca[c][k];
-                    cursor += 1;
+                offsets[c] = acc;
+                acc += lens[c];
+            }
+            offsets[component_count] = acc;
+            var flat: [input_count * max_len]u32 = undefined;
+            var cursors: [input_count * max_len]usize = [_]usize{0} ** (input_count * max_len);
+            for (0..component_count) |c| {
+                cursors[c] = offsets[c];
+            }
+            for (0..ARCH_COUNT) |a| {
+                for (Tables.arch_comp[a][0..Tables.arch_lens[a]]) |c| {
+                    flat[cursors[c]] = @intCast(a);
+                    cursors[c] += 1;
                 }
             }
-            break :blk flat;
+            break :blk .{
+                .flat = flat,
+                .offsets = offsets,
+                .lens = lens,
+                .total = acc,
+            };
         };
+        /// Flat component-major archetype index plus per-component lens and
+        /// offsets. Each const is its own global so runtime slices
+        /// (`ComponentInfo.archetype_ids`, query seeds) can borrow it.
+        /// Component `c` owns `comp_arch_flat[comp_arch_off[c]..][0..len]`.
+        const comp_arch_flat: [CompArchetypes.total]u32 = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [CompArchetypes.total]u32 = undefined;
+            for (0..CompArchetypes.total) |i| {
+                out[i] = CompArchetypes.flat[i];
+            }
+            break :blk out;
+        };
+        /// Number of archetypes per component, ascending in component id.
+        const comp_arch_lens: [component_count]usize = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [component_count]usize = undefined;
+            for (0..component_count) |c| {
+                out[c] = CompArchetypes.lens[c];
+            }
+            break :blk out;
+        };
+        /// Start offsets into `comp_arch_flat` per component, ascending.
+        const comp_arch_off: [component_count + 1]usize = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [component_count + 1]usize = undefined;
+            for (0..component_count + 1) |c| {
+                out[c] = CompArchetypes.offsets[c];
+            }
+            break :blk out;
+        };
+        /// Archetype ids of one component, ascending.
+        /// - `c` - component id, an index into `components`.
+        ///
+        /// Returns `[]const u32` - archetype ids containing the component.
+        fn archetypesOfComponent(comptime c: usize) []const u32 {
+            return comp_arch_flat[comp_arch_off[c]..][0..comp_arch_lens[c]];
+        }
         /// Static component descriptors. `components[id].id == id` always holds.
         pub const components: [component_count]ComponentInfo = blk: {
+            @setEvalBranchQuota(10_000_000);
             var out: [component_count]ComponentInfo = undefined;
-            var cursor: usize = 0;
             for (0..component_count) |c| {
                 const T: type = Tables.comp_types[c];
-                const len: usize = Tables.ca_lens[c];
                 out[c] = ComponentInfo{
                     .id = @intCast(c),
                     .size = @sizeOf(T),
                     .alignment = @alignOf(T),
                     .name = @typeName(T),
-                    .archetype_ids = comp_arch_flat[cursor..][0..len],
+                    .archetype_ids = archetypesOfComponent(c),
                 };
-                cursor += len;
             }
             break :blk out;
         };
         /// Static archetype descriptors. `archetypes[id].id == id` always holds.
         pub const archetypes: [archetype_count]ArchetypeInfo = blk: {
+            @setEvalBranchQuota(10_000_000);
             var out: [archetype_count]ArchetypeInfo = undefined;
             var comp_cursor: usize = 0;
-            var sup_cursor: usize = 0;
             for (0..archetype_count) |a| {
                 const comp_len: usize = Tables.arch_lens[a];
-                const sup_len: usize = Tables.sup_lens[a];
                 out[a] = ArchetypeInfo{
                     .id = @intCast(a),
                     .component_ids = arch_comp_flat[comp_cursor..][0..comp_len],
-                    .superset_ids = arch_sup_flat[sup_cursor..][0..sup_len],
                 };
                 comp_cursor += comp_len;
-                sup_cursor += sup_len;
             }
             break :blk out;
         };
@@ -789,19 +802,7 @@ pub fn ECS(comptime sets: anytype) type {
                         total += 1;
                     }
                 }
-                var outer: usize = 0;
-                while (outer < total) : (outer += 1) {
-                    var inner_cursor: usize = outer + 1;
-                    while (inner_cursor < total) : (inner_cursor += 1) {
-                        const left: []const u8 = @typeName(uniq[outer]);
-                        const right: []const u8 = @typeName(uniq[inner_cursor]);
-                        if (std.mem.order(u8, right, left) == .lt) {
-                            const swap: type = uniq[outer];
-                            uniq[outer] = uniq[inner_cursor];
-                            uniq[inner_cursor] = swap;
-                        }
-                    }
-                }
+                sortTypesByName(uniq[0..total]);
                 for (uniq[0..total]) |T| {
                     if (componentIndex(T) == null) {
                         @compileError("Component type was not declared in ECS(...).");
@@ -813,32 +814,6 @@ pub fn ECS(comptime sets: anytype) type {
                 };
                 break :canon Keep.values[0..Keep.count];
             };
-        }
-        /// Checks whether one archetype stores a type, by archetype id.
-        /// - `k` - archetype id. Must be comptime-known.
-        /// - `Item` - component type to look up.
-        ///
-        /// Returns `bool` - true when the archetype stores the type.
-        fn archHasType(comptime k: usize, comptime Item: type) bool {
-            for (0..Tables.arch_lens[k]) |i| {
-                if (Tables.arch_types[k][i] == Item) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        /// Maps a type to its column index inside one archetype, by archetype id.
-        /// - `k` - archetype id. Must be comptime-known.
-        /// - `Item` - component type to locate. Must be stored in the archetype.
-        ///
-        /// Returns `usize` - column index of the type.
-        fn archIndexOf(comptime k: usize, comptime Item: type) usize {
-            for (0..Tables.arch_lens[k]) |i| {
-                if (Tables.arch_types[k][i] == Item) {
-                    return i;
-                }
-            }
-            @compileError("Type is not part of this archetype.");
         }
         /// Compares one archetype against a canonical query for exact equality.
         /// - `k` - archetype id. Must be comptime-known.
@@ -898,8 +873,13 @@ pub fn ECS(comptime sets: anytype) type {
         ///
         /// Returns `u32` - archetype id, an index into `archetypes`.
         pub fn archetypeId(comptime types: anytype) u32 {
+            @setEvalBranchQuota(10_000_000);
             const q = comptime canonicalQuery(types);
+            const qh: u64 = comptime hashTypeSet(q);
             inline for (0..ARCH_COUNT) |k| {
+                if (comptime Tables.arch_hashes[k] != qh) {
+                    continue;
+                }
                 if (comptime archTypesEqual(k, q)) {
                     return @intCast(k);
                 }
@@ -1079,6 +1059,7 @@ pub fn ECS(comptime sets: anytype) type {
         }
         /// Concrete storage types, one per archetype, in archetype id order.
         const DataTypes: [ARCH_COUNT]type = blk: {
+            @setEvalBranchQuota(10_000_000);
             var tmp: [ARCH_COUNT]type = undefined;
             for (0..ARCH_COUNT) |j| {
                 tmp[j] = MakeData(Tables.arch_types[j], Tables.arch_lens[j]);
@@ -1089,11 +1070,102 @@ pub fn ECS(comptime sets: anytype) type {
         const Storages = std.meta.Tuple(&DataTypes);
         /// Every archetype storage. Starts empty; rows are added at runtime.
         var storages: Storages = blk: {
+            @setEvalBranchQuota(10_000_000);
             var tmp: Storages = undefined;
             for (0..ARCH_COUNT) |j| {
                 tmp[j] = DataTypes[j].empty();
             }
             break :blk tmp;
+        };
+        /// Number of 64-bit words covering all archetype occupancy bits.
+        const ARCH_WORDS: usize = (ARCH_COUNT + 63) / 64;
+        /// Occupancy bits, one per archetype: 1 means the storage holds at
+        /// least one row, 0 means empty. Dense (`512` flags per cache line)
+        /// so `nonEmptyPages()` filters without touching scattered headers.
+        var archetype_nonempty_bits: [ARCH_WORDS]u64 = [_]u64{0} ** ARCH_WORDS;
+        /// Checks the occupancy bit of one archetype.
+        /// - `arch_id` - archetype id, an index into `archetypes`.
+        ///
+        /// Returns `bool` - true when the archetype holds at least one row.
+        inline fn isArchetypeNonEmpty(arch_id: u32) bool {
+            const word: u64 = Ecs.archetype_nonempty_bits[arch_id >> 6];
+            const bit: u6 = @intCast(arch_id & 63);
+            return (word >> bit) & 1 == 1;
+        }
+        /// Marks one archetype as non-empty.
+        /// - `arch_id` - archetype id to mark.
+        inline fn setArchetypeNonEmpty(arch_id: u32) void {
+            const bit: u6 = @intCast(arch_id & 63);
+            Ecs.archetype_nonempty_bits[arch_id >> 6] |= @as(u64, 1) << bit;
+        }
+        /// Marks one archetype as empty.
+        /// - `arch_id` - archetype id to mark.
+        inline fn clearArchetypeNonEmpty(arch_id: u32) void {
+            const bit: u6 = @intCast(arch_id & 63);
+            Ecs.archetype_nonempty_bits[arch_id >> 6] &= ~(@as(u64, 1) << bit);
+        }
+        /// Raw byte view of one component column: base pointer plus row count.
+        /// The pointer always carries the column element alignment (columns
+        /// are `ArrayListUnmanaged(T)` buffers), so casting back up only
+        /// needs `@alignCast` with the comptime-known `@alignOf(T)`.
+        const RawColumn = struct {
+            ptr: [*]u8,
+            len: usize,
+        };
+        /// Builds the column getter for one archetype: resolves a runtime
+        /// column index to the live column bytes. One tiny function per
+        /// archetype; columns per archetype are few, so the inner dispatch
+        /// is trivial and never touches other archetypes.
+        /// - `k` - archetype id. Must be comptime-known.
+        ///
+        /// Returns `*const fn` - getter bound to the archetype storage.
+        fn makeColumnGetter(comptime k: usize) *const fn (col: usize) RawColumn {
+            return struct {
+                fn f(col: usize) RawColumn {
+                    inline for (0..Tables.arch_lens[k]) |c| {
+                        if (col == c) {
+                            const items = Ecs.storages[k].lists[c].items;
+                            return .{ .ptr = @ptrCast(items.ptr), .len = items.len };
+                        }
+                    }
+                    unreachable;
+                }
+            }.f;
+        }
+        /// Builds the entity-reference getter for one archetype. The element
+        /// type is uniform, so no casting is needed on this path.
+        /// - `k` - archetype id. Must be comptime-known.
+        ///
+        /// Returns `*const fn` - getter bound to the archetype storage.
+        fn makeRefsGetter(comptime k: usize) *const fn () []const EntityReference {
+            return struct {
+                fn f() []const EntityReference {
+                    return Ecs.storages[k].refs.items;
+                }
+            }.f;
+        }
+        /// Direct storage access by runtime archetype id: plain O(1) indexing
+        /// into a homogeneous fn-pointer array, no `inline for` chain over
+        /// all archetypes. The array is `const` (storage addresses and
+        /// getters are fixed), so there is nothing to keep in sync:
+        /// reallocations only replace column buffers, never the headers.
+        const column_getters: [ARCH_COUNT]*const fn (col: usize) RawColumn = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [ARCH_COUNT]*const fn (col: usize) RawColumn = undefined;
+            for (0..ARCH_COUNT) |k| {
+                out[k] = makeColumnGetter(k);
+            }
+            break :blk out;
+        };
+        /// Direct entity-reference access by runtime archetype id. Backs
+        /// `Page.entities` and `countById` with one indirect call.
+        const refs_getters: [ARCH_COUNT]*const fn () []const EntityReference = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [ARCH_COUNT]*const fn () []const EntityReference = undefined;
+            for (0..ARCH_COUNT) |k| {
+                out[k] = makeRefsGetter(k);
+            }
+            break :blk out;
         };
         /// Entity slots in SoA form. Position `id` in every column describes
         /// one slot: `entity_generation[id]` is the live generation,
@@ -1212,6 +1284,7 @@ pub fn ECS(comptime sets: anytype) type {
         ///
         /// Returns `EntityReference` - handle of the new entity.
         fn createById(allocator: std.mem.Allocator, id: u32) EcsError!EntityReference {
+            @setEvalBranchQuota(10_000_000);
             var new_id: u32 = 0;
             var new_gen: u8 = 0;
             if (Ecs.free_ids.pop()) |recycled| {
@@ -1232,7 +1305,11 @@ pub fn ECS(comptime sets: anytype) type {
             const index: u32 = blk: {
                 inline for (0..ARCH_COUNT) |k| {
                     if (id == k) {
-                        break :blk try Ecs.storages[k].add(allocator, &reference);
+                        const idx = try Ecs.storages[k].add(allocator, &reference);
+                        if (Ecs.storages[k].count() == 1) {
+                            Ecs.setArchetypeNonEmpty(id);
+                        }
+                        break :blk idx;
                     }
                 }
                 unreachable;
@@ -1256,18 +1333,16 @@ pub fn ECS(comptime sets: anytype) type {
         ///
         /// Returns `u32` - current row count.
         pub fn countById(id: u32) u32 {
-            inline for (0..ARCH_COUNT) |k| {
-                if (id == k) {
-                    return Ecs.storages[k].count();
-                }
-            }
-            unreachable;
+            return @intCast(Ecs.refs_getters[id]().len);
         }
         /// Returns a pointer to one component value at a row. The pointer is
         /// mutable: component data lives in global storage, no handle state
-        /// is modified by the lookup.
+        /// is modified by the lookup. Resolves through the column registry:
+        /// one binary search plus one indirect call, no dispatch chain.
+        /// Undeclared and absent types both report
+        /// `ComponentNotFoundInArchetype`, exactly as before.
         /// - `arch_id` - archetype id owning the row.
-        /// - `T` - component type, must be stored in the archetype.
+        /// - `T` - component type to look up.
         /// - `index` - row position.
         ///
         /// Returns `*T` - pointer into the component column.
@@ -1277,23 +1352,25 @@ pub fn ECS(comptime sets: anytype) type {
             comptime T: type,
             index: u32,
         ) EcsError!*T {
-            inline for (0..ARCH_COUNT) |k| {
-                if (arch_id == k) {
-                    if (comptime !archHasType(k, T)) {
-                        return EcsError.ComponentNotFoundInArchetype;
-                    }
-                    const col = comptime archIndexOf(k, T);
-                    const column = &Ecs.storages[k].lists[col];
-                    if (index >= column.items.len) {
-                        return EcsError.IndexOutOfBounds;
-                    }
-                    return &column.items[index];
-                }
+            if (comptime componentIndex(T) == null) {
+                return EcsError.ComponentNotFoundInArchetype;
             }
-            unreachable;
+            const comp_id: u32 = @intCast(comptime componentIndex(T).?);
+            const col = Ecs.binarySearchIds(
+                Ecs.archetypes[arch_id].component_ids,
+                comp_id,
+            ) orelse return EcsError.ComponentNotFoundInArchetype;
+            const raw = Ecs.column_getters[arch_id](col);
+            if (index >= raw.len) {
+                return EcsError.IndexOutOfBounds;
+            }
+            const typed: [*]T = @ptrCast(@alignCast(raw.ptr));
+            return &typed[index];
         }
         /// Copies values of components shared by two archetype rows.
-        /// Every shared component is copied with a typed struct assignment.
+        /// Single dispatch on the destination; source columns resolve through
+        /// the shared `getComponent` dispatch instead of a nested `A x A`
+        /// unroll, so codegen stays linear in the archetype count.
         /// - `src_id` - archetype to read from.
         /// - `src_index` - row position in the source storage.
         /// - `dst_id` - archetype to write to.
@@ -1304,35 +1381,23 @@ pub fn ECS(comptime sets: anytype) type {
             dst_id: u32,
             dst_index: u32,
         ) void {
-            inline for (0..ARCH_COUNT) |s| {
-                inline for (0..ARCH_COUNT) |d| {
-                    if (src_id == s and dst_id == d) {
-                        Ecs.copyBetween(s, d, src_index, dst_index);
-                        return;
+            @setEvalBranchQuota(10_000_000);
+            inline for (0..ARCH_COUNT) |d| {
+                if (dst_id == d) {
+                    inline for (0..Tables.arch_lens[d]) |ti| {
+                        const T: type = Tables.arch_types[d][ti];
+                        if (Ecs.getComponent(src_id, T, src_index)) |src_ptr| {
+                            Ecs.storages[d].lists[ti].items[dst_index] = src_ptr.*;
+                        } else |err| {
+                            if (err != EcsError.ComponentNotFoundInArchetype) {
+                                unreachable;
+                            }
+                        }
                     }
+                    return;
                 }
             }
             unreachable;
-        }
-        /// Copies shared components between two comptime-known archetypes.
-        /// - `s` - source archetype id. Must be comptime-known.
-        /// - `d` - destination archetype id. Must be comptime-known.
-        /// - `src_index` - row position in the source storage.
-        /// - `dst_index` - row position in the destination storage.
-        fn copyBetween(
-            comptime s: usize,
-            comptime d: usize,
-            src_index: u32,
-            dst_index: u32,
-        ) void {
-            inline for (0..Tables.arch_lens[d]) |ti| {
-                const T: type = Tables.arch_types[d][ti];
-                if (comptime archHasType(s, T)) {
-                    const sc = comptime archIndexOf(s, T);
-                    Ecs.storages[d].lists[ti].items[dst_index] =
-                        Ecs.storages[s].lists[sc].items[src_index];
-                }
-            }
         }
         /// Binary-searches a sorted component id list.
         /// - `ids` - sorted component ids.
@@ -1350,6 +1415,124 @@ pub fn ECS(comptime sets: anytype) type {
                     high = mid;
                 } else {
                     return mid;
+                }
+            }
+            return null;
+        }
+        /// Sorts a type slice by `(name hash, name)`, in place. Hashes make
+        /// the quadratic insertion pass cheap integer compares; the name
+        /// tie-break keeps a total order so id mapping stays order-preserving
+        /// (ascending `arch_comp` rows, ascending `qids`). Replaces the old
+        /// per-site bubble sorts; `std.mem.sort` is not comptime-safe here.
+        /// - `types` - comptime type slice to sort. Evaluated in comptime.
+        fn sortTypesByName(comptime types: []type) void {
+            var i: usize = 1;
+            while (i < types.len) : (i += 1) {
+                const t: type = types[i];
+                const h: u64 = hashTypeName(t);
+                var j: usize = i;
+                while (j > 0 and typeKeyLess(types[j - 1], h, t)) {
+                    types[j] = types[j - 1];
+                    j -= 1;
+                }
+                types[j] = t;
+            }
+        }
+        /// Compares a placed element against an insertion key.
+        /// - `placed` - element already in the sorted prefix.
+        /// - `key_hash` - hash of the element being inserted.
+        /// - `key` - element being inserted.
+        ///
+        /// Returns `bool` - true when `placed` sorts after the key.
+        fn typeKeyLess(comptime placed: type, key_hash: u64, comptime key: type) bool {
+            const ph: u64 = hashTypeName(placed);
+            if (ph != key_hash) {
+                return ph > key_hash;
+            }
+            return std.mem.order(u8, @typeName(placed), @typeName(key)) == .gt;
+        }
+        /// Hashes a type name for ordering. Collisions only cost a rare
+        /// name tie-break; order stays total via `typeKeyLess`.
+        /// - `T` - type whose name to hash.
+        ///
+        /// Returns `u64` - FNV-1a hash of the fully qualified name.
+        fn hashTypeName(comptime T: type) u64 {
+            var h: u64 = 0xcbf29ce484222325;
+            for (@typeName(T)) |b| {
+                h ^= b;
+                h *%= 0x100000001b3;
+            }
+            return h;
+        }
+        /// Hashes a canonical (sorted, unique) type list. Used to bucket
+        /// archetypes before exact dedup comparison.
+        /// - `types` - canonical type list to hash.
+        ///
+        /// Returns `u64` - FNV-1a hash over member type names and length.
+        fn hashTypeSet(comptime types: []const type) u64 {
+            var h: u64 = 0xcbf29ce484222325;
+            h ^= @as(u64, types.len);
+            h *%= 0x100000001b3;
+            for (types) |T| {
+                for (@typeName(T)) |b| {
+                    h ^= b;
+                    h *%= 0x100000001b3;
+                }
+                h ^= 0xff;
+                h *%= 0x100000001b3;
+            }
+            return h;
+        }
+        /// Sort key pairing an archetype hash with its input index.
+        const HashIndex = struct {
+            hash: u64,
+            index: usize,
+        };
+        /// Orders hash buckets for archetype dedup.
+        fn hashIndexLessThan(_: void, a: HashIndex, b: HashIndex) bool {
+            return a.hash < b.hash;
+        }
+        /// Sorts hash buckets by hash, in place. Plain insertion sort:
+        /// integer compares only, no aliasing hazards at comptime.
+        /// - `order` - buckets to sort. Evaluated in comptime.
+        fn sortHashIndices(order: []HashIndex) void {
+            var i: usize = 1;
+            while (i < order.len) : (i += 1) {
+                const key: HashIndex = order[i];
+                var j: usize = i;
+                while (j > 0 and order[j - 1].hash > key.hash) {
+                    order[j] = order[j - 1];
+                    j -= 1;
+                }
+                order[j] = key;
+            }
+        }
+        /// Binary-searches a `(hash, name)`-sorted component type list, the
+        /// order produced by `sortTypesByName`.
+        /// - `T` - component type to look up.
+        /// - `comps` - sorted component types.
+        ///
+        /// Returns `?usize` - position inside the list, or null when absent.
+        fn componentIndexInSorted(comptime T: type, comptime comps: []const type) ?usize {
+            const needle_hash: u64 = hashTypeName(T);
+            const needle: []const u8 = @typeName(T);
+            var low: usize = 0;
+            var high: usize = comps.len;
+            while (low < high) {
+                const mid: usize = low + (high - low) / 2;
+                const mid_hash: u64 = hashTypeName(comps[mid]);
+                if (mid_hash < needle_hash) {
+                    low = mid + 1;
+                    continue;
+                }
+                if (mid_hash > needle_hash) {
+                    high = mid;
+                    continue;
+                }
+                switch (std.mem.order(u8, @typeName(comps[mid]), needle)) {
+                    .lt => low = mid + 1,
+                    .gt => high = mid,
+                    .eq => return mid,
                 }
             }
             return null;
@@ -1382,7 +1565,9 @@ pub fn ECS(comptime sets: anytype) type {
                 const PageNamespace = @This();
                 /// Archetype this page reads and writes.
                 arch_id: u32,
-                /// Returns the whole mutable column of one component.
+                /// Returns the whole mutable column of one component, resolved
+                /// through the column registry (binary search plus one
+                /// indirect call, no dispatch chain over archetypes).
                 /// - `self` - page to inspect.
                 /// - `T` - component type, must be part of the query.
                 ///
@@ -1393,28 +1578,22 @@ pub fn ECS(comptime sets: anytype) type {
                             @compileError("Requested component type is not part of this page.");
                         }
                     }
-                    inline for (0..ARCH_COUNT) |k| {
-                        if (self.arch_id == k) {
-                            if (comptime !archHasType(k, T)) {
-                                return &[0]T{};
-                            }
-                            const col = comptime archIndexOf(k, T);
-                            return Ecs.storages[k].lists[col].items;
-                        }
-                    }
-                    unreachable;
+                    const comp_id: u32 = comptime Ecs.componentId(T);
+                    const col = Ecs.binarySearchIds(
+                        Ecs.archetypes[self.arch_id].component_ids,
+                        comp_id,
+                    ) orelse return &[0]T{};
+                    const raw = Ecs.column_getters[self.arch_id](col);
+                    const typed: [*]T = @ptrCast(@alignCast(raw.ptr));
+                    return typed[0..raw.len];
                 }
-                /// Returns the entity reference column, read-only.
+                /// Returns the entity reference column, read-only, via the
+                /// refs registry (one indirect call).
                 /// - `self` - page to inspect.
                 ///
                 /// Returns `[]const EntityReference` - read-only reference list.
                 pub fn entities(self: *const PageNamespace) []const EntityReference {
-                    inline for (0..ARCH_COUNT) |k| {
-                        if (self.arch_id == k) {
-                            return Ecs.storages[k].refs.items;
-                        }
-                    }
-                    unreachable;
+                    return Ecs.refs_getters[self.arch_id]();
                 }
                 /// Returns an immutable reference to the source archetype info.
                 /// - `self` - page to inspect.
@@ -1423,18 +1602,32 @@ pub fn ECS(comptime sets: anytype) type {
                 pub fn archetypeInfo(self: *const PageNamespace) *const ArchetypeInfo {
                     return &Ecs.archetypes[self.arch_id];
                 }
+                /// Checks whether the page holds no entities, via the global
+                /// occupancy bit. Touches only the dense bitset, not storage.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `bool` - true when the archetype storage is empty.
+                pub inline fn isEmpty(self: *const PageNamespace) bool {
+                    return !Ecs.isArchetypeNonEmpty(self.arch_id);
+                }
             };
         }
-        /// Iterator over pages of archetypes containing all `include` components
-        /// and none of the `exclude` components.
-        /// The match list is precomputed in comptime; iteration needs no allocator.
+        /// Container of pages for archetypes containing all `include`
+        /// components and none of the `exclude` components.
+        /// The match list is precomputed in comptime; no allocator is needed.
+        /// `allPages()` returns the immutable array of every matched page.
+        /// `nonEmptyPages()` filters that array through the dense global
+        /// `archetype_nonempty_bits` into a per-query static buffer and
+        /// returns its filled prefix. The slice is valid until the next
+        /// `nonEmptyPages()` call for the same query, so consume it in a
+        /// single expression: `for (h.pages(...).nonEmptyPages()) |p|`.
         /// - `include` - component bundle that must be present.
         /// - `exclude` - component bundle that must be absent. `null` and empty
         ///   bundles are equivalent to no exclusion.
         ///
-        /// Returns `type` - iterator over the matched archetype ids.
-        /// Private: iterators are only issued by `SystemHandler`.
-        fn PageIterator(comptime include: anytype, comptime exclude: anytype) type {
+        /// Returns `type` - container over the matched archetype ids.
+        /// Private: containers are only issued by `SystemHandler`.
+        fn PagesContainer(comptime include: anytype, comptime exclude: anytype) type {
             const query = comptime canonicalQuery(include);
             const qids: [query.len]u32 = blk: {
                 var tmp: [query.len]u32 = undefined;
@@ -1472,58 +1665,102 @@ pub fn ECS(comptime sets: anytype) type {
                 break :blk tmp;
             };
             const matched = blk: {
+                @setEvalBranchQuota(10_000_000);
+                // Rarest-seed scan: iterate only archetypes of the least
+                // frequent include component, verify the rest by merge.
+                // Seed lists are ascending, so the result stays ordered.
+                // include is never empty (canonicalQuery rejects it).
+                var seed: u32 = qids[0];
+                var seed_len: usize = comp_arch_lens[seed];
+                for (qids[1..]) |qid| {
+                    const l: usize = comp_arch_lens[qid];
+                    if (l < seed_len) {
+                        seed = qid;
+                        seed_len = l;
+                    }
+                }
+                const seed_list = comp_arch_flat[comp_arch_off[seed]..][0..seed_len];
                 var list: [ARCH_COUNT]u32 = undefined;
                 var total: usize = 0;
-                for (0..ARCH_COUNT) |k| {
-                    const ids = Tables.arch_comp[k][0..Tables.arch_lens[k]];
+                for (seed_list) |a| {
+                    const ids = Tables.arch_comp[a][0..Tables.arch_lens[a]];
+                    var qi: usize = 0;
+                    var ii: usize = 0;
                     var ok: bool = true;
-                    for (qids) |qid| {
-                        var has: bool = false;
-                        for (ids) |id| {
-                            if (id == qid) {
-                                has = true;
-                                break;
-                            }
+                    while (qi < qids.len) {
+                        while (ii < ids.len and ids[ii] < qids[qi]) : (ii += 1) {}
+                        if (ii >= ids.len or ids[ii] != qids[qi]) {
+                            ok = false;
+                            break;
                         }
-                        if (!has) {
+                        qi += 1;
+                        ii += 1;
+                    }
+                    if (!ok) {
+                        continue;
+                    }
+                    var di: usize = 0;
+                    ii = 0;
+                    while (di < deny_ids.len and ii < ids.len) {
+                        if (ids[ii] < deny_ids[di]) {
+                            ii += 1;
+                        } else if (ids[ii] > deny_ids[di]) {
+                            di += 1;
+                        } else {
                             ok = false;
                             break;
                         }
                     }
-                    for (deny_ids) |did| {
-                        for (ids) |id| {
-                            if (id == did) {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if (!ok) {
-                            break;
-                        }
+                    if (!ok) {
+                        continue;
                     }
-                    if (ok) {
-                        list[total] = @intCast(k);
-                        total += 1;
-                    }
+                    list[total] = a;
+                    total += 1;
                 }
                 break :blk .{ .list = list, .len = total };
             };
             return struct {
-                /// Current match position.
-                index: usize = 0,
-                /// Returns the next matching page, or null when exhausted.
-                /// - `self` - iterator to advance.
-                ///
-                /// Returns `?Page(include)` - next page, or null at the end.
-                pub fn next(self: *@This()) ?Page(include) {
-                    if (self.index >= matched.len) {
-                        return null;
+                /// Per-query static scratch for the filtered prefix. One
+                /// buffer per distinct query type, shared by all calls, so
+                /// the returned slice stays alive after the temporary
+                /// container dies. Overwritten by the next `nonEmptyPages()`
+                /// call for the same query.
+                var nonempty_buf: [matched.len]Page(include) = undefined;
+                /// Immutable array of every matched page, precomputed once.
+                const all_pages: [matched.len]Page(include) = blk: {
+                    @setEvalBranchQuota(10_000_000);
+                    var arr: [matched.len]Page(include) = undefined;
+                    for (0..matched.len) |i| {
+                        arr[i] = .{ .arch_id = matched.list[i] };
                     }
-                    const id: u32 = matched.list[self.index];
-                    self.index += 1;
-                    return Page(include){
-                        .arch_id = id,
-                    };
+                    break :blk arr;
+                };
+                /// Returns every matched page, including empty ones.
+                /// - `self` - container to inspect. Taken by value so the
+                ///   call works on a temporary: `h.pages(...).allPages()`.
+                ///
+                /// Returns `[]const Page(include)` - static slice, always valid.
+                pub fn allPages(self: @This()) []const Page(include) {
+                    _ = self;
+                    return &all_pages;
+                }
+                /// Returns only pages holding at least one entity. Filters via
+                /// the dense bitset, without touching storage headers.
+                /// - `self` - container to inspect. Taken by value so the
+                ///   call works on a temporary: `h.pages(...).nonEmptyPages()`.
+                ///
+                /// Returns `[]Page(include)` - static-buffer slice, valid until
+                /// the next `nonEmptyPages()` call for the same query.
+                pub fn nonEmptyPages(self: @This()) []Page(include) {
+                    _ = self;
+                    var total: usize = 0;
+                    for (all_pages) |p| {
+                        if (!p.isEmpty()) {
+                            @This().nonempty_buf[total] = p;
+                            total += 1;
+                        }
+                    }
+                    return @This().nonempty_buf[0..total];
                 }
             };
         }
@@ -1535,19 +1772,20 @@ pub fn ECS(comptime sets: anytype) type {
         pub const SystemHandler = struct {
             /// Allocator funding the command queue and flushed changes.
             allocator: std.mem.Allocator,
-            /// Builds an iterator over pages of archetypes containing all `include`
+            /// Builds a container of pages for archetypes containing all `include`
             /// components and none of the `exclude` components.
             /// - `self` - handler of the running system.
             /// - `include` - component bundle that must be present.
             /// - `exclude` - component bundle that must be absent. `null` and empty
             ///   bundles are equivalent to no exclusion.
             ///
-            /// Returns `PageIterator` - stack-owned iterator, no allocator needed.
+            /// Returns `PagesContainer` - zero-sized value; call `allPages()`
+            /// or `nonEmptyPages()` on it, including on a temporary.
             pub fn pages(
                 self: *const SystemHandler,
                 comptime include: anytype,
                 comptime exclude: anytype,
-            ) PageIterator(include, exclude) {
+            ) PagesContainer(include, exclude) {
                 _ = self;
                 return .{};
             }
@@ -1578,8 +1816,7 @@ pub fn ECS(comptime sets: anytype) type {
                 comptime exclude: anytype,
             ) u32 {
                 var total: u32 = 0;
-                var it = self.pages(include, exclude);
-                while (it.next()) |p| {
+                for (self.pages(include, exclude).nonEmptyPages()) |p| {
                     total += Ecs.countById(p.arch_id);
                 }
                 return total;
@@ -1694,8 +1931,7 @@ pub fn ECS(comptime sets: anytype) type {
                 comptime include: anytype,
                 comptime exclude: anytype,
             ) EcsError!void {
-                var it = self.pages(include, exclude);
-                while (it.next()) |p| {
+                for (self.pages(include, exclude).allPages()) |p| {
                     for (p.entities()) |ref| {
                         const entity_index = try Ecs.requireIdle(ref);
                         try Ecs.commands.append(self.allocator, .{ .destroy = ref });
@@ -1713,6 +1949,7 @@ pub fn ECS(comptime sets: anytype) type {
                 self: *const SystemHandler,
                 comptime bundle: anytype,
             ) EcsError!void {
+                @setEvalBranchQuota(10_000_000);
                 const id: u32 = @intCast(comptime archetypeId(bundle));
                 inline for (0..ARCH_COUNT) |k| {
                     if (id == k) {
@@ -1833,6 +2070,7 @@ pub fn ECS(comptime sets: anytype) type {
         /// or pages held by user code may dangle after reallocation.
         /// - `allocator` - allocator that funded the queue and the changes.
         fn flushCommands(allocator: std.mem.Allocator) EcsError!void {
+            @setEvalBranchQuota(10_000_000);
             defer Ecs.commands.clearRetainingCapacity();
             for (Ecs.commands.items) |cmd| {
                 switch (cmd) {
@@ -1879,6 +2117,7 @@ pub fn ECS(comptime sets: anytype) type {
                                     Ecs.storages[k].lists[col].items.len = 0;
                                 }
                                 Ecs.storages[k].refs.items.len = 0;
+                                Ecs.clearArchetypeNonEmpty(arch);
                             }
                         }
                     },
@@ -1890,6 +2129,7 @@ pub fn ECS(comptime sets: anytype) type {
         /// system fails and on teardown.
         /// - `allocator` - allocator that funded the queue.
         fn discardCommands(allocator: std.mem.Allocator) void {
+            @setEvalBranchQuota(10_000_000);
             for (Ecs.commands.items) |cmd| {
                 switch (cmd) {
                     .create => allocator.free(cmd.create.bytes),
@@ -1964,10 +2204,12 @@ pub fn ECS(comptime sets: anytype) type {
         /// deinitialized again.
         /// - `allocator` - allocator that funded all storage.
         pub fn deinit(allocator: std.mem.Allocator) void {
+            @setEvalBranchQuota(10_000_000);
             inline for (0..ARCH_COUNT) |k| {
                 Ecs.storages[k].deinit(allocator);
                 Ecs.storages[k] = DataTypes[k].empty();
             }
+            @memset(Ecs.archetype_nonempty_bits[0..], 0);
             Ecs.discardCommands(allocator);
             Ecs.commands.deinit(allocator);
             Ecs.commands = .empty;
@@ -2072,17 +2314,18 @@ test "entity migrate copies shared components" {
     const moved: *const Pos = try dest_data.get(Pos, 0);
     try std.testing.expect(moved.horizontal_coordinate == 7);
 }
-test "supersets and component archetype lists are precomputed" {
+test "component archetype lists are precomputed" {
     const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
     const small_id = Ecs.archetypeId(&[_]type{Pos});
     const big_id = Ecs.archetypeId(&[_]type{ Pos, Vel });
-    try std.testing.expect(Ecs.archetypes[small_id].superset_ids.len == 1);
-    try std.testing.expect(Ecs.archetypes[small_id].superset_ids[0] == big_id);
-    try std.testing.expect(Ecs.archetypes[big_id].superset_ids.len == 0);
     const pos_id = Ecs.componentId(Pos);
     const vel_id = Ecs.componentId(Vel);
     try std.testing.expect(Ecs.components[pos_id].archetype_ids.len == 2);
     try std.testing.expect(Ecs.components[vel_id].archetype_ids.len == 1);
+    // Inverted index rows are ascending in archetype id.
+    try std.testing.expect(Ecs.components[pos_id].archetype_ids[0] == @min(small_id, big_id));
+    try std.testing.expect(Ecs.components[pos_id].archetype_ids[1] == @max(small_id, big_id));
+    try std.testing.expect(Ecs.components[vel_id].archetype_ids[0] == big_id);
     try std.testing.expect(Ecs.hasComponent(small_id, pos_id));
     try std.testing.expect(!Ecs.hasComponent(small_id, vel_id));
     try std.testing.expect(Ecs.columnOf(big_id, vel_id) != null);
@@ -2099,44 +2342,72 @@ test "handler page returns the exact archetype" {
     try std.testing.expect(page.get(Pos).len == 0);
     _ = page.entities();
 }
-test "handler pages match supersets and honor exclude" {
+test "handler pages match include sets and honor exclude" {
     const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel }, .{ Pos, Vel, Health } });
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
     const handler = Ecs.SystemHandler{ .allocator = allocator };
 
-    var all_iterator = handler.pages(&[_]type{ Pos, Vel }, null);
     var all_count: usize = 0;
-    while (all_iterator.next()) |page| {
+    for (handler.pages(&[_]type{ Pos, Vel }, null).allPages()) |page| {
         all_count += 1;
         _ = page.get(Pos);
         _ = page.entities();
     }
     try std.testing.expect(all_count == 2);
 
-    var filtered_iterator = handler.pages(&[_]type{Pos}, &[_]type{Vel});
     var filtered_count: usize = 0;
-    while (filtered_iterator.next()) |page| {
+    for (handler.pages(&[_]type{Pos}, &[_]type{Vel}).allPages()) |page| {
         filtered_count += 1;
         try std.testing.expect(page.archetypeInfo().component_ids.len == 1);
     }
     try std.testing.expect(filtered_count == 1);
 
-    var null_iterator = handler.pages(&[_]type{Pos}, null);
     var null_count: usize = 0;
-    while (null_iterator.next()) |_| {
+    for (handler.pages(&[_]type{Pos}, null).allPages()) |_| {
         null_count += 1;
     }
     try std.testing.expect(null_count == 3);
 
-    var empty_iterator = handler.pages(&[_]type{Pos}, &[_]type{});
     var empty_count: usize = 0;
-    while (empty_iterator.next()) |_| {
+    for (handler.pages(&[_]type{Pos}, &[_]type{}).allPages()) |_| {
         empty_count += 1;
     }
     try std.testing.expect(empty_count == 3);
 
     try std.testing.expect(handler.count(&[_]type{Pos}, null) == 0);
+}
+test "seeded matching returns exact ascending id sets" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel }, .{ Pos, Health }, .{ Pos, Vel, Health } });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    const p = Ecs.archetypeId(&[_]type{Pos});
+    const pv = Ecs.archetypeId(&[_]type{ Pos, Vel });
+    const ph = Ecs.archetypeId(&[_]type{ Pos, Health });
+    const pvh = Ecs.archetypeId(&[_]type{ Pos, Vel, Health });
+
+    const both = handler.pages(&[_]type{ Pos, Vel }, null).allPages();
+    try std.testing.expect(both.len == 2);
+    try std.testing.expect(both[0].arch_id == @min(pv, pvh));
+    try std.testing.expect(both[1].arch_id == @max(pv, pvh));
+
+    const cross = handler.pages(&[_]type{ Vel, Health }, null).allPages();
+    try std.testing.expect(cross.len == 1);
+    try std.testing.expect(cross[0].arch_id == pvh);
+
+    const no_vel = handler.pages(&[_]type{Pos}, &[_]type{Vel}).allPages();
+    try std.testing.expect(no_vel.len == 2);
+    try std.testing.expect(no_vel[0].arch_id == @min(p, ph));
+    try std.testing.expect(no_vel[1].arch_id == @max(p, ph));
+
+    const all = handler.pages(&[_]type{Pos}, null).allPages();
+    try std.testing.expect(all.len == 4);
+    for (all, 0..) |page, i| {
+        if (i > 0) {
+            try std.testing.expect(all[i - 1].arch_id < page.arch_id);
+        }
+    }
 }
 test "page get returns mutable column and mutates data" {
     const Ecs = ECS(.{.{ Pos, Vel }});
@@ -2146,9 +2417,8 @@ test "page get returns mutable column and mutates data" {
     _ = created;
     const handler = Ecs.SystemHandler{ .allocator = allocator };
 
-    var iterator = handler.pages(&[_]type{ Pos, Vel }, null);
     var found_page: bool = false;
-    while (iterator.next()) |page| {
+    for (handler.pages(&[_]type{ Pos, Vel }, null).nonEmptyPages()) |page| {
         found_page = true;
         const positions = page.get(Pos);
         try std.testing.expect(positions.len == 1);
@@ -2177,9 +2447,8 @@ test "nested tuples flatten into component sets" {
     _ = created;
     try std.testing.expect(Ecs.count(Transform) == 1);
     const handler = Ecs.SystemHandler{ .allocator = allocator };
-    var iterator = handler.pages(Transform, null);
     var matched: usize = 0;
-    while (iterator.next()) |_| {
+    for (handler.pages(Transform, null).allPages()) |_| {
         matched += 1;
     }
     try std.testing.expect(matched == 2);
@@ -2260,9 +2529,8 @@ test "schedule runs systems in order and applies commands between them" {
         }
         fn verify(h: *Ecs.SystemHandler) anyerror!void {
             try std.testing.expect(h.count(&[_]type{Pos}, null) == 2);
-            var it = h.pages(&[_]type{Pos}, null);
             var sum: i32 = 0;
-            while (it.next()) |page| {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
                 for (page.get(Pos)) |*pos| {
                     sum += pos.horizontal_coordinate;
                 }
@@ -2286,9 +2554,8 @@ test "deferred migrate rejects a second queued command" {
             });
         }
         fn move_and_kill(h: *Ecs.SystemHandler) anyerror!void {
-            var it = h.pages(&[_]type{ Pos, Vel }, null);
             var target: ?Ecs.EntityReference = null;
-            while (it.next()) |page| {
+            for (h.pages(&[_]type{ Pos, Vel }, null).nonEmptyPages()) |page| {
                 for (page.entities()) |ref| {
                     if (target == null) {
                         target = ref;
@@ -2313,9 +2580,8 @@ test "deferred migrate rejects a second queued command" {
         fn verify(h: *Ecs.SystemHandler) anyerror!void {
             try std.testing.expect(h.count(&[_]type{ Pos, Vel }, null) == 0);
             try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
-            var it = h.pages(&[_]type{Pos}, null);
             var found = false;
-            while (it.next()) |page| {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
                 for (page.get(Pos)) |*pos| {
                     try std.testing.expect(pos.horizontal_coordinate == 9);
                     found = true;
@@ -2343,9 +2609,8 @@ test "pending flags are cleared when a failing system discards commands" {
             }});
         }
         fn queue_then_fail(h: *Ecs.SystemHandler) anyerror!void {
-            var it = h.pages(&[_]type{Pos}, null);
             var target: ?Ecs.EntityReference = null;
-            while (it.next()) |page| {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
                 for (page.entities()) |ref| {
                     target = ref;
                 }
@@ -2356,9 +2621,8 @@ test "pending flags are cleared when a failing system discards commands" {
         }
         fn retry_destroy(h: *Ecs.SystemHandler) anyerror!void {
             // Discard above must have reset the flag, so queueing works again.
-            var it = h.pages(&[_]type{Pos}, null);
             var target: ?Ecs.EntityReference = null;
-            while (it.next()) |page| {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
                 for (page.entities()) |ref| {
                     target = ref;
                 }
@@ -2459,4 +2723,75 @@ test "failing system discards its commands and propagates anyerror" {
     const Clean = Ecs.Schedule(.{S.ok_spawn});
     try Clean.run(allocator);
     try std.testing.expect(Ecs.count(&[_]type{Pos}) == 2);
+}
+test "nonempty bits track create and destroy" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    const small = Ecs.archetypeId(&[_]type{Pos});
+    const big = Ecs.archetypeId(&[_]type{ Pos, Vel });
+
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(small));
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 0);
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).allPages().len == 2);
+
+    const a = try Ecs.create(allocator, &[_]type{Pos});
+    try std.testing.expect(Ecs.isArchetypeNonEmpty(small));
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(big));
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 1);
+
+    const b = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    try std.testing.expect(Ecs.isArchetypeNonEmpty(big));
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 2);
+    try std.testing.expect(handler.pages(&[_]type{Pos}, &[_]type{Vel}).nonEmptyPages().len == 1);
+
+    try a.destroy(allocator);
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(small));
+    try std.testing.expect(handler.pages(&[_]type{Pos}, &[_]type{Vel}).nonEmptyPages().len == 0);
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 1);
+
+    try b.destroy(allocator);
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(big));
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 0);
+    // allPages still lists every match, even when empty.
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).allPages().len == 2);
+}
+test "nonempty bits track migrate and destroy_page" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    const small = Ecs.archetypeId(&[_]type{Pos});
+    const big = Ecs.archetypeId(&[_]type{ Pos, Vel });
+
+    const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(small));
+    try std.testing.expect(Ecs.isArchetypeNonEmpty(big));
+
+    const moved = try created.migrate(allocator, &[_]type{Pos}, true);
+    try std.testing.expect(Ecs.isArchetypeNonEmpty(small));
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(big));
+    // Page-level view agrees with the bitset.
+    for (handler.pages(&[_]type{Pos}, null).allPages()) |p| {
+        try std.testing.expect(p.isEmpty() == !Ecs.isArchetypeNonEmpty(p.arch_id));
+    }
+
+    try moved.destroy(allocator);
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(small));
+
+    _ = try Ecs.create(allocator, &[_]type{Pos});
+    _ = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 2);
+
+    const S = struct {
+        fn wipe(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroyPage(&[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{S.wipe});
+    try App.run(allocator);
+    try std.testing.expect(!Ecs.isArchetypeNonEmpty(small));
+    try std.testing.expect(Ecs.isArchetypeNonEmpty(big));
+    try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 1);
 }
