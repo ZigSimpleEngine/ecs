@@ -362,7 +362,7 @@ pub fn ECS(comptime sets: anytype) type {
                         total += 1;
                     }
                 }
-                sortTypesByName(uniq[0..total]);
+                sortTypesByName(max_len, &uniq, total);
                 canon_types[i] = uniq;
                 canon_lens[i] = total;
             }
@@ -376,7 +376,8 @@ pub fn ECS(comptime sets: anytype) type {
                     .index = i,
                 };
             }
-            sortHashIndices(order[0..]);
+            var order_scratch: [input_count]HashIndex = undefined;
+            sortHashIndices(order[0..], order_scratch[0..]);
             var is_dup: [input_count]bool = [_]bool{false} ** input_count;
             var run: usize = 0;
             while (run < input_count) {
@@ -439,7 +440,7 @@ pub fn ECS(comptime sets: anytype) type {
                     }
                 }
             }
-            sortTypesByName(comp_types[0..comp_count]);
+            sortTypesByName(input_count * max_len, &comp_types, comp_count);
             var arch_comp: [input_count][max_len]u32 = undefined;
             for (0..uniq_count) |a| {
                 var prev: u32 = 0;
@@ -802,7 +803,7 @@ pub fn ECS(comptime sets: anytype) type {
                         total += 1;
                     }
                 }
-                sortTypesByName(uniq[0..total]);
+                sortTypesByName(flat_input.len, &uniq, total);
                 for (uniq[0..total]) |T| {
                     if (componentIndex(T) == null) {
                         @compileError("Component type was not declared in ECS(...).");
@@ -1111,6 +1112,9 @@ pub fn ECS(comptime sets: anytype) type {
         const RawColumn = struct {
             ptr: [*]u8,
             len: usize,
+            /// Byte size of one row element. Lets byte-level writers (command
+            /// flushing) copy columns without any type dispatch or unrolling.
+            elem_size: usize,
         };
         /// Builds the column getter for one archetype: resolves a runtime
         /// column index to the live column bytes. One tiny function per
@@ -1125,7 +1129,11 @@ pub fn ECS(comptime sets: anytype) type {
                     inline for (0..Tables.arch_lens[k]) |c| {
                         if (col == c) {
                             const items = Ecs.storages[k].lists[c].items;
-                            return .{ .ptr = @ptrCast(items.ptr), .len = items.len };
+                            return .{
+                                .ptr = @ptrCast(items.ptr),
+                                .len = items.len,
+                                .elem_size = @sizeOf(Tables.arch_types[k][c]),
+                            };
                         }
                     }
                     unreachable;
@@ -1419,37 +1427,49 @@ pub fn ECS(comptime sets: anytype) type {
             }
             return null;
         }
-        /// Sorts a type slice by `(name hash, name)`, in place. Hashes make
-        /// the quadratic insertion pass cheap integer compares; the name
-        /// tie-break keeps a total order so id mapping stays order-preserving
-        /// (ascending `arch_comp` rows, ascending `qids`). Replaces the old
-        /// per-site bubble sorts; `std.mem.sort` is not comptime-safe here.
-        /// - `types` - comptime type slice to sort. Evaluated in comptime.
-        fn sortTypesByName(comptime types: []type) void {
-            var i: usize = 1;
-            while (i < types.len) : (i += 1) {
-                const t: type = types[i];
-                const h: u64 = hashTypeName(t);
-                var j: usize = i;
-                while (j > 0 and typeKeyLess(types[j - 1], h, t)) {
-                    types[j] = types[j - 1];
-                    j -= 1;
+        /// Sorts a type buffer by `(name hash, name)`, in place. Hashes are
+        /// hoisted once (`O(n)`), the quadratic selection pass then touches
+        /// only integers; the name tie-break keeps a total order so id
+        /// mapping stays order-preserving (ascending `arch_comp` rows,
+        /// ascending `qids`). Replaces the old per-site bubble sorts;
+        /// `std.mem.sort` is not comptime-safe here.
+        /// - `N` - buffer capacity. Must be comptime-known.
+        /// - `buf` - buffer holding the types. Evaluated in comptime.
+        /// - `len` - number of valid entries at the start of `buf`.
+        fn sortTypesByName(comptime N: usize, comptime buf: *[N]type, len: usize) void {
+            var keys: [N]u64 = undefined;
+            for (0..len) |i| {
+                keys[i] = hashTypeName(buf[i]);
+            }
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
+                var m: usize = i;
+                var j: usize = i + 1;
+                while (j < len) : (j += 1) {
+                    if (keys[j] < keys[m] or
+                        (keys[j] == keys[m] and typeNameLess(buf[j], buf[m])))
+                    {
+                        m = j;
+                    }
                 }
-                types[j] = t;
+                if (m != i) {
+                    const tt: type = buf[i];
+                    buf[i] = buf[m];
+                    buf[m] = tt;
+                    const tk: u64 = keys[i];
+                    keys[i] = keys[m];
+                    keys[m] = tk;
+                }
             }
         }
-        /// Compares a placed element against an insertion key.
-        /// - `placed` - element already in the sorted prefix.
-        /// - `key_hash` - hash of the element being inserted.
-        /// - `key` - element being inserted.
+        /// Orders two types by fully qualified name (tie-break for equal
+        /// name hashes in `sortTypesByName`).
+        /// - `a` - left type.
+        /// - `b` - right type.
         ///
-        /// Returns `bool` - true when `placed` sorts after the key.
-        fn typeKeyLess(comptime placed: type, key_hash: u64, comptime key: type) bool {
-            const ph: u64 = hashTypeName(placed);
-            if (ph != key_hash) {
-                return ph > key_hash;
-            }
-            return std.mem.order(u8, @typeName(placed), @typeName(key)) == .gt;
+        /// Returns `bool` - true when `a` sorts before `b`.
+        fn typeNameLess(comptime a: type, comptime b: type) bool {
+            return std.mem.order(u8, @typeName(a), @typeName(b)) == .lt;
         }
         /// Hashes a type name for ordering. Collisions only cost a rare
         /// name tie-break; order stays total via `typeKeyLess`.
@@ -1492,19 +1512,44 @@ pub fn ECS(comptime sets: anytype) type {
         fn hashIndexLessThan(_: void, a: HashIndex, b: HashIndex) bool {
             return a.hash < b.hash;
         }
-        /// Sorts hash buckets by hash, in place. Plain insertion sort:
-        /// integer compares only, no aliasing hazards at comptime.
+        /// Sorts hash buckets by hash, in place. Bottom-up iterative
+        /// mergesort, `O(n log n)` integer compares only: the dedup index
+        /// sort must not go quadratic when archetypes number in thousands.
+        /// No aliasing hazards at comptime (plain data, no `type` values).
         /// - `order` - buckets to sort. Evaluated in comptime.
-        fn sortHashIndices(order: []HashIndex) void {
-            var i: usize = 1;
-            while (i < order.len) : (i += 1) {
-                const key: HashIndex = order[i];
-                var j: usize = i;
-                while (j > 0 and order[j - 1].hash > key.hash) {
-                    order[j] = order[j - 1];
-                    j -= 1;
+        /// - `scratch` - temporary buffer, at least `order.len` entries.
+        fn sortHashIndices(order: []HashIndex, scratch: []HashIndex) void {
+            var width: usize = 1;
+            while (width < order.len) : (width *= 2) {
+                var lo: usize = 0;
+                while (lo < order.len) : (lo += 2 * width) {
+                    const mid: usize = @min(lo + width, order.len);
+                    const hi: usize = @min(lo + 2 * width, order.len);
+                    var a: usize = lo;
+                    var b: usize = mid;
+                    var c: usize = lo;
+                    while (a < mid and b < hi) {
+                        if (order[b].hash < order[a].hash) {
+                            scratch[c] = order[b];
+                            b += 1;
+                        } else {
+                            scratch[c] = order[a];
+                            a += 1;
+                        }
+                        c += 1;
+                    }
+                    while (a < mid) : (a += 1) {
+                        scratch[c] = order[a];
+                        c += 1;
+                    }
+                    while (b < hi) : (b += 1) {
+                        scratch[c] = order[b];
+                        c += 1;
+                    }
+                    for (scratch[lo..hi], lo..) |v, idx| {
+                        order[idx] = v;
+                    }
                 }
-                order[j] = key;
             }
         }
         /// Binary-searches a `(hash, name)`-sorted component type list, the
@@ -2078,15 +2123,17 @@ pub fn ECS(comptime sets: anytype) type {
                         errdefer allocator.free(c.bytes);
                         const created = try Ecs.createById(allocator, c.arch);
                         const created_row: u32 = Ecs.entity_row.items[created.id];
-                        inline for (0..ARCH_COUNT) |k| {
-                            if (c.arch == k) {
-                                var off: usize = 0;
-                                inline for (0..Tables.arch_lens[k]) |col| {
-                                    const dst = std.mem.asBytes(&Ecs.storages[k].lists[col].items[created_row]);
-                                    @memcpy(dst, c.bytes[off..][0..dst.len]);
-                                    off += dst.len;
-                                }
-                            }
+                        // Byte-level column fill through the registry: one
+                        // plain runtime loop, no unrolling over archetypes.
+                        // Blob layout matches column order (see packValues).
+                        const ncols: usize = Ecs.archetypes[c.arch].component_ids.len;
+                        var off: usize = 0;
+                        var col: usize = 0;
+                        while (col < ncols) : (col += 1) {
+                            const raw = Ecs.column_getters[c.arch](col);
+                            const dst = (raw.ptr + created_row * raw.elem_size)[0..raw.elem_size];
+                            @memcpy(dst, c.bytes[off..][0..raw.elem_size]);
+                            off += raw.elem_size;
                         }
                         allocator.free(c.bytes);
                     },
