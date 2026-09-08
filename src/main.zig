@@ -25,14 +25,15 @@ const Empty4 = struct {};
 const Empty5 = struct {};
 
 const App = ECS.Schedule(.{ setup, print, print_all_vs_nonempty });
-
+var player1: ECS.EntityReference = undefined;
 fn setup(h: *ECS.SystemHandler) anyerror!void {
-    try h.cmdCreate(Player, .{
+    player1 = try h.cmdCreate(Player, .{
         Position{ .x = 10, .y = -3 },
         Scale{ .w = 1, .h = 1 },
         Health{ .value = 100 },
     });
-    try h.cmdCreate(.{ Player, Enemy }, .{
+    std.log.debug("Is player 1 alive: {}", .{player1.isAlive()});
+    _ = try h.cmdCreateChild(player1, .{ Player, Enemy }, .{
         Position{ .x = 55, .y = 2 },
         Scale{ .w = 2, .h = 2 },
         Health{ .value = 50 },
@@ -41,9 +42,14 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
 }
 
 fn print(h: *ECS.SystemHandler) anyerror!void {
-    for (h.pages(.{Position}, .{Enemy}).nonEmptyPages()) |p| {
+    std.debug.print("Is player 1 alive: {}\n", .{player1.isAlive()});
+    for (h.pages(.{Position}, null).nonEmptyPages()) |p| {
         for (p.get(Position)) |value| {
             std.debug.print("Pos: {any}\n", .{value});
+        }
+
+        for (p.entities()) |e| {
+            std.debug.print("Parent: {any}\n", .{e.parent()});
         }
     }
 }

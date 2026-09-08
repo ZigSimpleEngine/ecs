@@ -1,4 +1,4 @@
-﻿const std = @import("std");
+const std = @import("std");
 /// Builds a read-only view over a standard unmanaged array list.
 /// - `Element` - element type stored in the wrapped list.
 ///
@@ -83,21 +83,123 @@ pub fn ECS(comptime sets: anytype) type {
         pub const EcsError = std.mem.Allocator.Error || error{
             /// Operation requires a live entity but the reference is stale.
             EntityIsNotAlive,
-            /// Entity already has a queued destroy or migrate in this batch.
+            /// Entity already has a queued destroy or migrate or reparent in this batch.
             EntityHasPendingCommand,
             /// Requested position lies outside the storage range.
             IndexOutOfBounds,
             /// Requested component is not stored in this archetype.
             ComponentNotFoundInArchetype,
+            /// Reparenting would create a cycle in the hierarchy.
+            HierarchyCycle,
         };
-        /// Deferred lifecycle state of an entity slot: none, queued for
-        /// destroy, or queued for migrate. Densely packed, 2 bits per slot,
-        /// 4 slots per byte in `entity_state_words`, so one byte answers
-        /// four slots at once.
-        pub const EntityState = enum(u2) {
-            none = 0,
-            pending_destroy = 1,
-            pending_migrate = 2,
+        /// Sentinel slot id meaning "no entity": no parent, no children, no siblings.
+        /// Real entity ids are `u24`, so this never collides with a live slot.
+        const NO_ENTITY: u32 = std.math.maxInt(u32);
+        /// Contiguous run of rows inside one archetype storage that share the
+        /// same hierarchy depth. `depth_zones` lists are sorted ascending by
+        /// `depth` and their regions tile the row array without gaps, so a row
+        /// at position `p` belongs to the zone with the largest
+        /// `offset <= p`. Rows inside a zone have no meaningful order.
+        pub const DepthZone = struct {
+            /// Hierarchy depth shared by every row in the zone.
+            depth: u32,
+            /// First row index of the zone inside the storage row array.
+            offset: u32,
+            /// Number of rows in the zone.
+            len: u32,
+        };
+        /// Deferred lifecycle state of an entity slot: one boolean per kind
+        /// of pending command. Stored as a 1-byte packed struct per slot, so
+        /// adding a new kind only requires a new field - no repacking.
+        /// `pending_create` marks a slot reserved by a queued create command:
+        /// the entity is not alive yet but its id is already taken.
+        pub const EntityState = packed struct {
+            /// Queued destroy, applied at the next flush.
+            pending_destroy: bool = false,
+            /// Queued migrate, applied at the next flush.
+            pending_migrate: bool = false,
+            /// Queued reparent, applied at the next flush.
+            pending_reparent: bool = false,
+            /// Slot reserved by a queued create; the entity becomes alive
+            /// only when the command flushes.
+            pending_create: bool = false,
+            /// Checks whether no command is queued for the slot.
+            /// - `self` - state to inspect.
+            ///
+            /// Returns `bool` - true when every flag is clear.
+            pub fn isIdle(self: @This()) bool {
+                return !self.pending_destroy and
+                    !self.pending_migrate and
+                    !self.pending_reparent and
+                    !self.pending_create;
+            }
+        };
+        /// One reserved entity slot: the future handle plus whether the id
+        /// came from the free list (so discard can decide between pushing the
+        /// id back or popping the appended slot arrays).
+        const Reservation = struct {
+            ref: EntityReference,
+            from_free: bool,
+        };
+        /// Read-only iterator over the children of one entity. Produced by
+        /// `EntityReference.children`. Walks the sibling linked list; the
+        /// list itself is immutable from the outside.
+        pub const ChildrenIterator = struct {
+            current: u32,
+            /// Yields the next child, or null when the list is exhausted.
+            /// - `self` - iterator to advance.
+            ///
+            /// Returns `?EntityReference` - next child handle.
+            pub fn next(self: *ChildrenIterator) ?EntityReference {
+                if (self.current == NO_ENTITY) {
+                    return null;
+                }
+                const id = self.current;
+                self.current = Ecs.entity_next_sibling.items[id];
+                return EntityReference{
+                    .id = @intCast(id),
+                    .gen = Ecs.entity_generation.items[id],
+                };
+            }
+        };
+        /// Read-only iterator over the whole subtree below one entity, in
+        /// pre-order (children before grandchildren), excluding the root.
+        /// Produced by `EntityReference.descendants`. Zero allocation: the
+        /// walk descends via `first_child` and climbs via `parent` when a
+        /// branch ends, so no stack buffer is needed.
+        pub const DescendantsIterator = struct {
+            root: u32,
+            current: u32,
+            /// Yields the next descendant, or null when the subtree is done.
+            /// - `self` - iterator to advance.
+            ///
+            /// Returns `?EntityReference` - next descendant handle.
+            pub fn next(self: *DescendantsIterator) ?EntityReference {
+                if (self.current == NO_ENTITY) {
+                    return null;
+                }
+                const id = self.current;
+                if (Ecs.entity_first_child.items[id] != NO_ENTITY) {
+                    self.current = Ecs.entity_first_child.items[id];
+                } else {
+                    var cur: u32 = id;
+                    while (cur != NO_ENTITY and
+                        cur != self.root and
+                        Ecs.entity_next_sibling.items[cur] == NO_ENTITY)
+                    {
+                        cur = Ecs.entity_parent.items[cur];
+                    }
+                    if (cur == NO_ENTITY or cur == self.root) {
+                        self.current = NO_ENTITY;
+                    } else {
+                        self.current = Ecs.entity_next_sibling.items[cur];
+                    }
+                }
+                return EntityReference{
+                    .id = @intCast(id),
+                    .gen = Ecs.entity_generation.items[id],
+                };
+            }
         };
         /// Lightweight entity handle. Stays small enough to copy by value.
         /// The id is the slot index into the SoA columns below, so no
@@ -117,25 +219,31 @@ pub fn ECS(comptime sets: anytype) type {
                 return entity_index < Ecs.entity_generation.items.len;
             }
             /// Checks whether the reference still points at a live entity.
+            /// A slot reserved by a queued create (`pending_create`) is not
+            /// alive yet even though its id and generation are already taken.
             /// - `self` - reference to inspect.
             ///
-            /// Returns `bool` - true when the slot exists and generations match.
+            /// Returns `bool` - true when the slot exists, generations match
+            /// and no create command is still pending for it.
             pub fn isAlive(self: *const EntityReference) bool {
                 if (!self.exists()) {
                     return false;
                 }
                 const entity_index: u32 = self.id;
-                return Ecs.entity_generation.items[entity_index] == self.gen;
+                if (Ecs.entity_generation.items[entity_index] != self.gen) {
+                    return false;
+                }
+                return !Ecs.getEntityState(entity_index).pending_create;
             }
             /// Returns the pending lifecycle state of the referenced slot.
             /// - `self` - reference to inspect.
             ///
-            /// Returns `EntityState` - queued state, or `none` when the id
-            /// was never assigned (treated as idle, not pending).
+            /// Returns `EntityState` - queued state, or idle when the id was
+            /// never assigned.
             pub fn state(self: *const EntityReference) EntityState {
                 const entity_index: u32 = self.id;
                 if (entity_index >= Ecs.entityStateLen()) {
-                    return .none;
+                    return .{};
                 }
                 return Ecs.getEntityState(entity_index);
             }
@@ -168,9 +276,155 @@ pub fn ECS(comptime sets: anytype) type {
                 const entity_index: u32 = self.id;
                 return Ecs.entity_row.items[entity_index];
             }
-            /// Destroys the referenced entity and recycles its slot.
-            /// Immediate variant used by command flushing. Clears any pending
-            /// state left by the queueing command.
+            /// Returns the parent of the entity, or null when it is detached
+            /// (a root). Read-only: parents change only through deferred
+            /// commands.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `?EntityReference` - live parent handle, or null.
+            pub fn parent(self: *const EntityReference) ?EntityReference {
+                if (!self.isAlive()) {
+                    return null;
+                }
+                const pid = Ecs.entity_parent.items[self.id];
+                if (pid == NO_ENTITY) {
+                    return null;
+                }
+                return EntityReference{
+                    .id = @intCast(pid),
+                    .gen = Ecs.entity_generation.items[pid],
+                };
+            }
+            /// Returns the hierarchy depth of the entity. Detached entities
+            /// have depth zero; a child always has `depthOf == depthOf(parent) + 1`.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `u32` - depth of the entity.
+            pub fn depthOf(self: *const EntityReference) EcsError!u32 {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                return Ecs.entity_depth.items[self.id];
+            }
+            /// Returns the first child of the entity, or null when it has none.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `?EntityReference` - live child handle, or null.
+            pub fn firstChild(self: *const EntityReference) ?EntityReference {
+                if (!self.isAlive()) {
+                    return null;
+                }
+                const cid = Ecs.entity_first_child.items[self.id];
+                if (cid == NO_ENTITY) {
+                    return null;
+                }
+                return EntityReference{
+                    .id = @intCast(cid),
+                    .gen = Ecs.entity_generation.items[cid],
+                };
+            }
+            /// Returns the next sibling of the entity, or null when it is the
+            /// last child of its parent.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `?EntityReference` - live sibling handle, or null.
+            pub fn nextSibling(self: *const EntityReference) ?EntityReference {
+                if (!self.isAlive()) {
+                    return null;
+                }
+                const sid = Ecs.entity_next_sibling.items[self.id];
+                if (sid == NO_ENTITY) {
+                    return null;
+                }
+                return EntityReference{
+                    .id = @intCast(sid),
+                    .gen = Ecs.entity_generation.items[sid],
+                };
+            }
+            /// Returns the previous sibling of the entity, or null when it is
+            /// the first child of its parent.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `?EntityReference` - live sibling handle, or null.
+            pub fn prevSibling(self: *const EntityReference) ?EntityReference {
+                if (!self.isAlive()) {
+                    return null;
+                }
+                const sid = Ecs.entity_prev_sibling.items[self.id];
+                if (sid == NO_ENTITY) {
+                    return null;
+                }
+                return EntityReference{
+                    .id = @intCast(sid),
+                    .gen = Ecs.entity_generation.items[sid],
+                };
+            }
+            /// Counts the direct children of the entity.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `u32` - number of children.
+            pub fn childCount(self: *const EntityReference) EcsError!u32 {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                var total: u32 = 0;
+                var child = Ecs.entity_first_child.items[self.id];
+                while (child != NO_ENTITY) : (child = Ecs.entity_next_sibling.items[child]) {
+                    total += 1;
+                }
+                return total;
+            }
+            /// Checks whether the entity lies somewhere below the given
+            /// ancestor. The check is strict: a node is not its own ancestor.
+            /// - `self` - reference to inspect. Must be alive.
+            /// - `ancestor` - candidate ancestor. Must be alive.
+            ///
+            /// Returns `bool` - true when `ancestor` is an ancestor of `self`.
+            pub fn isDescendantOf(self: *const EntityReference, ancestor: EntityReference) bool {
+                if (!self.isAlive() or !ancestor.isAlive()) {
+                    return false;
+                }
+                var cur = Ecs.entity_parent.items[self.id];
+                while (cur != NO_ENTITY) {
+                    if (cur == ancestor.id) {
+                        return true;
+                    }
+                    cur = Ecs.entity_parent.items[cur];
+                }
+                return false;
+            }
+            /// Returns a read-only iterator over the direct children of the
+            /// entity. The iterator observes live hierarchy data; children
+            /// can only be added or removed through deferred commands.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `ChildrenIterator` - zero-cost walk over the sibling list.
+            pub fn children(self: *const EntityReference) ChildrenIterator {
+                if (!self.isAlive()) {
+                    return ChildrenIterator{ .current = NO_ENTITY };
+                }
+                return ChildrenIterator{ .current = Ecs.entity_first_child.items[self.id] };
+            }
+            /// Returns a read-only iterator over the subtree below the entity
+            /// (pre-order, excluding the entity itself). Zero allocation.
+            /// - `self` - reference to inspect. Must be alive.
+            ///
+            /// Returns `DescendantsIterator` - walk over the subtree.
+            pub fn descendants(self: *const EntityReference) DescendantsIterator {
+                if (!self.isAlive()) {
+                    return DescendantsIterator{ .root = NO_ENTITY, .current = NO_ENTITY };
+                }
+                return DescendantsIterator{
+                    .root = self.id,
+                    .current = Ecs.entity_first_child.items[self.id],
+                };
+            }
+            /// Destroys the referenced entity and its whole subtree, then
+            /// recycles every slot. Immediate variant used by command
+            /// flushing; clears any pending state left by queueing commands.
+            /// Children are destroyed before their parent (via a collected
+            /// pre-order list walked in reverse), so sibling links remain
+            /// valid during the walk. Iterative: no recursion on deep trees.
             /// - `self` - reference to destroy. Must be alive.
             /// - `allocator` - funds the free-slot bookkeeping.
             fn destroy(self: *const EntityReference, allocator: std.mem.Allocator) EcsError!void {
@@ -178,28 +432,99 @@ pub fn ECS(comptime sets: anytype) type {
                 if (!self.isAlive()) {
                     return EcsError.EntityIsNotAlive;
                 }
+                var order: std.ArrayListUnmanaged(u32) = .empty;
+                defer order.deinit(allocator);
+                try order.append(allocator, self.id);
+                var idx: usize = 0;
+                while (idx < order.items.len) : (idx += 1) {
+                    var child = Ecs.entity_first_child.items[order.items[idx]];
+                    while (child != NO_ENTITY) : (child = Ecs.entity_next_sibling.items[child]) {
+                        try order.append(allocator, child);
+                    }
+                }
+                std.mem.reverse(u32, order.items);
+                for (order.items) |id| {
+                    try Ecs.destroyNode(id, allocator);
+                }
+            }
+            /// Moves the entity under a new parent, or detaches it when
+            /// `new_parent_id` is `NO_ENTITY`. Recomputes the depth of the
+            /// whole subtree and relocates rows to their new depth zone
+            /// inside the owning archetype. Immediate variant used by command
+            /// flushing; the queued command carries the pending-parent id.
+            /// Private: structural changes run only via commands flushed by
+            /// the scheduler.
+            /// - `self` - reference to move. Must be alive.
+            /// - `allocator` - funds the subtree walk.
+            /// - `new_parent_id` - new parent slot id, or `NO_ENTITY` to detach.
+            fn reparentById(
+                self: *const EntityReference,
+                allocator: std.mem.Allocator,
+                new_parent_id: u32,
+            ) EcsError!void {
+                @setEvalBranchQuota(10_000_000);
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
                 const entity_index: u32 = self.id;
-                const arch: u32 = Ecs.entity_archetype.items[entity_index];
-                const index: u32 = Ecs.entity_row.items[entity_index];
-                const displaced: ?EntityReference = blk: {
+                if (new_parent_id != NO_ENTITY) {
+                    if (new_parent_id == entity_index) {
+                        return EcsError.HierarchyCycle;
+                    }
+                    // Safety net: command-time validation already rejected
+                    // batch cycles, but a flush-time walk is cheap and keeps
+                    // the invariant even if validation changes later.
+                    var cur = new_parent_id;
+                    while (cur != NO_ENTITY) {
+                        if (cur == entity_index) {
+                            return EcsError.HierarchyCycle;
+                        }
+                        cur = Ecs.entity_parent.items[cur];
+                    }
+                }
+                const old_depth: u32 = Ecs.entity_depth.items[entity_index];
+                const new_depth: u32 = if (new_parent_id == NO_ENTITY)
+                    0
+                else
+                    Ecs.entity_depth.items[new_parent_id] + 1;
+                const delta: i64 = @as(i64, new_depth) - @as(i64, old_depth);
+                Ecs.unlinkFromParent(entity_index);
+                if (new_parent_id != NO_ENTITY) {
+                    Ecs.linkChild(entity_index, new_parent_id);
+                }
+                if (delta == 0) {
+                    return;
+                }
+                // Depth changed: update every subtree member and move its row
+                // into the zone matching its new depth. Hierarchy links are
+                // untouched by row moves, so a single pre-order pass suffices.
+                var order: std.ArrayListUnmanaged(u32) = .empty;
+                defer order.deinit(allocator);
+                try order.append(allocator, entity_index);
+                var idx: usize = 0;
+                while (idx < order.items.len) : (idx += 1) {
+                    var child = Ecs.entity_first_child.items[order.items[idx]];
+                    while (child != NO_ENTITY) : (child = Ecs.entity_next_sibling.items[child]) {
+                        try order.append(allocator, child);
+                    }
+                }
+                for (order.items) |id| {
+                    const next_depth: u32 = @intCast(@as(i64, Ecs.entity_depth.items[id]) + delta);
+                    Ecs.entity_depth.items[id] = next_depth;
+                    const arch: u32 = Ecs.entity_archetype.items[id];
+                    const row: u32 = Ecs.entity_row.items[id];
+                    const ref = EntityReference{
+                        .id = @intCast(id),
+                        .gen = Ecs.entity_generation.items[id],
+                    };
                     inline for (0..ARCH_COUNT) |k| {
                         if (arch == k) {
-                            const moved = Ecs.storages[k].remove(index);
-                            if (Ecs.storages[k].count() == 0) {
-                                Ecs.clearArchetypeNonEmpty(arch);
-                            }
-                            break :blk moved;
+                            Ecs.storages[k].removeRow(row);
+                            _ = try Ecs.storages[k].insertRowAtDepth(allocator, &ref, next_depth);
+                            break;
                         }
                     }
-                    unreachable;
-                };
-                if (displaced) |relocated| {
-                    const relocated_index: u32 = relocated.id;
-                    Ecs.entity_row.items[relocated_index] = index;
                 }
-                Ecs.entity_generation.items[entity_index] +%= 1;
-                Ecs.setEntityState(entity_index, .none);
-                try Ecs.free_ids.append(allocator, entity_index);
             }
             /// Moves the entity into another archetype, optionally copying shared data.
             /// - `self` - reference to move. Must be alive.
@@ -243,10 +568,13 @@ pub fn ECS(comptime sets: anytype) type {
                     .id = self.id,
                     .gen = self.gen +% 1,
                 };
+                // Hierarchy survives a migrate: the row keeps its depth and
+                // lands in the matching zone of the destination archetype.
+                const depth: u32 = Ecs.entity_depth.items[entity_index];
                 const dest_index: u32 = blk: {
                     inline for (0..ARCH_COUNT) |k| {
                         if (dest_id == k) {
-                            const idx = try Ecs.storages[k].add(allocator, &next);
+                            const idx = try Ecs.storages[k].insertRowAtDepth(allocator, &next, depth);
                             if (Ecs.storages[k].count() == 1) {
                                 Ecs.setArchetypeNonEmpty(dest_id);
                             }
@@ -263,26 +591,19 @@ pub fn ECS(comptime sets: anytype) type {
                         dest_index,
                     );
                 }
-                const displaced: ?EntityReference = blk: {
-                    inline for (0..ARCH_COUNT) |k| {
-                        if (source_id == k) {
-                            const moved = Ecs.storages[k].remove(source_index);
-                            if (Ecs.storages[k].count() == 0) {
-                                Ecs.clearArchetypeNonEmpty(source_id);
-                            }
-                            break :blk moved;
+                inline for (0..ARCH_COUNT) |k| {
+                    if (source_id == k) {
+                        Ecs.storages[k].removeRow(source_index);
+                        if (Ecs.storages[k].count() == 0) {
+                            Ecs.clearArchetypeNonEmpty(source_id);
                         }
+                        break;
                     }
-                    unreachable;
-                };
-                if (displaced) |relocated| {
-                    const relocated_index: u32 = relocated.id;
-                    Ecs.entity_row.items[relocated_index] = source_index;
                 }
                 Ecs.entity_generation.items[entity_index] = next.gen;
                 Ecs.entity_archetype.items[entity_index] = dest_id;
                 Ecs.entity_row.items[entity_index] = dest_index;
-                Ecs.setEntityState(entity_index, .none);
+                Ecs.setEntityState(entity_index, .{});
                 return next;
             }
         };
@@ -915,6 +1236,11 @@ pub fn ECS(comptime sets: anytype) type {
                 lists: Lists,
                 /// One row per stored entity, parallel to the component columns.
                 refs: std.ArrayListUnmanaged(EntityReference) = .empty,
+                /// Contiguous depth zones tiling the row array. Maintained by
+                /// every structural operation, so rows are always grouped by
+                /// hierarchy depth: `depth_zones[i]` covers rows
+                /// `[offset, offset + len)`.
+                depth_zones: std.ArrayListUnmanaged(DepthZone) = .empty,
                 /// Builds empty storage. Usable in comptime initializers.
                 ///
                 /// Returns `Self` - storage with every list empty.
@@ -926,6 +1252,7 @@ pub fn ECS(comptime sets: anytype) type {
                     return Self{
                         .lists = lists,
                         .refs = .empty,
+                        .depth_zones = .empty,
                     };
                 }
                 /// Locates the column index storing the given component type.
@@ -1010,7 +1337,48 @@ pub fn ECS(comptime sets: anytype) type {
                 pub fn entityList(self: *const Self) []const EntityReference {
                     return self.refs.items;
                 }
-                /// Appends an empty row across all columns plus the reference.
+                /// Locates the zone whose region contains the given row index.
+                /// Zones are contiguous, so this is the last zone with
+                /// `offset <= index`.
+                /// - `self` - storage to inspect.
+                /// - `pos` - row position.
+                ///
+                /// Returns `usize` - index into `depth_zones`.
+                fn zoneIndexByOffset(self: *const Self, pos: u32) usize {
+                    var lo: usize = 0;
+                    var hi: usize = self.depth_zones.items.len;
+                    while (lo < hi) {
+                        const mid = (lo + hi) / 2;
+                        if (self.depth_zones.items[mid].offset <= pos) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    return lo - 1;
+                }
+                /// Finds the sorted insertion point of a depth in `depth_zones`.
+                /// - `self` - storage to inspect.
+                /// - `depth` - hierarchy depth.
+                ///
+                /// Returns `usize` - first zone with `depth >= depth`.
+                fn zoneInsertionIndex(self: *const Self, depth: u32) usize {
+                    var lo: usize = 0;
+                    var hi: usize = self.depth_zones.items.len;
+                    while (lo < hi) {
+                        const mid = (lo + hi) / 2;
+                        if (self.depth_zones.items[mid].depth < depth) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    return lo;
+                }
+                /// Appends an empty raw row (columns plus reference) without
+                /// touching depth zones. Used by bulk creation, which re-sorts
+                /// the zones afterwards in one consolidation pass, and by
+                /// low-level tests.
                 /// - `self` - storage to mutate.
                 /// - `allocator` - funds row allocation.
                 /// - `reference` - handle stored alongside the components.
@@ -1027,27 +1395,260 @@ pub fn ECS(comptime sets: anytype) type {
                     try self.refs.append(allocator, reference.*);
                     return @intCast(self.refs.items.len - 1);
                 }
-                /// Removes a row across all columns via swap with the last row.
+                /// Appends a row and places it into the zone matching
+                /// `depth`, keeping every zone contiguous and ordered.
+                /// The row lands at the end of its zone; deeper zones then
+                /// shift by one slot, which costs exactly one moved row per
+                /// deeper zone (order inside a zone is irrelevant, so the
+                /// rotation moves only boundary elements). Updates
+                /// `entity_row` for every relocated row.
+                /// - `self` - storage to mutate.
+                /// - `allocator` - funds row and zone-list allocation.
+                /// - `reference` - handle stored alongside the components.
+                /// - `depth` - hierarchy depth of the row.
+                ///
+                /// Returns `u32` - final position of the inserted row.
+                fn insertRowAtDepth(
+                    self: *Self,
+                    allocator: std.mem.Allocator,
+                    reference: *const EntityReference,
+                    depth: u32,
+                ) EcsError!u32 {
+                    inline for (0..ArchTypes.len) |i| {
+                        try self.lists[i].append(allocator, undefined);
+                    }
+                    try self.refs.append(allocator, reference.*);
+                    const n: u32 = @intCast(self.refs.items.len - 1);
+                    const idx = self.zoneInsertionIndex(depth);
+                    const has_zone = idx < self.depth_zones.items.len and
+                        self.depth_zones.items[idx].depth == depth;
+                    const target: u32 = if (has_zone)
+                        self.depth_zones.items[idx].offset + self.depth_zones.items[idx].len
+                    else if (idx == 0)
+                        0
+                    else
+                        self.depth_zones.items[idx - 1].offset + self.depth_zones.items[idx - 1].len;
+                    const m: usize = if (has_zone)
+                        self.depth_zones.items.len - 1 - idx
+                    else
+                        self.depth_zones.items.len - idx;
+                    if (m > 0) {
+                        // Rotation: the new row travels from the end up to the
+                        // tail of its zone; one boundary element per deeper
+                        // zone rotates down in exchange. Chain positions are
+                        // p0 = n and p_i = start offset of zone idx+i-1.
+                        const start = if (has_zone) idx + 1 else idx;
+                        inline for (0..ArchTypes.len) |i| {
+                            const col = self.lists[i].items;
+                            const tmp = col[n];
+                            col[n] = col[self.depth_zones.items[start + m - 1].offset];
+                            var k: usize = m;
+                            while (k > 1) : (k -= 1) {
+                                col[self.depth_zones.items[start + k - 1].offset] =
+                                    col[self.depth_zones.items[start + k - 2].offset];
+                            }
+                            col[self.depth_zones.items[start].offset] = tmp;
+                        }
+                        {
+                            const refs = self.refs.items;
+                            const tmp = refs[n];
+                            refs[n] = refs[self.depth_zones.items[start + m - 1].offset];
+                            var k: usize = m;
+                            while (k > 1) : (k -= 1) {
+                                refs[self.depth_zones.items[start + k - 1].offset] =
+                                    refs[self.depth_zones.items[start + k - 2].offset];
+                            }
+                            refs[self.depth_zones.items[start].offset] = tmp;
+                        }
+                        for (0..m + 1) |i| {
+                            const pos: u32 = if (i == 0)
+                                n
+                            else
+                                self.depth_zones.items[start + i - 1].offset;
+                            Ecs.entity_row.items[self.refs.items[pos].id] = pos;
+                        }
+                    } else {
+                        Ecs.entity_row.items[reference.id] = n;
+                    }
+                    if (has_zone) {
+                        self.depth_zones.items[idx].len += 1;
+                        for (idx + 1..self.depth_zones.items.len) |z| {
+                            self.depth_zones.items[z].offset += 1;
+                        }
+                    } else {
+                        try self.depth_zones.insert(allocator, idx, .{
+                            .depth = depth,
+                            .offset = target,
+                            .len = 1,
+                        });
+                        for (idx + 1..self.depth_zones.items.len) |z| {
+                            self.depth_zones.items[z].offset += 1;
+                        }
+                    }
+                    return target;
+                }
+                /// Removes a row from its depth zone. The last row of the
+                /// zone swaps into the removed slot (order inside the zone is
+                /// irrelevant), then deeper zones shift down by one slot,
+                /// costing exactly one moved row per deeper zone. Updates
+                /// `entity_row` for every relocated row.
                 /// - `self` - storage to mutate.
                 /// - `index` - row position to remove.
-                ///
-                /// Returns `?EntityReference` - relocated reference, or null when the last row was removed.
-                fn remove(self: *Self, index: u32) ?EntityReference {
-                    const previous_count: usize = self.refs.items.len;
-                    if (index >= previous_count) {
-                        return null;
+                fn removeRow(self: *Self, index: u32) void {
+                    const zi = self.zoneIndexByOffset(index);
+                    const zone = self.depth_zones.items[zi];
+                    const e_d: u32 = zone.offset + zone.len - 1;
+                    const m: usize = self.depth_zones.items.len - 1 - zi;
+                    inline for (0..ArchTypes.len) |i| {
+                        self.lists[i].items[index] = self.lists[i].items[e_d];
+                    }
+                    self.refs.items[index] = self.refs.items[e_d];
+                    Ecs.entity_row.items[self.refs.items[index].id] = index;
+                    if (m > 0) {
+                        var i: usize = 1;
+                        while (i <= m) : (i += 1) {
+                            const dst: u32 = if (i == 1)
+                                e_d
+                            else
+                                self.depth_zones.items[zi + i - 1].offset +
+                                    self.depth_zones.items[zi + i - 1].len - 1;
+                            const src: u32 = self.depth_zones.items[zi + i].offset +
+                                self.depth_zones.items[zi + i].len - 1;
+                            inline for (0..ArchTypes.len) |c| {
+                                self.lists[c].items[dst] = self.lists[c].items[src];
+                            }
+                            self.refs.items[dst] = self.refs.items[src];
+                        }
+                        var j: usize = 0;
+                        while (j < m) : (j += 1) {
+                            const pos: u32 = if (j == 0)
+                                e_d
+                            else
+                                self.depth_zones.items[zi + j].offset +
+                                    self.depth_zones.items[zi + j].len - 1;
+                            Ecs.entity_row.items[self.refs.items[pos].id] = pos;
+                        }
                     }
                     inline for (0..ArchTypes.len) |i| {
-                        _ = self.lists[i].swapRemove(index);
+                        _ = self.lists[i].pop();
                     }
-                    _ = self.refs.swapRemove(index);
-                    const last: usize = previous_count - 1;
-                    if (index == last) {
-                        return null;
+                    _ = self.refs.pop();
+                    self.depth_zones.items[zi].len -= 1;
+                    for (zi + 1..self.depth_zones.items.len) |z| {
+                        self.depth_zones.items[z].offset -= 1;
                     }
-                    return self.refs.items[index];
+                    if (self.depth_zones.items[zi].len == 0) {
+                        std.mem.copyForwards(
+                            DepthZone,
+                            self.depth_zones.items[zi..],
+                            self.depth_zones.items[zi + 1 ..],
+                        );
+                        _ = self.depth_zones.pop();
+                    }
                 }
-                /// Releases every column list and the reference list.
+                /// Re-sorts every row by hierarchy depth and rebuilds the
+                /// depth zones in one pass. Used by bulk creation, where
+                /// appending many rows through `insertRowAtDepth` would pay
+                /// the per-row cascade; a single stable sort is cheaper.
+                /// Updates `entity_row` for every row.
+                /// - `self` - storage to mutate.
+                /// - `allocator` - funds scratch and zone-list allocation.
+                /// - `perm_scratch` - reusable scratch for row indices.
+                /// - `visited_scratch` - reusable scratch for cycle marks.
+                fn consolidateZones(
+                    self: *Self,
+                    allocator: std.mem.Allocator,
+                    perm_scratch: *std.ArrayListUnmanaged(u32),
+                    visited_scratch: *std.ArrayListUnmanaged(u8),
+                ) EcsError!void {
+                    const n = self.refs.items.len;
+                    if (n == 0) {
+                        self.depth_zones.clearRetainingCapacity();
+                        return;
+                    }
+                    try perm_scratch.resize(allocator, n);
+                    for (0..n) |i| {
+                        perm_scratch.items[i] = @intCast(i);
+                    }
+                    const Ctx = struct {
+                        depths: []const u32,
+                        refs: []const EntityReference,
+                        fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                            const da = ctx.depths[ctx.refs[a].id];
+                            const db = ctx.depths[ctx.refs[b].id];
+                            return da < db or (da == db and a < b);
+                        }
+                    };
+                    std.mem.sort(u32, perm_scratch.items, Ctx{
+                        .depths = Ecs.entity_depth.items,
+                        .refs = self.refs.items,
+                    }, Ctx.lessThan);
+                    try visited_scratch.resize(allocator, n);
+                    @memset(visited_scratch.items[0..n], 0);
+                    const perm = perm_scratch.items;
+                    const visited = visited_scratch.items;
+                    for (0..n) |start| {
+                        if (visited[start] != 0) {
+                            continue;
+                        }
+                        inline for (0..ArchTypes.len) |c| {
+                            const col = self.lists[c].items;
+                            const tmp = col[start];
+                            var j: usize = start;
+                            while (true) {
+                                const next: usize = perm[j];
+                                if (next == start) {
+                                    col[j] = tmp;
+                                    break;
+                                }
+                                col[j] = col[next];
+                                j = next;
+                            }
+                        }
+                        {
+                            const refs = self.refs.items;
+                            const tmp = refs[start];
+                            var j: usize = start;
+                            while (true) {
+                                const next: usize = perm[j];
+                                if (next == start) {
+                                    refs[j] = tmp;
+                                    break;
+                                }
+                                refs[j] = refs[next];
+                                j = next;
+                            }
+                        }
+                        var mark: usize = start;
+                        while (true) {
+                            visited[mark] = 1;
+                            mark = perm[mark];
+                            if (mark == start) {
+                                break;
+                            }
+                        }
+                    }
+                    self.depth_zones.clearRetainingCapacity();
+                    var i: usize = 0;
+                    while (i < n) {
+                        const depth = Ecs.entity_depth.items[self.refs.items[i].id];
+                        var j: usize = i + 1;
+                        while (j < n and Ecs.entity_depth.items[self.refs.items[j].id] == depth) : (j += 1) {}
+                        try self.depth_zones.append(allocator, .{
+                            .depth = depth,
+                            .offset = @intCast(i),
+                            .len = @intCast(j - i),
+                        });
+                        // Rewrite entity_row for every row of the run, not
+                        // just its first element.
+                        for (i..j) |pos| {
+                            Ecs.entity_row.items[self.refs.items[pos].id] = @intCast(pos);
+                        }
+                        i = j;
+                    }
+                }
+                /// Releases every column list, the reference list and the
+                /// depth zones.
                 /// - `self` - storage to release.
                 /// - `allocator` - allocator that funded the lists.
                 fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -1055,6 +1656,7 @@ pub fn ECS(comptime sets: anytype) type {
                         self.lists[i].deinit(allocator);
                     }
                     self.refs.deinit(allocator);
+                    self.depth_zones.deinit(allocator);
                 }
             };
         }
@@ -1152,6 +1754,18 @@ pub fn ECS(comptime sets: anytype) type {
                 }
             }.f;
         }
+        /// Builds the depth-zone getter for one archetype. Zones share one
+        /// uniform type, so the getter is cast-free.
+        /// - `k` - archetype id. Must be comptime-known.
+        ///
+        /// Returns `*const fn` - getter bound to the archetype storage.
+        fn makeZonesGetter(comptime k: usize) *const fn () []const DepthZone {
+            return struct {
+                fn f() []const DepthZone {
+                    return Ecs.storages[k].depth_zones.items;
+                }
+            }.f;
+        }
         /// Direct storage access by runtime archetype id: plain O(1) indexing
         /// into a homogeneous fn-pointer array, no `inline for` chain over
         /// all archetypes. The array is `const` (storage addresses and
@@ -1175,83 +1789,357 @@ pub fn ECS(comptime sets: anytype) type {
             }
             break :blk out;
         };
+        /// Direct depth-zone access by runtime archetype id. Backs the
+        /// `Page` zone API with one indirect call, mirroring `refs_getters`.
+        const zones_getters: [ARCH_COUNT]*const fn () []const DepthZone = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [ARCH_COUNT]*const fn () []const DepthZone = undefined;
+            for (0..ARCH_COUNT) |k| {
+                out[k] = makeZonesGetter(k);
+            }
+            break :blk out;
+        };
         /// Entity slots in SoA form. Position `id` in every column describes
         /// one slot: `entity_generation[id]` is the live generation,
         /// `entity_archetype[id]` owns the row, `entity_row[id]` is the row.
-        /// Pending lifecycle states live densely packed in
-        /// `entity_state_words`, 2 bits per slot, 4 slots per byte.
+        /// Pending lifecycle states live one packed byte per slot in
+        /// `entity_states` (a `packed struct` of flags, so adding a new kind
+        /// of pending command never requires repacking).
         /// A slot id always equals its position; ids are never stored.
         var entity_generation: std.ArrayListUnmanaged(u8) = .empty;
         /// Owning archetype per slot, parallel to `entity_generation`.
         var entity_archetype: std.ArrayListUnmanaged(u32) = .empty;
         /// Row inside the owning archetype storage, parallel to `entity_generation`.
         var entity_row: std.ArrayListUnmanaged(u32) = .empty;
-        /// Packed pending states, 4 slots per byte, 2 bits per slot.
-        /// Length is `ceil(entityStateLen() / 4)`; slot `id` uses bits
-        /// `2 * (id % 4)` of `words[id / 4]`.
-        var entity_state_words: std.ArrayListUnmanaged(u8) = .empty;
+        /// Pending state per slot, one packed byte each.
+        var entity_states: std.ArrayListUnmanaged(EntityState) = .empty;
+        /// Parent slot per entity, `NO_ENTITY` for roots. Parallel to
+        /// `entity_generation`. Owned by the hierarchy core; users only read
+        /// through `EntityReference` methods.
+        var entity_parent: std.ArrayListUnmanaged(u32) = .empty;
+        /// First child slot per entity, `NO_ENTITY` when childless.
+        var entity_first_child: std.ArrayListUnmanaged(u32) = .empty;
+        /// Next sibling slot per entity, `NO_ENTITY` for the last child.
+        var entity_next_sibling: std.ArrayListUnmanaged(u32) = .empty;
+        /// Previous sibling slot per entity, `NO_ENTITY` for the first child.
+        var entity_prev_sibling: std.ArrayListUnmanaged(u32) = .empty;
+        /// Hierarchy depth per entity: 0 for detached entities, always
+        /// `depth[parent] + 1` for children. Drives the depth zones.
+        var entity_depth: std.ArrayListUnmanaged(u32) = .empty;
+        /// Parent queued by a not-yet-flushed reparent command, or
+        /// `NO_ENTITY` when the slot has no queued reparent. Also acts as the
+        /// "reparent pending" marker: any queued command on the slot is
+        /// rejected while it is set.
+        var entity_pending_parent: std.ArrayListUnmanaged(u32) = .empty;
+        /// Reusable scratch for depth-zone consolidation (row permutation).
+        var zone_scratch_perm: std.ArrayListUnmanaged(u32) = .empty;
+        /// Reusable scratch for depth-zone consolidation (visited marks).
+        var zone_scratch_visited: std.ArrayListUnmanaged(u8) = .empty;
         /// Stack of freed entity ids ready for reuse.
         var free_ids: std.ArrayListUnmanaged(u32) = .empty;
-        /// Counts entity slots. Backs the packed state store length.
+        /// Counts entity slots.
         /// - Returns `usize` - number of slots ever assigned.
         fn entityStateLen() usize {
             return Ecs.entity_generation.items.len;
         }
-        /// Reads one packed 2-bit state. Caller must ensure `id` is in range.
+        /// Reads the pending state of one slot. Caller must ensure `id` is in
+        /// range.
         /// - `entity_index` - slot id to read.
         ///
         /// Returns `EntityState` - stored state of the slot.
         fn getEntityState(entity_index: u32) EntityState {
-            const word: u8 = Ecs.entity_state_words.items[entity_index >> 2];
-            const shift: u3 = @intCast((entity_index & 3) * 2);
-            const bits: u2 = @intCast((word >> shift) & 0b11);
-            return @enumFromInt(bits);
+            return Ecs.entity_states.items[entity_index];
         }
-        /// Writes one packed 2-bit state. Caller must ensure `id` is in range
-        /// and words already cover it (see `ensureStateWords`).
+        /// Writes the pending state of one slot. Caller must ensure `id` is in
+        /// range and `entity_states` already covers it.
         /// - `entity_index` - slot id to write.
         /// - `next` - pending state to store.
         fn setEntityState(entity_index: u32, next: EntityState) void {
-            const slot: *u8 = &Ecs.entity_state_words.items[entity_index >> 2];
-            const shift: u3 = @intCast((entity_index & 3) * 2);
-            const mask: u8 = @as(u8, 0b11) << shift;
-            slot.* = (slot.* & ~mask) | (@as(u8, @intFromEnum(next)) << shift);
+            Ecs.entity_states.items[entity_index] = next;
         }
-        /// Grows the packed words with zero (`none`) bytes to cover `slot_count` slots.
+        /// Grows the state store with idle (`{}`) entries to cover
+        /// `slot_count` slots.
         /// - `allocator` - funds the growth.
         /// - `slot_count` - number of slots that must be addressable afterwards.
-        fn ensureStateWords(allocator: std.mem.Allocator, slot_count: usize) EcsError!void {
-            const need: usize = (slot_count + 3) >> 2;
-            const have: usize = Ecs.entity_state_words.items.len;
-            if (need > have) {
-                try Ecs.entity_state_words.appendNTimes(allocator, 0, need - have);
+        fn ensureEntityStates(allocator: std.mem.Allocator, slot_count: usize) EcsError!void {
+            const have: usize = Ecs.entity_states.items.len;
+            if (slot_count > have) {
+                try Ecs.entity_states.appendNTimes(allocator, .{}, slot_count - have);
             }
         }
-        /// Requires the referenced slot to be alive and idle (no queued command).
+        /// Requires the referenced slot to be alive and idle: no queued
+        /// destroy/migrate/reparent and no reserved-create flag.
         /// - `ref` - entity reference to validate.
         fn requireIdle(ref: EntityReference) EcsError!u32 {
             if (!ref.isAlive()) {
                 return EcsError.EntityIsNotAlive;
             }
             const entity_index: u32 = ref.id;
-            if (Ecs.getEntityState(entity_index) != .none) {
+            if (!Ecs.getEntityState(entity_index).isIdle()) {
+                return EcsError.EntityHasPendingCommand;
+            }
+            if (Ecs.entity_pending_parent.items[entity_index] != NO_ENTITY) {
                 return EcsError.EntityHasPendingCommand;
             }
             return entity_index;
         }
-        /// Marks a slot as pending. Caller must have validated via `requireIdle`.
-        /// - `entity_index` - slot id to mark.
-        /// - `next` - pending state to store.
-        fn markPending(entity_index: u32, next: EntityState) void {
-            Ecs.setEntityState(entity_index, next);
+        /// Validates a candidate parent for `cmdCreateChild`/`cmdCreateChildren`:
+        /// either a live entity with no pending command, or a slot reserved by
+        /// a queued create in this batch (so trees can be built in one pass).
+        /// - `parent` - candidate parent to validate.
+        fn requireParent(parent: EntityReference) EcsError!void {
+            if (!parent.exists()) {
+                return EcsError.EntityIsNotAlive;
+            }
+            const state = Ecs.getEntityState(parent.id);
+            if (parent.isAlive()) {
+                if (!state.isIdle()) {
+                    return EcsError.EntityHasPendingCommand;
+                }
+                return;
+            }
+            if (state.pending_create) {
+                return;
+            }
+            return EcsError.EntityIsNotAlive;
         }
         /// Clears the pending flag of a slot, ignoring never-assigned ids.
         /// Used when discarding queued commands after a failing system.
         /// - `entity_index` - slot id to release.
         fn clearPending(entity_index: u32) void {
             if (entity_index < Ecs.entityStateLen()) {
-                Ecs.setEntityState(entity_index, .none);
+                Ecs.setEntityState(entity_index, .{});
             }
+        }
+        /// Reserves a slot for a queued create command: takes a recycled id
+        /// (resetting its hierarchy state) or appends a fresh slot, and marks
+        /// it `pending_create` so the returned reference is not alive until
+        /// the command flushes. Slot arrays grow atomically: capacity is
+        /// ensured up front, so a partial append can never leave a torn slot.
+        /// - `allocator` - funds fresh-slot growth.
+        /// - `arch` - archetype id the future entity will own.
+        ///
+        /// Returns `Reservation` - future handle plus recycle provenance.
+        fn reserveSlot(allocator: std.mem.Allocator, arch: u32) EcsError!Reservation {
+            if (Ecs.free_ids.pop()) |recycled| {
+                const id = recycled;
+                const gen = Ecs.entity_generation.items[id];
+                Ecs.entity_archetype.items[id] = arch;
+                Ecs.entity_row.items[id] = 0;
+                Ecs.entity_parent.items[id] = NO_ENTITY;
+                Ecs.entity_first_child.items[id] = NO_ENTITY;
+                Ecs.entity_next_sibling.items[id] = NO_ENTITY;
+                Ecs.entity_prev_sibling.items[id] = NO_ENTITY;
+                Ecs.entity_depth.items[id] = 0;
+                Ecs.entity_pending_parent.items[id] = NO_ENTITY;
+                Ecs.setEntityState(id, .{ .pending_create = true });
+                return .{
+                    .ref = .{ .id = @intCast(id), .gen = gen },
+                    .from_free = true,
+                };
+            }
+            const next_len = Ecs.entity_generation.items.len + 1;
+            try Ecs.entity_generation.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_archetype.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_row.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_states.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_parent.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_first_child.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_next_sibling.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_prev_sibling.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_depth.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_pending_parent.ensureTotalCapacity(allocator, next_len);
+            const id: u32 = @intCast(Ecs.entity_generation.items.len);
+            Ecs.entity_generation.appendAssumeCapacity(0);
+            Ecs.entity_archetype.appendAssumeCapacity(arch);
+            Ecs.entity_row.appendAssumeCapacity(0);
+            Ecs.entity_states.appendAssumeCapacity(.{ .pending_create = true });
+            Ecs.entity_parent.appendAssumeCapacity(NO_ENTITY);
+            Ecs.entity_first_child.appendAssumeCapacity(NO_ENTITY);
+            Ecs.entity_next_sibling.appendAssumeCapacity(NO_ENTITY);
+            Ecs.entity_prev_sibling.appendAssumeCapacity(NO_ENTITY);
+            Ecs.entity_depth.appendAssumeCapacity(0);
+            Ecs.entity_pending_parent.appendAssumeCapacity(NO_ENTITY);
+            return .{
+                .ref = .{ .id = @intCast(id), .gen = 0 },
+                .from_free = false,
+            };
+        }
+        /// Releases a reserved slot when its create command is discarded.
+        /// Recycled ids return to the free list; fresh ids pop the appended
+        /// slot arrays again (callers must release in reverse reservation
+        /// order so the popped id is always the last appended slot).
+        /// - `allocator` - funds the free-list push.
+        /// - `reservation` - slot to release.
+        fn releaseReservation(allocator: std.mem.Allocator, reservation: Reservation) EcsError!void {
+            if (reservation.from_free) {
+                Ecs.setEntityState(reservation.ref.id, .{});
+                try Ecs.free_ids.append(allocator, reservation.ref.id);
+                return;
+            }
+            std.debug.assert(reservation.ref.id == Ecs.entity_generation.items.len - 1);
+            _ = Ecs.entity_generation.pop();
+            _ = Ecs.entity_archetype.pop();
+            _ = Ecs.entity_row.pop();
+            _ = Ecs.entity_states.pop();
+            _ = Ecs.entity_parent.pop();
+            _ = Ecs.entity_first_child.pop();
+            _ = Ecs.entity_next_sibling.pop();
+            _ = Ecs.entity_prev_sibling.pop();
+            _ = Ecs.entity_depth.pop();
+            _ = Ecs.entity_pending_parent.pop();
+        }
+        /// Initializes a reserved slot as a real entity: inserts its row into
+        /// the depth zone of `depth`, records the row and clears the
+        /// reservation flag. Component bytes are filled by the caller.
+        /// - `allocator` - funds row allocation.
+        /// - `ref` - reserved handle of the entity.
+        /// - `arch` - owning archetype id.
+        /// - `depth` - hierarchy depth of the new entity.
+        ///
+        /// Returns `u32` - row position of the created entity.
+        fn initReservedSlot(
+            allocator: std.mem.Allocator,
+            ref: EntityReference,
+            arch: u32,
+            depth: u32,
+        ) EcsError!u32 {
+            @setEvalBranchQuota(10_000_000);
+            const id: u32 = ref.id;
+            Ecs.entity_depth.items[id] = depth;
+            const index: u32 = blk: {
+                inline for (0..ARCH_COUNT) |k| {
+                    if (arch == k) {
+                        const idx = try Ecs.storages[k].insertRowAtDepth(allocator, &ref, depth);
+                        if (Ecs.storages[k].count() == 1) {
+                            Ecs.setArchetypeNonEmpty(arch);
+                        }
+                        break :blk idx;
+                    }
+                }
+                unreachable;
+            };
+            Ecs.entity_row.items[id] = index;
+            Ecs.setEntityState(id, .{});
+            return index;
+        }
+        /// Appends rows for a batch of already-reserved slots (all at their
+        /// current `entity_depth` values), clears their reservation flags and
+        /// consolidates the depth zones once. Used by the `create_batch` and
+        /// `create_children` commands.
+        /// - `allocator` - funds row allocation and zone consolidation.
+        /// - `arch` - owning archetype id.
+        /// - `refs` - reserved handles, in creation order.
+        ///
+        /// Returns `u32` - first row index of the batch (before consolidation).
+        fn initReservedBatch(
+            allocator: std.mem.Allocator,
+            arch: u32,
+            refs: []const EntityReference,
+        ) EcsError!u32 {
+            @setEvalBranchQuota(10_000_000);
+            var row_start: u32 = 0;
+            inline for (0..ARCH_COUNT) |k| {
+                if (arch == k) {
+                    row_start = @intCast(Ecs.storages[k].refs.items.len);
+                    for (refs) |ref| {
+                        const pos = try Ecs.storages[k].add(allocator, &ref);
+                        Ecs.entity_row.items[ref.id] = pos;
+                        Ecs.setEntityState(ref.id, .{});
+                    }
+                    if (row_start == 0) {
+                        Ecs.setArchetypeNonEmpty(arch);
+                    }
+                    break;
+                }
+            }
+            return row_start;
+        }
+        /// Attaches a brand-new entity as the last child of a live parent:
+        /// sets the parent link, the depth and appends to the sibling list.
+        /// Only used for freshly created children; reparenting of existing
+        /// entities goes through `reparentById`.
+        /// - `id` - child slot id.
+        /// - `parent_id` - parent slot id.
+        fn linkChild(id: u32, parent_id: u32) void {
+            Ecs.entity_parent.items[id] = parent_id;
+            const first = Ecs.entity_first_child.items[parent_id];
+            if (first == NO_ENTITY) {
+                Ecs.entity_first_child.items[parent_id] = id;
+            } else {
+                var last = first;
+                while (Ecs.entity_next_sibling.items[last] != NO_ENTITY) {
+                    last = Ecs.entity_next_sibling.items[last];
+                }
+                Ecs.entity_next_sibling.items[last] = id;
+                Ecs.entity_prev_sibling.items[id] = last;
+            }
+        }
+        /// Resolves the effective parent of a slot: the queued reparent target
+        /// when one exists, otherwise the committed parent. Lets command-time
+        /// cycle checks see the hierarchy shape a batch will produce.
+        /// - `entity_index` - slot id to resolve.
+        ///
+        /// Returns `u32` - effective parent slot, or `NO_ENTITY`.
+        fn effectiveParent(entity_index: u32) u32 {
+            const pending = Ecs.entity_pending_parent.items[entity_index];
+            if (pending != NO_ENTITY) {
+                return pending;
+            }
+            return Ecs.entity_parent.items[entity_index];
+        }
+        /// Removes an entity from its parent's child list (O(1) via the
+        /// sibling links) and clears its own sibling links. The entity keeps
+        /// its hierarchy data otherwise; caller decides the new parent.
+        /// - `entity_index` - slot id to unlink.
+        fn unlinkFromParent(entity_index: u32) void {
+            const parent = Ecs.entity_parent.items[entity_index];
+            if (parent == NO_ENTITY) {
+                return;
+            }
+            const prev = Ecs.entity_prev_sibling.items[entity_index];
+            const next = Ecs.entity_next_sibling.items[entity_index];
+            if (prev != NO_ENTITY) {
+                Ecs.entity_next_sibling.items[prev] = next;
+            } else {
+                Ecs.entity_first_child.items[parent] = next;
+            }
+            if (next != NO_ENTITY) {
+                Ecs.entity_prev_sibling.items[next] = prev;
+            }
+            Ecs.entity_parent.items[entity_index] = NO_ENTITY;
+            Ecs.entity_prev_sibling.items[entity_index] = NO_ENTITY;
+            Ecs.entity_next_sibling.items[entity_index] = NO_ENTITY;
+        }
+        /// Destroys one already-unlinked slot: removes its row from the
+        /// owning archetype (through the depth-zone cascade), resets every
+        /// hierarchy field, bumps the generation and recycles the id.
+        /// Callers guarantee all descendants were destroyed before this node.
+        /// - `id` - slot id to destroy.
+        /// - `allocator` - funds the free-slot bookkeeping.
+        fn destroyNode(id: u32, allocator: std.mem.Allocator) EcsError!void {
+            @setEvalBranchQuota(10_000_000);
+            const arch: u32 = Ecs.entity_archetype.items[id];
+            const row: u32 = Ecs.entity_row.items[id];
+            inline for (0..ARCH_COUNT) |k| {
+                if (arch == k) {
+                    Ecs.storages[k].removeRow(row);
+                    if (Ecs.storages[k].count() == 0) {
+                        Ecs.clearArchetypeNonEmpty(arch);
+                    }
+                    break;
+                }
+            }
+            Ecs.unlinkFromParent(id);
+            Ecs.entity_parent.items[id] = NO_ENTITY;
+            Ecs.entity_first_child.items[id] = NO_ENTITY;
+            Ecs.entity_next_sibling.items[id] = NO_ENTITY;
+            Ecs.entity_prev_sibling.items[id] = NO_ENTITY;
+            Ecs.entity_depth.items[id] = 0;
+            Ecs.entity_pending_parent.items[id] = NO_ENTITY;
+            Ecs.entity_generation.items[id] +%= 1;
+            Ecs.setEntityState(id, .{});
+            try Ecs.free_ids.append(allocator, id);
         }
         /// Names the storage type of one archetype id. Useful to name the
         /// pointer returned by `storage` without repeating the lookup.
@@ -1303,17 +2191,26 @@ pub fn ECS(comptime sets: anytype) type {
                 try Ecs.entity_generation.append(allocator, 0);
                 try Ecs.entity_archetype.append(allocator, id);
                 try Ecs.entity_row.append(allocator, 0);
-                try Ecs.ensureStateWords(allocator, Ecs.entity_generation.items.len);
+                try Ecs.ensureEntityStates(allocator, Ecs.entity_generation.items.len);
+                try Ecs.entity_parent.append(allocator, NO_ENTITY);
+                try Ecs.entity_first_child.append(allocator, NO_ENTITY);
+                try Ecs.entity_next_sibling.append(allocator, NO_ENTITY);
+                try Ecs.entity_prev_sibling.append(allocator, NO_ENTITY);
+                try Ecs.entity_depth.append(allocator, 0);
+                try Ecs.entity_pending_parent.append(allocator, NO_ENTITY);
                 new_gen = 0;
             }
             const reference = EntityReference{
                 .id = @intCast(new_id),
                 .gen = new_gen,
             };
+            // Every entity is born as a root (depth 0) and lands in the
+            // depth-0 zone of its archetype. Recycled slots get every
+            // hierarchy field reset, so a reused id never inherits links.
             const index: u32 = blk: {
                 inline for (0..ARCH_COUNT) |k| {
                     if (id == k) {
-                        const idx = try Ecs.storages[k].add(allocator, &reference);
+                        const idx = try Ecs.storages[k].insertRowAtDepth(allocator, &reference, 0);
                         if (Ecs.storages[k].count() == 1) {
                             Ecs.setArchetypeNonEmpty(id);
                         }
@@ -1325,9 +2222,20 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_generation.items[new_id] = new_gen;
             Ecs.entity_archetype.items[new_id] = id;
             Ecs.entity_row.items[new_id] = index;
-            Ecs.setEntityState(new_id, .none);
+            Ecs.entity_parent.items[new_id] = NO_ENTITY;
+            Ecs.entity_first_child.items[new_id] = NO_ENTITY;
+            Ecs.entity_next_sibling.items[new_id] = NO_ENTITY;
+            Ecs.entity_prev_sibling.items[new_id] = NO_ENTITY;
+            Ecs.entity_depth.items[new_id] = 0;
+            Ecs.entity_pending_parent.items[new_id] = NO_ENTITY;
+            Ecs.setEntityState(new_id, .{});
             return reference;
         }
+        /// Creates `count` entities at once, all roots (depth 0). Slots are
+        /// allocated first, then rows are appended raw and depth zones are
+        /// rebuilt in one consolidation pass, so bulk creation costs one
+        /// stable sort instead of one zone cascade per row.
+        /// Private: used by the `create_batch` command.
         /// Counts entities stored in the given archetype.
         /// - `types` - component bundle. Must exactly match a declared archetype.
         ///
@@ -1655,6 +2563,137 @@ pub fn ECS(comptime sets: anytype) type {
                 pub inline fn isEmpty(self: *const PageNamespace) bool {
                     return !Ecs.isArchetypeNonEmpty(self.arch_id);
                 }
+                /// Read-only view of one depth zone: a contiguous run of rows
+                /// sharing one hierarchy depth. Obtained from
+                /// `Page.zone(depth)` or `Page.zoneAt(index)`; the underlying
+                /// column slice is a sub-slice of the full column.
+                pub const ZoneView = struct {
+                    /// Owning page (archetype handle) of the zone.
+                    page: PageNamespace,
+                    /// The zone descriptor: depth plus row range.
+                    zone: DepthZone,
+                    /// Number of rows in the zone.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `u32` - zone row count.
+                    pub fn len(self: *const ZoneView) u32 {
+                        return self.zone.len;
+                    }
+                    /// Returns the zone's depth.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `u32` - hierarchy depth of the zone.
+                    pub fn depth(self: *const ZoneView) u32 {
+                        return self.zone.depth;
+                    }
+                    /// Returns the zone's component column slice.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    ///
+                    /// Returns `[]T` - mutable slice over the zone rows.
+                    pub fn get(self: *const ZoneView, comptime T: type) []T {
+                        comptime {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                        const comp_id: u32 = comptime Ecs.componentId(T);
+                        const col = Ecs.binarySearchIds(
+                            Ecs.archetypes[self.page.arch_id].component_ids,
+                            comp_id,
+                        ) orelse return &[0]T{};
+                        const raw = Ecs.column_getters[self.page.arch_id](col);
+                        const typed: [*]T = @ptrCast(@alignCast(raw.ptr));
+                        return typed[self.zone.offset..][0..self.zone.len];
+                    }
+                    /// Returns the zone's entity reference slice.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `[]const EntityReference` - zone row references.
+                    pub fn entities(self: *const ZoneView) []const EntityReference {
+                        return Ecs.refs_getters[self.page.arch_id]()[self.zone.offset..][0..self.zone.len];
+                    }
+                };
+                /// Returns every depth zone of the page, sorted ascending by
+                /// depth. Zones are always valid: structural operations
+                /// maintain them eagerly, so no rebuild is triggered here.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const DepthZone` - zone list of the archetype.
+                pub fn depthZones(self: *const PageNamespace) []const DepthZone {
+                    return Ecs.zones_getters[self.arch_id]();
+                }
+                /// Returns the zone of one depth, or null when the page holds
+                /// no entity at that depth.
+                /// - `self` - page to inspect.
+                /// - `depth` - hierarchy depth to look up.
+                ///
+                /// Returns `?DepthZone` - zone descriptor, or null.
+                pub fn depthZone(self: *const PageNamespace, depth: u32) ?DepthZone {
+                    const zones = Ecs.zones_getters[self.arch_id]();
+                    var lo: usize = 0;
+                    var hi: usize = zones.len;
+                    while (lo < hi) {
+                        const mid = (lo + hi) / 2;
+                        if (zones[mid].depth < depth) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if (lo < zones.len and zones[lo].depth == depth) {
+                        return zones[lo];
+                    }
+                    return null;
+                }
+                /// Number of distinct depths currently present in the page.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `usize` - depth zone count.
+                pub fn depthCount(self: *const PageNamespace) usize {
+                    return Ecs.zones_getters[self.arch_id]().len;
+                }
+                /// Deepest depth present in the page, or null when empty.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `?u32` - deepest depth, or null.
+                pub fn maxDepth(self: *const PageNamespace) ?u32 {
+                    const zones = Ecs.zones_getters[self.arch_id]();
+                    if (zones.len == 0) {
+                        return null;
+                    }
+                    return zones[zones.len - 1].depth;
+                }
+                /// Returns a zone view for one depth. A missing depth yields
+                /// an empty view with the same depth, so callers can iterate
+                /// unconditionally.
+                /// - `self` - page to inspect.
+                /// - `depth` - hierarchy depth.
+                ///
+                /// Returns `ZoneView` - view over the zone rows.
+                pub fn zone(self: *const PageNamespace, depth: u32) ZoneView {
+                    const z = self.depthZone(depth) orelse return ZoneView{
+                        .page = self.*,
+                        .zone = .{ .depth = depth, .offset = 0, .len = 0 },
+                    };
+                    return ZoneView{
+                        .page = self.*,
+                        .zone = z,
+                    };
+                }
+                /// Returns a zone view for one row position, resolved through
+                /// the zone offsets. Useful to iterate zones sequentially.
+                /// - `self` - page to inspect.
+                /// - `index` - zone list index (`0 <= index < depthCount()`).
+                ///
+                /// Returns `ZoneView` - view over the indexed zone rows.
+                pub fn zoneAt(self: *const PageNamespace, index: usize) ZoneView {
+                    const z = Ecs.zones_getters[self.arch_id]()[index];
+                    return ZoneView{
+                        .page = self.*,
+                        .zone = z,
+                    };
+                }
             };
         }
         /// Container of pages for archetypes containing all `include`
@@ -1888,47 +2927,232 @@ pub fn ECS(comptime sets: anytype) type {
                     Ecs.entity_row.items[entity_index],
                 );
             }
-            /// Queues entity creation. Applied after the current system finishes.
+            /// Queues entity creation and returns the future handle. The id
+            /// and generation are reserved immediately (the slot is marked
+            /// `pending_create`), so the returned reference can already be
+            /// used as a parent for `cmdCreateChild`/`cmdCreateChildren`
+            /// queued later in the same system. The entity itself - storage
+            /// row, components, hierarchy - is created at flush.
+            /// Until then `isAlive()` returns false and every read on the
+            /// reference fails with `EntityIsNotAlive`.
             /// - `self` - handler of the running system.
             /// - `bundle` - component bundle of the new entity. Must be declared in `ECS(...)`.
             /// - `values` - tuple of component values, one per bundle component,
             ///   in any order. Types must match the bundle exactly.
+            ///
+            /// Returns `EntityReference` - reserved handle, alive after flush.
             pub fn cmdCreate(
                 self: *const SystemHandler,
                 comptime bundle: anytype,
                 values: anytype,
-            ) EcsError!void {
+            ) EcsError!EntityReference {
                 const arch = comptime archetypeId(bundle);
                 const blob = try Ecs.packValues(arch, values, self.allocator);
                 errdefer self.allocator.free(blob);
+                const reservation = try Ecs.reserveSlot(self.allocator, @intCast(arch));
+                errdefer Ecs.releaseReservation(self.allocator, reservation) catch {};
                 try Ecs.commands.append(self.allocator, .{ .create = .{
                     .arch = @intCast(arch),
                     .bytes = blob,
+                    .reserved = reservation.ref,
+                    .from_free = reservation.from_free,
                 } });
+                return reservation.ref;
             }
-            /// Queues creation of `n` entities with identical component values.
+            /// Queues creation of `n` entities with identical component values
+            /// and returns the slice of their reserved handles. All slots are
+            /// reserved immediately (one batch command): rows are appended in
+            /// one go and the depth zones are consolidated with a single pass
+            /// instead of paying the per-row cascade `n` times.
+            /// The returned slice is owned by the queued command and stays
+            /// valid until the batch flushes or is discarded; use it for
+            /// chaining `cmdCreateChild` in the same system.
             /// - `self` - handler of the running system.
             /// - `bundle` - component bundle of the new entities.
             /// - `values` - tuple of component values shared by all `n` entities.
             /// - `n` - number of entities to create.
+            ///
+            /// Returns `[]const EntityReference` - reserved handles.
             pub fn cmdCreateN(
                 self: *const SystemHandler,
                 comptime bundle: anytype,
                 values: anytype,
                 n: u32,
-            ) EcsError!void {
+            ) EcsError![]const EntityReference {
                 const arch: u32 = @intCast(comptime archetypeId(bundle));
+                return self.queueCreateMany(
+                    arch,
+                    values,
+                    n,
+                    null,
+                );
+            }
+            /// Queues creation of `n` entities attached to `parent` in one
+            /// batch and returns their reserved handles. Identical to
+            /// `cmdCreateN` except every entity is born as a child: its depth
+            /// is `parent.depth + 1` and it is linked into the parent's child
+            /// list during the same flush.
+            /// - `self` - handler of the running system.
+            /// - `parent` - parent entity. Must be alive and idle at queue
+            ///   time, or reserved by an earlier `cmdCreate` in this system.
+            /// - `bundle` - component bundle of the new entities.
+            /// - `values` - tuple of component values shared by all `n` entities.
+            /// - `n` - number of entities to create.
+            ///
+            /// Returns `[]const EntityReference` - reserved handles.
+            pub fn cmdCreateChildren(
+                self: *const SystemHandler,
+                parent: EntityReference,
+                comptime bundle: anytype,
+                values: anytype,
+                n: u32,
+            ) EcsError![]const EntityReference {
+                try Ecs.requireParent(parent);
+                const arch: u32 = @intCast(comptime archetypeId(bundle));
+                return self.queueCreateMany(
+                    arch,
+                    values,
+                    n,
+                    parent,
+                );
+            }
+            /// Queues creation of an entity attached to `parent` and returns
+            /// its reserved handle. The child is reserved immediately; during
+            /// flush its depth becomes `parent.depth + 1` and it is linked
+            /// into the parent's child list, so no intermediate root state is
+            /// ever observable. `parent` may be alive and idle, or reserved
+            /// by an earlier `cmdCreate` in this system.
+            /// - `self` - handler of the running system.
+            /// - `parent` - parent entity. Must be alive and idle at queue
+            ///   time, or reserved by an earlier `cmdCreate` in this system.
+            /// - `bundle` - component bundle of the new entity.
+            /// - `values` - tuple of component values matching the bundle.
+            ///
+            /// Returns `EntityReference` - reserved handle, alive after flush.
+            pub fn cmdCreateChild(
+                self: *const SystemHandler,
+                parent: EntityReference,
+                comptime bundle: anytype,
+                values: anytype,
+            ) EcsError!EntityReference {
+                try Ecs.requireParent(parent);
+                const arch = comptime archetypeId(bundle);
                 const blob = try Ecs.packValues(arch, values, self.allocator);
-                defer self.allocator.free(blob);
+                errdefer self.allocator.free(blob);
+                const reservation = try Ecs.reserveSlot(self.allocator, @intCast(arch));
+                errdefer Ecs.releaseReservation(self.allocator, reservation) catch {};
+                try Ecs.commands.append(self.allocator, .{ .create_child = .{
+                    .arch = @intCast(arch),
+                    .bytes = blob,
+                    .parent = parent,
+                    .reserved = reservation.ref,
+                    .from_free = reservation.from_free,
+                } });
+                return reservation.ref;
+            }
+            /// Shared implementation of `cmdCreateN` and `cmdCreateChildren`:
+            /// packs one value blob, reserves `n` slots, queues a single batch
+            /// command and returns the slice of reserved handles. When
+            /// `parent` is non-null the batch command is `create_children`.
+            /// - `self` - handler of the running system.
+            /// - `arch` - destination archetype id.
+            /// - `values` - tuple of component values shared by all entities.
+            /// - `n` - number of entities to create.
+            /// - `parent` - optional parent for `create_children`.
+            ///
+            /// Returns `[]const EntityReference` - reserved handles, owned by
+            /// the queued command until flush.
+            fn queueCreateMany(
+                self: *const SystemHandler,
+                comptime arch: u32,
+                values: anytype,
+                n: u32,
+                parent: ?EntityReference,
+            ) EcsError![]const EntityReference {
+                const blob = try Ecs.packValues(arch, values, self.allocator);
+                errdefer self.allocator.free(blob);
+                const reserved = try self.allocator.alloc(EntityReference, n);
+                errdefer self.allocator.free(reserved);
+                const from_free = try self.allocator.alloc(bool, n);
+                errdefer self.allocator.free(from_free);
                 var i: u32 = 0;
                 while (i < n) : (i += 1) {
-                    const dup = try self.allocator.dupe(u8, blob);
-                    errdefer self.allocator.free(dup);
-                    try Ecs.commands.append(self.allocator, .{ .create = .{
+                    const reservation = try Ecs.reserveSlot(self.allocator, arch);
+                    reserved[i] = reservation.ref;
+                    from_free[i] = reservation.from_free;
+                }
+                errdefer {
+                    var j: u32 = n;
+                    while (j > 0) {
+                        j -= 1;
+                        Ecs.releaseReservation(
+                            self.allocator,
+                            .{ .ref = reserved[j], .from_free = from_free[j] },
+                        ) catch {};
+                    }
+                }
+                if (parent) |p| {
+                    try Ecs.commands.append(self.allocator, .{ .create_children = .{
                         .arch = arch,
-                        .bytes = dup,
+                        .bytes = blob,
+                        .parent = p,
+                        .reserved = reserved,
+                        .from_free = from_free,
+                    } });
+                } else {
+                    try Ecs.commands.append(self.allocator, .{ .create_batch = .{
+                        .arch = arch,
+                        .bytes = blob,
+                        .reserved = reserved,
+                        .from_free = from_free,
                     } });
                 }
+                return reserved;
+            }
+            /// Queues reparenting of `ref` under `parent`, or detaching it
+            /// when `parent` is null. The queued parent is written to
+            /// `entity_pending_parent` immediately and the full cycle check
+            /// runs against the effective hierarchy (pending parents of other
+            /// queued reparents included), so batch cycles like
+            /// `A->B; B->A` fail here, not at flush.
+            /// The slot becomes pending: a second reparent, a destroy or a
+            /// migrate of the same entity in this batch is rejected with
+            /// `EntityHasPendingCommand`.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity to move. Must be alive and idle.
+            /// - `parent` - new parent, or null to detach. Must be alive.
+            pub fn cmdReparent(
+                self: *const SystemHandler,
+                ref: EntityReference,
+                parent: ?EntityReference,
+            ) EcsError!void {
+                const entity_index = try Ecs.requireIdle(ref);
+                var parent_id: u32 = NO_ENTITY;
+                if (parent) |p| {
+                    if (!p.isAlive()) {
+                        return EcsError.EntityIsNotAlive;
+                    }
+                    if (p.id == ref.id) {
+                        return EcsError.HierarchyCycle;
+                    }
+                    // Walk the effective parent chain: queued reparents are
+                    // treated as applied, so a cycle that only exists after
+                    // the whole batch is rejected right here.
+                    var cur: u32 = p.id;
+                    while (cur != NO_ENTITY) {
+                        if (cur == ref.id) {
+                            return EcsError.HierarchyCycle;
+                        }
+                        cur = Ecs.effectiveParent(cur);
+                    }
+                    parent_id = p.id;
+                }
+                try Ecs.commands.append(self.allocator, .{ .reparent = .{
+                    .ref = ref,
+                    .parent = parent,
+                } });
+                Ecs.setEntityState(entity_index, .{ .pending_reparent = true });
+                Ecs.entity_pending_parent.items[entity_index] = parent_id;
             }
             /// Queues entity destruction. Applied after the current system finishes.
             /// Fails with `EntityIsNotAlive` when the reference is stale and
@@ -1939,7 +3163,7 @@ pub fn ECS(comptime sets: anytype) type {
             pub fn cmdDestroy(self: *const SystemHandler, ref: EntityReference) EcsError!void {
                 const entity_index = try Ecs.requireIdle(ref);
                 try Ecs.commands.append(self.allocator, .{ .destroy = ref });
-                Ecs.markPending(entity_index, .pending_destroy);
+                Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
             }
             /// Queues entity migration into another archetype.
             /// Same strictness as `cmdDestroy`: stale or already-pending
@@ -1962,7 +3186,7 @@ pub fn ECS(comptime sets: anytype) type {
                     .dest = dest_id,
                     .copy = copy,
                 } });
-                Ecs.markPending(entity_index, .pending_migrate);
+                Ecs.setEntityState(entity_index, .{ .pending_migrate = true });
             }
             /// Queues destruction of every entity on pages matching `include`
             /// and `exclude`. Applied after the current system finishes.
@@ -1980,7 +3204,7 @@ pub fn ECS(comptime sets: anytype) type {
                     for (p.entities()) |ref| {
                         const entity_index = try Ecs.requireIdle(ref);
                         try Ecs.commands.append(self.allocator, .{ .destroy = ref });
-                        Ecs.markPending(entity_index, .pending_destroy);
+                        Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
                     }
                 }
             }
@@ -2000,7 +3224,7 @@ pub fn ECS(comptime sets: anytype) type {
                     if (id == k) {
                         for (Ecs.storages[k].refs.items) |ref| {
                             const entity_index = try Ecs.requireIdle(ref);
-                            Ecs.markPending(entity_index, .pending_destroy);
+                            Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
                         }
                         break;
                     }
@@ -2010,12 +3234,39 @@ pub fn ECS(comptime sets: anytype) type {
         };
         /// Deferred structural change, applied between systems in FIFO order.
         const Command = union(enum) {
-            /// Create an entity; `bytes` holds packed component values in column order.
+            /// Create an entity; the slot was reserved at queue time and
+            /// `bytes` holds packed component values in column order.
             create: struct {
                 arch: u32,
                 bytes: []u8,
+                reserved: EntityReference,
+                from_free: bool,
             },
-            /// Destroy an entity; skipped when the reference is stale.
+            /// Create many entities in one pass; slots were reserved at queue
+            /// time and the depth zones are consolidated once after the batch.
+            create_batch: struct {
+                arch: u32,
+                bytes: []u8,
+                reserved: []EntityReference,
+                from_free: []bool,
+            },
+            /// Create an entity and attach it to `parent` in the same flush.
+            create_child: struct {
+                arch: u32,
+                bytes: []u8,
+                parent: EntityReference,
+                reserved: EntityReference,
+                from_free: bool,
+            },
+            /// Create many entities attached to `parent` in the same flush.
+            create_children: struct {
+                arch: u32,
+                bytes: []u8,
+                parent: EntityReference,
+                reserved: []EntityReference,
+                from_free: []bool,
+            },
+            /// Destroy an entity and its whole subtree; skipped when stale.
             destroy: EntityReference,
             /// Migrate an entity; skipped when the reference is stale.
             migrate: struct {
@@ -2023,8 +3274,15 @@ pub fn ECS(comptime sets: anytype) type {
                 dest: u32,
                 copy: bool,
             },
-            /// Destroy every entity in one exact archetype.
+            /// Destroy every entity in one exact archetype (with subtrees).
             destroy_page: u32,
+            /// Reparent an entity; `parent` is null when detaching. The
+            /// parent reference carries its queue-time generation, so flush
+            /// can detect a parent destroyed earlier in the same batch.
+            reparent: struct {
+                ref: EntityReference,
+                parent: ?EntityReference,
+            },
         };
         /// Queued structural changes of the running system.
         var commands: std.ArrayListUnmanaged(Command) = .empty;
@@ -2107,10 +3365,30 @@ pub fn ECS(comptime sets: anytype) type {
             }
             return blob;
         }
+        /// Fills one row of an archetype with packed component values.
+        /// Byte-level access through the column registry: one plain runtime
+        /// loop, no unrolling over archetypes. Blob layout matches column
+        /// order (see `packValues`).
+        /// - `arch` - archetype id owning the row.
+        /// - `row` - row position to fill.
+        /// - `bytes` - packed values, one element per column.
+        fn fillRowBytes(arch: u32, row: u32, bytes: []const u8) void {
+            const ncols: usize = Ecs.archetypes[arch].component_ids.len;
+            var off: usize = 0;
+            var col: usize = 0;
+            while (col < ncols) : (col += 1) {
+                const raw = Ecs.column_getters[arch](col);
+                const dst = (raw.ptr + row * raw.elem_size)[0..raw.elem_size];
+                @memcpy(dst, bytes[off..][0..raw.elem_size]);
+                off += raw.elem_size;
+            }
+        }
         /// Applies every queued command in FIFO order, then clears the queue.
         /// Queue-time validation (`requireIdle`) already rejected duplicates,
         /// so flush only keeps a defensive `isAlive` guard. Immediate
         /// `destroy`/`migrateById` clear the pending flag they resolve.
+        /// Reserved create slots are initialized here: rows, components and
+        /// hierarchy links appear only when the command flushes.
         /// Private: runs automatically between systems; never call it directly,
         /// or pages held by user code may dangle after reallocation.
         /// - `allocator` - allocator that funded the queue and the changes.
@@ -2121,67 +3399,191 @@ pub fn ECS(comptime sets: anytype) type {
                 switch (cmd) {
                     .create => |c| {
                         errdefer allocator.free(c.bytes);
-                        const created = try Ecs.createById(allocator, c.arch);
-                        const created_row: u32 = Ecs.entity_row.items[created.id];
-                        // Byte-level column fill through the registry: one
-                        // plain runtime loop, no unrolling over archetypes.
-                        // Blob layout matches column order (see packValues).
-                        const ncols: usize = Ecs.archetypes[c.arch].component_ids.len;
-                        var off: usize = 0;
-                        var col: usize = 0;
-                        while (col < ncols) : (col += 1) {
-                            const raw = Ecs.column_getters[c.arch](col);
-                            const dst = (raw.ptr + created_row * raw.elem_size)[0..raw.elem_size];
-                            @memcpy(dst, c.bytes[off..][0..raw.elem_size]);
-                            off += raw.elem_size;
+                        const row = try Ecs.initReservedSlot(allocator, c.reserved, c.arch, 0);
+                        Ecs.fillRowBytes(c.arch, row, c.bytes);
+                        allocator.free(c.bytes);
+                    },
+                    .create_batch => |c| {
+                        errdefer allocator.free(c.bytes);
+                        const row_start = try Ecs.initReservedBatch(allocator, c.arch, c.reserved);
+                        for (c.reserved, 0..) |_, j| {
+                            Ecs.fillRowBytes(c.arch, row_start + @as(u32, @intCast(j)), c.bytes);
+                        }
+                        // Rebuild the depth zones once. Rows are still in
+                        // append order here; consolidation moves them after.
+                        inline for (0..ARCH_COUNT) |k| {
+                            if (c.arch == k) {
+                                try Ecs.storages[k].consolidateZones(
+                                    allocator,
+                                    &Ecs.zone_scratch_perm,
+                                    &Ecs.zone_scratch_visited,
+                                );
+                                break;
+                            }
                         }
                         allocator.free(c.bytes);
+                        allocator.free(c.reserved);
+                        allocator.free(c.from_free);
+                    },
+                    .create_child => |c| {
+                        errdefer allocator.free(c.bytes);
+                        // The parent must be alive when the command applies:
+                        // either a real entity, or a reserved slot whose own
+                        // create command already ran (FIFO order). A parent
+                        // destroyed by an earlier command aborts the batch.
+                        if (!c.parent.isAlive()) {
+                            return EcsError.EntityIsNotAlive;
+                        }
+                        const child_depth = Ecs.entity_depth.items[c.parent.id] + 1;
+                        const row = try Ecs.initReservedSlot(allocator, c.reserved, c.arch, child_depth);
+                        Ecs.fillRowBytes(c.arch, row, c.bytes);
+                        Ecs.linkChild(c.reserved.id, c.parent.id);
+                        allocator.free(c.bytes);
+                    },
+                    .create_children => |c| {
+                        errdefer allocator.free(c.bytes);
+                        if (!c.parent.isAlive()) {
+                            return EcsError.EntityIsNotAlive;
+                        }
+                        const child_depth = Ecs.entity_depth.items[c.parent.id] + 1;
+                        for (c.reserved) |ref| {
+                            Ecs.entity_depth.items[ref.id] = child_depth;
+                            Ecs.linkChild(ref.id, c.parent.id);
+                        }
+                        const row_start = try Ecs.initReservedBatch(allocator, c.arch, c.reserved);
+                        for (c.reserved, 0..) |_, j| {
+                            Ecs.fillRowBytes(c.arch, row_start + @as(u32, @intCast(j)), c.bytes);
+                        }
+                        inline for (0..ARCH_COUNT) |k| {
+                            if (c.arch == k) {
+                                try Ecs.storages[k].consolidateZones(
+                                    allocator,
+                                    &Ecs.zone_scratch_perm,
+                                    &Ecs.zone_scratch_visited,
+                                );
+                                break;
+                            }
+                        }
+                        allocator.free(c.bytes);
+                        allocator.free(c.reserved);
+                        allocator.free(c.from_free);
                     },
                     .destroy => |ref| {
                         if (ref.isAlive()) {
                             try ref.destroy(allocator);
-                        } else {
+                        } else if (Ecs.entity_generation.items[ref.id] == ref.gen) {
                             Ecs.clearPending(ref.id);
                         }
                     },
                     .migrate => |m| {
                         if (m.ref.isAlive()) {
                             _ = try m.ref.migrateById(allocator, m.dest, m.copy);
-                        } else {
+                        } else if (Ecs.entity_generation.items[m.ref.id] == m.ref.gen) {
                             Ecs.clearPending(m.ref.id);
                         }
                     },
                     .destroy_page => |arch| {
                         inline for (0..ARCH_COUNT) |k| {
                             if (arch == k) {
-                                for (Ecs.storages[k].refs.items) |ref| {
-                                    const entity_index: u32 = ref.id;
-                                    Ecs.entity_generation.items[entity_index] +%= 1;
-                                    Ecs.setEntityState(entity_index, .none);
-                                    try Ecs.free_ids.append(allocator, entity_index);
+                                // Drain from the tail: every destroy cascades
+                                // into the subtree, and swap-removal can touch
+                                // rows of this very archetype, so a forward
+                                // `for` over refs would skip survivors. Taking
+                                // the last row every time re-reads the live
+                                // length and terminates exactly at empty.
+                                while (Ecs.storages[k].refs.items.len > 0) {
+                                    const ref = Ecs.storages[k].refs.items[Ecs.storages[k].refs.items.len - 1];
+                                    try ref.destroy(allocator);
                                 }
-                                inline for (0..Tables.arch_lens[k]) |col| {
-                                    Ecs.storages[k].lists[col].items.len = 0;
-                                }
-                                Ecs.storages[k].refs.items.len = 0;
-                                Ecs.clearArchetypeNonEmpty(arch);
+                                break;
                             }
+                        }
+                    },
+                    .reparent => |r| {
+                        if (r.ref.isAlive()) {
+                            // A parent destroyed by an earlier command of this
+                            // batch is silently skipped, mirroring the stale
+                            // reference semantics of destroy/migrate.
+                            if (r.parent) |p| {
+                                if (p.isAlive()) {
+                                    try r.ref.reparentById(allocator, p.id);
+                                }
+                            } else {
+                                try r.ref.reparentById(allocator, NO_ENTITY);
+                            }
+                            Ecs.entity_pending_parent.items[r.ref.id] = NO_ENTITY;
+                            Ecs.setEntityState(r.ref.id, .{});
+                        } else if (Ecs.entity_generation.items[r.ref.id] == r.ref.gen) {
+                            Ecs.entity_pending_parent.items[r.ref.id] = NO_ENTITY;
+                            Ecs.clearPending(r.ref.id);
                         }
                     },
                 }
             }
         }
-        /// Drops every queued command without applying it, freeing create blobs
-        /// and releasing the pending flags set at queue time. Used when a
-        /// system fails and on teardown.
+        /// Drops every queued command without applying it, freeing create
+        /// blobs, releasing the pending flags set at queue time and rolling
+        /// back reserved create slots. Used when a system fails and on
+        /// teardown. No flush has run, so clearing by slot id is safe.
+        /// Commands are walked in reverse because fresh reservations were
+        /// appended in queue order: releasing in reverse pops the appended
+        /// slot arrays back to their original length, while recycled ids just
+        /// return to the free list.
         /// - `allocator` - allocator that funded the queue.
         fn discardCommands(allocator: std.mem.Allocator) void {
             @setEvalBranchQuota(10_000_000);
-            for (Ecs.commands.items) |cmd| {
-                switch (cmd) {
-                    .create => allocator.free(cmd.create.bytes),
+            var i: usize = Ecs.commands.items.len;
+            while (i > 0) {
+                i -= 1;
+                switch (Ecs.commands.items[i]) {
+                    .create => |c| {
+                        allocator.free(c.bytes);
+                        Ecs.releaseReservation(allocator, .{
+                            .ref = c.reserved,
+                            .from_free = c.from_free,
+                        }) catch {};
+                    },
+                    .create_batch => |c| {
+                        allocator.free(c.bytes);
+                        var j: usize = c.reserved.len;
+                        while (j > 0) {
+                            j -= 1;
+                            Ecs.releaseReservation(allocator, .{
+                                .ref = c.reserved[j],
+                                .from_free = c.from_free[j],
+                            }) catch {};
+                        }
+                        allocator.free(c.reserved);
+                        allocator.free(c.from_free);
+                    },
+                    .create_child => |c| {
+                        allocator.free(c.bytes);
+                        Ecs.releaseReservation(allocator, .{
+                            .ref = c.reserved,
+                            .from_free = c.from_free,
+                        }) catch {};
+                    },
+                    .create_children => |c| {
+                        allocator.free(c.bytes);
+                        var j: usize = c.reserved.len;
+                        while (j > 0) {
+                            j -= 1;
+                            Ecs.releaseReservation(allocator, .{
+                                .ref = c.reserved[j],
+                                .from_free = c.from_free[j],
+                            }) catch {};
+                        }
+                        allocator.free(c.reserved);
+                        allocator.free(c.from_free);
+                    },
                     .destroy => |ref| Ecs.clearPending(ref.id),
                     .migrate => |m| Ecs.clearPending(m.ref.id),
+                    .reparent => |r| {
+                        Ecs.clearPending(r.ref.id);
+                        if (r.ref.id < Ecs.entityStateLen()) {
+                            Ecs.entity_pending_parent.items[r.ref.id] = NO_ENTITY;
+                        }
+                    },
                     .destroy_page => |arch| {
                         inline for (0..ARCH_COUNT) |k| {
                             if (arch == k) {
@@ -2266,8 +3668,24 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_archetype = .empty;
             Ecs.entity_row.deinit(allocator);
             Ecs.entity_row = .empty;
-            Ecs.entity_state_words.deinit(allocator);
-            Ecs.entity_state_words = .empty;
+            Ecs.entity_states.deinit(allocator);
+            Ecs.entity_states = .empty;
+            Ecs.entity_parent.deinit(allocator);
+            Ecs.entity_parent = .empty;
+            Ecs.entity_first_child.deinit(allocator);
+            Ecs.entity_first_child = .empty;
+            Ecs.entity_next_sibling.deinit(allocator);
+            Ecs.entity_next_sibling = .empty;
+            Ecs.entity_prev_sibling.deinit(allocator);
+            Ecs.entity_prev_sibling = .empty;
+            Ecs.entity_depth.deinit(allocator);
+            Ecs.entity_depth = .empty;
+            Ecs.entity_pending_parent.deinit(allocator);
+            Ecs.entity_pending_parent = .empty;
+            Ecs.zone_scratch_perm.deinit(allocator);
+            Ecs.zone_scratch_perm = .empty;
+            Ecs.zone_scratch_visited.deinit(allocator);
+            Ecs.zone_scratch_visited = .empty;
             Ecs.free_ids.deinit(allocator);
             Ecs.free_ids = .empty;
         }
@@ -2322,7 +3740,7 @@ test "entity create destroy and slot reuse" {
     const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
     try std.testing.expect(created.exists());
     try std.testing.expect(created.isAlive());
-    try std.testing.expect(created.state() == .none);
+    try std.testing.expect(created.state().isIdle());
     try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 1);
     const data = Ecs.storage(&[_]type{ Pos, Vel });
     const row = try created.indexOf();
@@ -2340,7 +3758,7 @@ test "entity create destroy and slot reuse" {
     try std.testing.expect(recycled.id == created.id);
     try std.testing.expect(recycled.gen == created.gen +% 1);
     try std.testing.expect(recycled.isAlive());
-    try std.testing.expect(recycled.state() == .none);
+    try std.testing.expect(recycled.state().isIdle());
 }
 test "entity migrate copies shared components" {
     const Ecs = ECS(.{ .{ Pos, Vel }, .{ Pos, Health } });
@@ -2352,7 +3770,7 @@ test "entity migrate copies shared components" {
     (try source_data.get(Vel, 0)).horizontal_speed = 1.5;
     const migrated = try created.migrate(allocator, &[_]type{ Pos, Health }, true);
     try std.testing.expect(migrated.isAlive());
-    try std.testing.expect(migrated.state() == .none);
+    try std.testing.expect(migrated.state().isIdle());
     try std.testing.expect(!created.isAlive());
     try std.testing.expect(try migrated.archetypeOf() == Ecs.archetypeId(&[_]type{ Pos, Health }));
     try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 0);
@@ -2559,7 +3977,7 @@ test "schedule runs systems in order and applies commands between them" {
     const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
     const S = struct {
         fn spawn(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
                 .horizontal_coordinate = 1,
                 .vertical_coordinate = 2,
             }});
@@ -2567,7 +3985,7 @@ test "schedule runs systems in order and applies commands between them" {
         fn check_and_spawn(h: *Ecs.SystemHandler) anyerror!void {
             // Spawned by the previous system, flushed before this one.
             try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
-            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
                 .horizontal_coordinate = 3,
                 .vertical_coordinate = 4,
             }});
@@ -2595,7 +4013,7 @@ test "deferred migrate rejects a second queued command" {
     const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
     const S = struct {
         fn setup(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+            _ = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
                 Pos{ .horizontal_coordinate = 9, .vertical_coordinate = 0 },
                 Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
             });
@@ -2611,7 +4029,7 @@ test "deferred migrate rejects a second queued command" {
             }
             const ref = target.?;
             try h.cmdMigrate(ref, &[_]type{Pos}, true);
-            try std.testing.expect(ref.state() == .pending_migrate);
+            try std.testing.expect(ref.state().pending_migrate);
             // Same slot destroyed right after: rejected at queue time,
             // so a migrate-pending entity can never become destroy-pending.
             try std.testing.expectError(
@@ -2634,7 +4052,7 @@ test "deferred migrate rejects a second queued command" {
                     found = true;
                 }
                 for (page.entities()) |ref| {
-                    try std.testing.expect(ref.state() == .none);
+                    try std.testing.expect(ref.state().isIdle());
                 }
             }
             try std.testing.expect(found);
@@ -2650,7 +4068,7 @@ test "pending flags are cleared when a failing system discards commands" {
     const CustomError = error{Boom};
     const S = struct {
         fn spawn(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
                 .horizontal_coordinate = 1,
                 .vertical_coordinate = 1,
             }});
@@ -2663,7 +4081,7 @@ test "pending flags are cleared when a failing system discards commands" {
                 }
             }
             try h.cmdDestroy(target.?);
-            try std.testing.expect(target.?.state() == .pending_destroy);
+            try std.testing.expect(target.?.state().pending_destroy);
             return CustomError.Boom;
         }
         fn retry_destroy(h: *Ecs.SystemHandler) anyerror!void {
@@ -2688,7 +4106,7 @@ test "pending flags are cleared when a failing system discards commands" {
     try std.testing.expect(Ecs.count(&[_]type{Pos}) == 1);
     try Recovery.run(allocator);
 }
-test "entity states are densely packed four per byte" {
+test "entity states are one flag-packed byte per slot" {
     const Ecs = ECS(.{.{Pos}});
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
@@ -2696,31 +4114,35 @@ test "entity states are densely packed four per byte" {
     for (0..5) |i| {
         refs[i] = try Ecs.create(allocator, &[_]type{Pos});
     }
-    // 5 slots fit into 2 bytes.
-    try std.testing.expect(Ecs.entity_state_words.items.len == 2);
-    // Setting one slot must not clobber its neighbours in the same byte.
-    Ecs.setEntityState(refs[1].id, .pending_destroy);
-    Ecs.setEntityState(refs[2].id, .pending_migrate);
-    try std.testing.expect(Ecs.getEntityState(refs[0].id) == .none);
-    try std.testing.expect(Ecs.getEntityState(refs[1].id) == .pending_destroy);
-    try std.testing.expect(Ecs.getEntityState(refs[2].id) == .pending_migrate);
-    try std.testing.expect(Ecs.getEntityState(refs[3].id) == .none);
-    try std.testing.expect(Ecs.getEntityState(refs[4].id) == .none);
-    try std.testing.expect(refs[1].state() == .pending_destroy);
+    // One packed struct per slot; every slot starts idle.
+    try std.testing.expect(Ecs.entity_states.items.len == 5);
+    for (refs) |ref| {
+        try std.testing.expect(ref.state().isIdle());
+    }
+    // Flags are independent: setting one kind must not affect the others.
+    Ecs.setEntityState(refs[1].id, .{ .pending_destroy = true });
+    Ecs.setEntityState(refs[2].id, .{ .pending_migrate = true });
+    try std.testing.expect(Ecs.getEntityState(refs[0].id).isIdle());
+    try std.testing.expect(Ecs.getEntityState(refs[1].id).pending_destroy);
+    try std.testing.expect(!Ecs.getEntityState(refs[1].id).pending_migrate);
+    try std.testing.expect(Ecs.getEntityState(refs[2].id).pending_migrate);
+    try std.testing.expect(Ecs.getEntityState(refs[3].id).isIdle());
+    try std.testing.expect(Ecs.getEntityState(refs[4].id).isIdle());
+    try std.testing.expect(refs[1].state().pending_destroy);
     Ecs.clearPending(refs[1].id);
     Ecs.clearPending(refs[2].id);
-    try std.testing.expect(refs[1].state() == .none);
-    try std.testing.expect(Ecs.entity_state_words.items[0] == 0);
+    try std.testing.expect(refs[1].state().isIdle());
+    try std.testing.expect(refs[2].state().isIdle());
 }
 test "bulk commands create and destroy pages" {
     const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
     const S = struct {
         fn spawn_many(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+            _ = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
                 .horizontal_coordinate = 5,
                 .vertical_coordinate = 6,
             }}, 3);
-            try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+            _ = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
                 Pos{ .horizontal_coordinate = 7, .vertical_coordinate = 8 },
                 Vel{ .horizontal_speed = 1, .vertical_speed = 2 },
             });
@@ -2747,13 +4169,13 @@ test "failing system discards its commands and propagates anyerror" {
     const CustomError = error{Boom};
     const S = struct {
         fn ok_spawn(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
                 .horizontal_coordinate = 1,
                 .vertical_coordinate = 1,
             }});
         }
         fn failing(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
                 .horizontal_coordinate = 2,
                 .vertical_coordinate = 2,
             }});
@@ -2841,4 +4263,1021 @@ test "nonempty bits track migrate and destroy_page" {
     try std.testing.expect(!Ecs.isArchetypeNonEmpty(small));
     try std.testing.expect(Ecs.isArchetypeNonEmpty(big));
     try std.testing.expect(handler.pages(&[_]type{Pos}, null).nonEmptyPages().len == 1);
+}
+/// Verifies the depth-zone invariant of one archetype: zones tile the row
+/// array without gaps, are sorted by depth, every row's `entity_depth` and
+/// `entity_row` match its position, and the entity set is preserved.
+fn expectZonesConsistent(comptime Ecs: type, comptime bundle: anytype) !void {
+    const data = Ecs.storage(bundle);
+    const zones = data.depth_zones.items;
+    var expected_offset: u32 = 0;
+    var prev_depth: ?u32 = null;
+    for (zones) |z| {
+        try std.testing.expect(z.offset == expected_offset);
+        if (prev_depth) |pd| {
+            try std.testing.expect(z.depth > pd);
+        }
+        prev_depth = z.depth;
+        var i: u32 = z.offset;
+        while (i < z.offset + z.len) : (i += 1) {
+            const ref = data.refs.items[i];
+            try std.testing.expect(Ecs.entity_depth.items[ref.id] == z.depth);
+            try std.testing.expect(Ecs.entity_row.items[ref.id] == i);
+        }
+        expected_offset += z.len;
+    }
+    try std.testing.expect(expected_offset == data.refs.items.len);
+}
+test "hierarchy roots share the depth zero zone" {
+    const Ecs = ECS(.{.{ Pos, Vel }});
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    var refs: [5]Ecs.EntityReference = undefined;
+    for (0..5) |i| {
+        refs[i] = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    }
+    _ = refs[0];
+    const data = Ecs.storage(&[_]type{ Pos, Vel });
+    try std.testing.expect(data.depth_zones.items.len == 1);
+    try std.testing.expect(data.depth_zones.items[0].depth == 0);
+    try std.testing.expect(data.depth_zones.items[0].len == 5);
+    try expectZonesConsistent(Ecs, &[_]type{ Pos, Vel });
+}
+test "cmdCreateChild attaches at parent depth plus one" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var parent_ref: ?Ecs.EntityReference = null;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn capture(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.parent_ref = ref;
+                }
+            }
+            const p = S.parent_ref.?;
+            _ = try h.cmdCreateChild(p, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreateChild(p, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const p = S.parent_ref.?;
+            try std.testing.expect(try p.depthOf() == 0);
+            try std.testing.expect(try p.childCount() == 2);
+            var child_refs: [2]Ecs.EntityReference = undefined;
+            var i: usize = 0;
+            var it = p.children();
+            while (it.next()) |c| : (i += 1) {
+                try std.testing.expect(try c.depthOf() == 1);
+                child_refs[i] = c;
+            }
+            try std.testing.expect(i == 2);
+            try std.testing.expect(child_refs[0].nextSibling().?.id == child_refs[1].id);
+            try std.testing.expect(child_refs[1].prevSibling().?.id == child_refs[0].id);
+            try std.testing.expect(child_refs[0].parent().?.id == p.id);
+            try std.testing.expect(child_refs[0].isDescendantOf(p));
+            try std.testing.expect(!p.isDescendantOf(child_refs[0]));
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                try std.testing.expect(page.depthCount() == 2);
+                try std.testing.expect(page.maxDepth().? == 1);
+                try std.testing.expect(page.depthZone(0).?.len == 1);
+                try std.testing.expect(page.depthZone(1).?.len == 2);
+                try std.testing.expect(page.depthZone(2) == null);
+                const z1 = page.zone(1);
+                try std.testing.expect(z1.len() == 2);
+                try std.testing.expect(z1.depth() == 1);
+                try std.testing.expect(z1.entities().len == 2);
+                try std.testing.expect(z1.get(Pos).len == 2);
+                const z0 = page.zoneAt(0);
+                try std.testing.expect(z0.zone.len == 1);
+            }
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.capture, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "reparent updates subtree depth and destroy cascades" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        var d: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            var refs: [2]Ecs.EntityReference = undefined;
+            var i: usize = 0;
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    refs[i] = ref;
+                    i += 1;
+                }
+            }
+            S.a = refs[0];
+            S.d = refs[1];
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 4,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn link(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.a.children();
+            S.b = it.next().?;
+            S.c = it.next().?;
+            try h.cmdReparent(S.c, S.b);
+        }
+        fn verify_and_destroy(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.a.depthOf() == 0);
+            try std.testing.expect(try S.b.depthOf() == 1);
+            try std.testing.expect(try S.c.depthOf() == 2);
+            try std.testing.expect(S.c.parent().?.id == S.b.id);
+            try std.testing.expect(S.c.isDescendantOf(S.a));
+            try std.testing.expect(S.b.isDescendantOf(S.a));
+            try std.testing.expect(!S.a.isDescendantOf(S.c));
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            const data = Ecs.storage(&[_]type{Pos});
+            try std.testing.expect(data.depth_zones.items.len == 3);
+            try std.testing.expect(data.depth_zones.items[2].depth == 2);
+            // Cascade: destroying the root takes b and c down with it.
+            try S.a.destroy(std.testing.allocator);
+            try std.testing.expect(!S.a.isAlive());
+            try std.testing.expect(!S.b.isAlive());
+            try std.testing.expect(!S.c.isAlive());
+            try std.testing.expect(S.d.isAlive());
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            const gen_after = Ecs.entity_generation.items[S.b.id];
+            _ = gen_after;
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.link, S.verify_and_destroy });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+    // Destroyed slots were recycled into the free list; a fresh create must
+    // reuse one of them with no hierarchy leftovers.
+    const fresh = try Ecs.create(allocator, &[_]type{Pos});
+    try std.testing.expect(try fresh.depthOf() == 0);
+    try std.testing.expect(fresh.parent() == null);
+    try std.testing.expect(fresh.firstChild() == null);
+    try std.testing.expect(fresh.nextSibling() == null);
+    try std.testing.expect(fresh.prevSibling() == null);
+    try expectZonesConsistent(Ecs, &[_]type{Pos});
+}
+test "reparent cycle is rejected at command time" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.a = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn attempt(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.a.children();
+            S.b = it.next().?;
+            S.c = it.next().?;
+            // c becomes a child of b; b under c would then be a cycle and is
+            // rejected right here, even though the batch is not applied yet.
+            try h.cmdReparent(S.c, S.b);
+            try std.testing.expectError(
+                Ecs.EcsError.HierarchyCycle,
+                h.cmdReparent(S.b, S.b),
+            );
+            try std.testing.expectError(
+                Ecs.EcsError.HierarchyCycle,
+                h.cmdReparent(S.b, S.c),
+            );
+            try std.testing.expectError(
+                Ecs.EcsError.EntityIsNotAlive,
+                h.cmdReparent(S.b, Ecs.EntityReference{ .id = S.b.id, .gen = S.b.gen +% 1 }),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.b.depthOf() == 1);
+            try std.testing.expect(try S.c.depthOf() == 2);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.attempt, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "reparent pending rejects conflicting commands" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.a = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn attempt(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.a.children();
+            S.b = it.next().?;
+            // Detach: the queued target is NO_ENTITY, but the slot is still
+            // pending, so every structural command on it is rejected.
+            try h.cmdReparent(S.b, null);
+            try std.testing.expect(S.b.state().pending_reparent);
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdDestroy(S.b),
+            );
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdMigrate(S.b, &[_]type{Pos}, true),
+            );
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdReparent(S.b, S.a),
+            );
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdCreateChild(S.b, &[_]type{Pos}, .{Pos{
+                    .horizontal_coordinate = 3,
+                    .vertical_coordinate = 0,
+                }}),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(S.b.parent() == null);
+            try std.testing.expect(try S.b.depthOf() == 0);
+            try std.testing.expect(try S.a.childCount() == 0);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.attempt, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "migrate keeps the entity at its depth zone" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{ Pos, Health } });
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 1, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 1, .vertical_speed = 1 },
+            });
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{ Pos, Vel }, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.a = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.a, &[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 2, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 2, .vertical_speed = 2 },
+            });
+        }
+        fn move(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.a.children();
+            S.b = it.next().?;
+            // Migrate the child to another archetype: depth must be preserved.
+            try h.cmdMigrate(S.b, &[_]type{ Pos, Health }, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            // Migrate bumped the generation, so resolve a fresh handle.
+            const fresh_b = Ecs.EntityReference{
+                .id = S.b.id,
+                .gen = Ecs.entity_generation.items[S.b.id],
+            };
+            try std.testing.expect(fresh_b.isAlive());
+            try std.testing.expect(try fresh_b.depthOf() == 1);
+            try std.testing.expect(fresh_b.parent().?.id == S.a.id);
+            try expectZonesConsistent(Ecs, &[_]type{ Pos, Health });
+            try expectZonesConsistent(Ecs, &[_]type{ Pos, Vel });
+            for (h.pages(&[_]type{ Pos, Health }, null).nonEmptyPages()) |page| {
+                try std.testing.expect(page.depthZone(1).?.len == 1);
+            }
+            for (h.pages(&[_]type{ Pos, Vel }, null).nonEmptyPages()) |page| {
+                try std.testing.expect(page.depthZone(0).?.len == 1);
+            }
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.move, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "descendants iterator walks the subtree pre-order" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        var d: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.a = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn link(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.a.children();
+            S.b = it.next().?;
+            S.d = it.next().?;
+            _ = try h.cmdCreateChild(S.b, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 4,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            var it = S.a.descendants();
+            S.c = it.next().?;
+            // Pre-order: b, then b's child, then d.
+            try std.testing.expect(S.c.id == S.b.id);
+            const grand = it.next().?;
+            try std.testing.expect(try grand.depthOf() == 2);
+            const last = it.next().?;
+            try std.testing.expect(last.id == S.d.id);
+            try std.testing.expect(it.next() == null);
+            // Iterating again restarts at the first descendant.
+            var it2 = S.a.descendants();
+            _ = it2.next().?;
+            try std.testing.expect(it2.next().?.id == grand.id);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.link, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "destroy page cascades subtrees and drains safely" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.a = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn wipe(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroyPage(&[_]type{Pos});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 0);
+            try std.testing.expect(!S.a.isAlive());
+            const data = Ecs.storage(&[_]type{Pos});
+            try std.testing.expect(data.refs.items.len == 0);
+            try std.testing.expect(data.depth_zones.items.len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.wipe, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "bulk create consolidates zones in one pass" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.a = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn link(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.a.children();
+            const b = it.next().?;
+            _ = try h.cmdCreateChild(b, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn spawn_many(h: *Ecs.SystemHandler) anyerror!void {
+            // Batch of roots lands into an archetype that already holds
+            // depths 0, 1 and 2: consolidation must merge into zone 0 while
+            // keeping the deeper zones intact.
+            _ = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 6,
+            }}, 3);
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 7,
+                .vertical_coordinate = 8,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 7);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                try std.testing.expect(page.depthCount() == 3);
+                try std.testing.expect(page.depthZone(0).?.len == 5);
+                try std.testing.expect(page.depthZone(1).?.len == 1);
+                try std.testing.expect(page.depthZone(2).?.len == 1);
+                var sum: i32 = 0;
+                for (page.zone(0).get(Pos)) |pos| {
+                    sum += pos.horizontal_coordinate;
+                }
+                try std.testing.expect(sum == 23);
+            }
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.link, S.spawn_many, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "reparent moves a whole tree deeper across zones" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var r1: Ecs.EntityReference = undefined;
+        var r2: Ecs.EntityReference = undefined;
+        var c1: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            var refs: [2]Ecs.EntityReference = undefined;
+            var i: usize = 0;
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    refs[i] = ref;
+                    i += 1;
+                }
+            }
+            S.r1 = refs[0];
+            S.r2 = refs[1];
+            _ = try h.cmdCreateChild(S.r1, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreateChild(S.r2, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 4,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn link(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.r1.children();
+            S.c1 = it.next().?;
+            // Grandchild under c1, then sink the whole r2 subtree under c1:
+            // r2 goes from depth 0 to 2 and its child from 1 to 3.
+            _ = try h.cmdCreateChild(S.c1, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 0,
+            }});
+            try h.cmdReparent(S.r2, S.c1);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.r1.depthOf() == 0);
+            try std.testing.expect(try S.c1.depthOf() == 1);
+            try std.testing.expect(try S.r2.depthOf() == 2);
+            try std.testing.expect(S.r2.parent().?.id == S.c1.id);
+            var it = S.r2.children();
+            const d1 = it.next().?;
+            try std.testing.expect(try d1.depthOf() == 3);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            const data = Ecs.storage(&[_]type{Pos});
+            try std.testing.expect(data.depth_zones.items.len == 4);
+            try std.testing.expect(data.depth_zones.items[0].depth == 0);
+            try std.testing.expect(data.depth_zones.items[1].depth == 1);
+            try std.testing.expect(data.depth_zones.items[2].depth == 2);
+            try std.testing.expect(data.depth_zones.items[2].len == 2);
+            try std.testing.expect(data.depth_zones.items[3].depth == 3);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.link, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "queued destroy of a cascaded child is skipped" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.r = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn wipe(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.r.children();
+            S.c = it.next().?;
+            // Destroy parent first: its cascade frees the child, so the
+            // child's queued destroy must be skipped silently at flush.
+            try h.cmdDestroy(S.r);
+            try h.cmdDestroy(S.c);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 0);
+            try std.testing.expect(!S.r.isAlive());
+            try std.testing.expect(!S.c.isAlive());
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.build, S.wipe, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "failing system discards queued reparent" {
+    const Ecs = ECS(.{.{Pos}});
+    const CustomError = error{Boom};
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.r = ref;
+                }
+            }
+            _ = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn queue_then_fail(h: *Ecs.SystemHandler) anyerror!void {
+            var it = S.r.children();
+            S.c = it.next().?;
+            try h.cmdReparent(S.c, null);
+            try std.testing.expect(S.c.state().pending_reparent);
+            return CustomError.Boom;
+        }
+        fn retry_attach(h: *Ecs.SystemHandler) anyerror!void {
+            // Discard above cleared the pending reparent, so the same slot
+            // can be reparented again in a fresh batch.
+            try h.cmdReparent(S.c, S.r);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(S.c.parent().?.id == S.r.id);
+            try std.testing.expect(try S.c.depthOf() == 1);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const Failing = Ecs.Schedule(.{ S.spawn, S.build, S.queue_then_fail });
+    const Recovery = Ecs.Schedule(.{ S.retry_attach, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
+    try Recovery.run(allocator);
+}
+test "reparent to a parent destroyed in the same batch is skipped" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var r1: Ecs.EntityReference = undefined;
+        var r2: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn attempt(h: *Ecs.SystemHandler) anyerror!void {
+            var refs: [2]Ecs.EntityReference = undefined;
+            var i: usize = 0;
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    refs[i] = ref;
+                    i += 1;
+                }
+            }
+            S.r1 = refs[0];
+            S.r2 = refs[1];
+            // Destroy the target parent first, then reparent under it: the
+            // parent is dead by the time the reparent applies, so the
+            // reparent is skipped and r1 stays a root.
+            try h.cmdDestroy(S.r2);
+            try h.cmdReparent(S.r1, S.r2);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+            try std.testing.expect(S.r1.isAlive());
+            try std.testing.expect(S.r1.parent() == null);
+            try std.testing.expect(try S.r1.depthOf() == 0);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.attempt, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "create child under a destroy-pending parent is rejected" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn attempt(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    S.r = ref;
+                }
+            }
+            // Destroying the parent first marks it pending, so attaching a
+            // child under it in the same batch is rejected at queue time.
+            // The already-queued destroy still applies afterwards.
+            try h.cmdDestroy(S.r);
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                    .horizontal_coordinate = 2,
+                    .vertical_coordinate = 0,
+                }}),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 0);
+            try std.testing.expect(!S.r.isAlive());
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.attempt, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdCreate returns a future handle usable as a parent" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            // Reserve and use in the same pass: the handle is not alive yet
+            // but already works as a parent for a queued child.
+            S.a = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            try std.testing.expect(!S.a.isAlive());
+            try std.testing.expect(S.a.state().pending_create);
+            try std.testing.expectError(Ecs.EcsError.EntityIsNotAlive, S.a.depthOf());
+            try std.testing.expectError(Ecs.EcsError.EntityIsNotAlive, S.a.indexOf());
+            S.b = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            try std.testing.expect(!S.b.isAlive());
+            // A reserved handle cannot be destroyed, migrated or reparented.
+            try std.testing.expectError(Ecs.EcsError.EntityIsNotAlive, h.cmdDestroy(S.a));
+            try std.testing.expectError(Ecs.EcsError.EntityIsNotAlive, h.cmdMigrate(S.a, &[_]type{Pos}, true));
+            try std.testing.expectError(Ecs.EcsError.EntityIsNotAlive, h.cmdReparent(S.a, null));
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(S.a.isAlive());
+            try std.testing.expect(S.b.isAlive());
+            try std.testing.expect(S.a.state().isIdle());
+            try std.testing.expect(S.b.state().isIdle());
+            try std.testing.expect(try S.a.depthOf() == 0);
+            try std.testing.expect(try S.b.depthOf() == 1);
+            try std.testing.expect(S.b.parent().?.id == S.a.id);
+            try std.testing.expect(try S.a.childCount() == 1);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "tree is built in one pass from cmdCreate" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.a = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.b = try h.cmdCreateChild(S.a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            S.c = try h.cmdCreateChild(S.b, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.a.depthOf() == 0);
+            try std.testing.expect(try S.b.depthOf() == 1);
+            try std.testing.expect(try S.c.depthOf() == 2);
+            try std.testing.expect(S.c.parent().?.id == S.b.id);
+            try std.testing.expect(S.c.isDescendantOf(S.a));
+            try std.testing.expect(try S.a.childCount() == 1);
+            try std.testing.expect(try S.b.childCount() == 1);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            const data = Ecs.storage(&[_]type{Pos});
+            try std.testing.expect(data.depth_zones.items.len == 3);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdCreateN returns reserved handles chainable as parents" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var refs: [3]Ecs.EntityReference = undefined;
+        var child: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 6,
+            }}, 3);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+                try std.testing.expect(!ref.isAlive());
+                try std.testing.expect(ref.state().pending_create);
+            }
+            S.child = try h.cmdCreateChild(S.refs[0], &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 7,
+                .vertical_coordinate = 8,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 4);
+            for (S.refs) |ref| {
+                try std.testing.expect(ref.isAlive());
+                try std.testing.expect(try ref.depthOf() == 0);
+            }
+            try std.testing.expect(try S.child.depthOf() == 1);
+            try std.testing.expect(S.child.parent().?.id == S.refs[0].id);
+            try std.testing.expect(try S.refs[0].childCount() == 1);
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            var sum: i32 = 0;
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.get(Pos)) |pos| {
+                    sum += pos.horizontal_coordinate;
+                }
+            }
+            try std.testing.expect(sum == 22);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdCreateChildren creates a batch under a parent" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var parent: Ecs.EntityReference = undefined;
+        var children: [3]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.parent = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            const created = try h.cmdCreateChildren(S.parent, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }}, 3);
+            for (created, 0..) |ref, i| {
+                S.children[i] = ref;
+            }
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 4);
+            try std.testing.expect(try S.parent.depthOf() == 0);
+            try std.testing.expect(try S.parent.childCount() == 3);
+            for (S.children) |ref| {
+                try std.testing.expect(try ref.depthOf() == 1);
+                try std.testing.expect(ref.parent().?.id == S.parent.id);
+            }
+            try expectZonesConsistent(Ecs, &[_]type{Pos});
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                try std.testing.expect(page.depthZone(0).?.len == 1);
+                try std.testing.expect(page.depthZone(1).?.len == 3);
+            }
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "discard rolls back reserved slots" {
+    const Ecs = ECS(.{.{Pos}});
+    const CustomError = error{Boom};
+    const S = struct {
+        const S = @This();
+        fn spawn_then_fail(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            return CustomError.Boom;
+        }
+        fn retry(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+        }
+    };
+    const Failing = Ecs.Schedule(.{ S.spawn_then_fail });
+    const Recovery = Ecs.Schedule(.{ S.retry, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
+    // Fresh reservations were rolled back: no slots, no rows left behind.
+    try std.testing.expect(Ecs.count(&[_]type{Pos}) == 0);
+    try std.testing.expect(Ecs.entity_generation.items.len == 0);
+    try Recovery.run(allocator);
+}
+test "discard returns recycled reservations to the free list" {
+    const Ecs = ECS(.{.{Pos}});
+    const CustomError = error{Boom};
+    const S = struct {
+        const S = @This();
+        var victim: Ecs.EntityReference = undefined;
+        fn reserve_then_fail(h: *Ecs.SystemHandler) anyerror!void {
+            // Reserve the recycled slot, then fail before flush.
+            victim = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            return CustomError.Boom;
+        }
+        fn retry(h: *Ecs.SystemHandler) anyerror!void {
+            const b = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            // The same recycled id must be reused after the rollback.
+            try std.testing.expect(b.id == S.victim.id);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
+        }
+    };
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    // Put one entity into the free list, then let the failing system reserve
+    // its recycled slot.
+    const a = try Ecs.create(allocator, &[_]type{Pos});
+    try a.destroy(allocator);
+    const Failing = Ecs.Schedule(.{ S.reserve_then_fail });
+    const Recovery = Ecs.Schedule(.{ S.retry, S.verify });
+    try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
+    try Recovery.run(allocator);
 }

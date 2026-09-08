@@ -1162,9 +1162,9 @@ test "scale: seeded matching equals brute force" {
     try std.testing.expect(handler.pages(&[_]type{Base0}, null).nonEmptyPages().len == 0);
     const S = struct {
         fn spawn(h: *Ecs.SystemHandler) anyerror!void {
-            try h.cmdCreate(.{ Base0, Base1, C0 }, .{ Base0{}, Base1{}, C0{} });
-            try h.cmdCreate(.{ Base0, Base1, C0, C1 }, .{ Base0{}, Base1{}, C0{}, C1{} });
-            try h.cmdCreate(.{ Base0, Base1, C0, C2 }, .{ Base0{}, Base1{}, C0{}, C2{} });
+            _ = try h.cmdCreate(.{ Base0, Base1, C0 }, .{ Base0{}, Base1{}, C0{} });
+            _ = try h.cmdCreate(.{ Base0, Base1, C0, C1 }, .{ Base0{}, Base1{}, C0{}, C1{} });
+            _ = try h.cmdCreate(.{ Base0, Base1, C0, C2 }, .{ Base0{}, Base1{}, C0{}, C2{} });
         }
     };
     try Ecs.Schedule(.{S.spawn}).run(allocator);
