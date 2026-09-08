@@ -83,14 +83,28 @@ pub fn ECS(comptime sets: anytype) type {
         pub const EcsError = std.mem.Allocator.Error || error{
             /// Operation requires a live entity but the reference is stale.
             EntityIsNotAlive,
+            /// Entity already has a queued destroy or migrate in this batch.
+            EntityHasPendingCommand,
             /// Requested position lies outside the storage range.
             IndexOutOfBounds,
             /// Requested component is not stored in this archetype.
             ComponentNotFoundInArchetype,
         };
+        /// Deferred lifecycle state of an entity slot: none, queued for
+        /// destroy, or queued for migrate. Densely packed, 2 bits per slot,
+        /// 4 slots per byte in `entity_state_words`, so one byte answers
+        /// four slots at once.
+        pub const EntityState = enum(u2) {
+            none = 0,
+            pending_destroy = 1,
+            pending_migrate = 2,
+        };
         /// Lightweight entity handle. Stays small enough to copy by value.
+        /// The id is the slot index into the SoA columns below, so no
+        /// separate `Entity` struct is stored: generation, archetype, row
+        /// and pending state are parallel arrays indexed by id.
         pub const EntityReference = packed struct {
-            /// Entity slot id. Matches the record position in storage.
+            /// Entity slot id. Matches the position in the SoA columns.
             id: u24,
             /// Slot generation. Bumped on every destroy and migrate.
             gen: u8,
@@ -100,7 +114,7 @@ pub fn ECS(comptime sets: anytype) type {
             /// Returns `bool` - true when a record slot exists for the id.
             pub fn exists(self: *const EntityReference) bool {
                 const entity_index: u32 = self.id;
-                return entity_index < Ecs.entities.items.len;
+                return entity_index < Ecs.entity_generation.items.len;
             }
             /// Checks whether the reference still points at a live entity.
             /// - `self` - reference to inspect.
@@ -111,22 +125,52 @@ pub fn ECS(comptime sets: anytype) type {
                     return false;
                 }
                 const entity_index: u32 = self.id;
-                const stored: *const Entity = &Ecs.entities.items[entity_index];
-                return stored.reference.gen == self.gen;
+                return Ecs.entity_generation.items[entity_index] == self.gen;
             }
-            /// Loads the full entity record behind this reference.
+            /// Returns the pending lifecycle state of the referenced slot.
+            /// - `self` - reference to inspect.
+            ///
+            /// Returns `EntityState` - queued state, or `none` when the id
+            /// was never assigned (treated as idle, not pending).
+            pub fn state(self: *const EntityReference) EntityState {
+                const entity_index: u32 = self.id;
+                if (entity_index >= Ecs.entityStateLen()) {
+                    return .none;
+                }
+                return Ecs.getEntityState(entity_index);
+            }
+            /// Loads a fresh handle for the same id behind this reference.
+            /// Useful to refresh a stale copy after a migrate.
             /// - `self` - reference to resolve.
             ///
-            /// Returns `?Entity` - stored record copy, or null when not alive.
-            pub fn entity(self: *const EntityReference) ?Entity {
+            /// Returns `?EntityReference` - live handle, or null when not alive.
+            pub fn entity(self: *const EntityReference) ?EntityReference {
                 if (!self.isAlive()) {
                     return null;
                 }
+                return self.*;
+            }
+            /// Returns the archetype currently owning the entity.
+            /// - `self` - reference to resolve. Must be alive.
+            pub fn archetypeOf(self: *const EntityReference) EcsError!u32 {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
                 const entity_index: u32 = self.id;
-                return Ecs.entities.items[entity_index];
+                return Ecs.entity_archetype.items[entity_index];
+            }
+            /// Returns the row position inside the owning archetype storage.
+            /// - `self` - reference to resolve. Must be alive.
+            pub fn indexOf(self: *const EntityReference) EcsError!u32 {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                const entity_index: u32 = self.id;
+                return Ecs.entity_row.items[entity_index];
             }
             /// Destroys the referenced entity and recycles its slot.
-            /// Private: structural changes run only via commands flushed by the scheduler.
+            /// Immediate variant used by command flushing. Clears any pending
+            /// state left by the queueing command.
             /// - `self` - reference to destroy. Must be alive.
             /// - `allocator` - funds the free-slot bookkeeping.
             fn destroy(self: *const EntityReference, allocator: std.mem.Allocator) EcsError!void {
@@ -134,9 +178,8 @@ pub fn ECS(comptime sets: anytype) type {
                     return EcsError.EntityIsNotAlive;
                 }
                 const entity_index: u32 = self.id;
-                const record: *Entity = &Ecs.entities.items[entity_index];
-                const arch: u32 = record.archetype;
-                const index: u32 = record.index;
+                const arch: u32 = Ecs.entity_archetype.items[entity_index];
+                const index: u32 = Ecs.entity_row.items[entity_index];
                 const displaced: ?EntityReference = blk: {
                     inline for (0..ARCH_COUNT) |k| {
                         if (arch == k) {
@@ -147,9 +190,10 @@ pub fn ECS(comptime sets: anytype) type {
                 };
                 if (displaced) |relocated| {
                     const relocated_index: u32 = relocated.id;
-                    Ecs.entities.items[relocated_index].index = index;
+                    Ecs.entity_row.items[relocated_index] = index;
                 }
-                record.reference.gen +%= 1;
+                Ecs.entity_generation.items[entity_index] +%= 1;
+                Ecs.setEntityState(entity_index, .none);
                 try Ecs.free_ids.append(allocator, entity_index);
             }
             /// Moves the entity into another archetype, optionally copying shared data.
@@ -158,14 +202,14 @@ pub fn ECS(comptime sets: anytype) type {
             /// - `dest` - component bundle of the destination archetype. Must be declared in `ECS(...)`.
             /// - `copy` - when true, shared component values are carried over.
             ///
-            /// Returns `Entity` - refreshed record with a bumped generation.
+            /// Returns `EntityReference` - refreshed handle with a bumped generation.
             /// Private: structural changes run only via commands flushed by the scheduler.
             fn migrate(
                 self: *const EntityReference,
                 allocator: std.mem.Allocator,
                 comptime dest: anytype,
                 copy: bool,
-            ) EcsError!Entity {
+            ) EcsError!EntityReference {
                 const dest_id = comptime Ecs.archetypeId(dest);
                 return self.migrateById(allocator, dest_id, copy);
             }
@@ -175,21 +219,20 @@ pub fn ECS(comptime sets: anytype) type {
             /// - `dest_id` - destination archetype id, an index into `archetypes`.
             /// - `copy` - when true, shared component values are carried over.
             ///
-            /// Returns `Entity` - refreshed record with a bumped generation.
+            /// Returns `EntityReference` - refreshed handle with a bumped generation.
             /// Private: structural changes run only via commands flushed by the scheduler.
             fn migrateById(
                 self: *const EntityReference,
                 allocator: std.mem.Allocator,
                 dest_id: u32,
                 copy: bool,
-            ) EcsError!Entity {
+            ) EcsError!EntityReference {
                 if (!self.isAlive()) {
                     return EcsError.EntityIsNotAlive;
                 }
                 const entity_index: u32 = self.id;
-                const record: *Entity = &Ecs.entities.items[entity_index];
-                const source_id: u32 = record.archetype;
-                const source_index: u32 = record.index;
+                const source_id: u32 = Ecs.entity_archetype.items[entity_index];
+                const source_index: u32 = Ecs.entity_row.items[entity_index];
                 const next = EntityReference{
                     .id = self.id,
                     .gen = self.gen +% 1,
@@ -220,44 +263,13 @@ pub fn ECS(comptime sets: anytype) type {
                 };
                 if (displaced) |relocated| {
                     const relocated_index: u32 = relocated.id;
-                    Ecs.entities.items[relocated_index].index =
-                        source_index;
+                    Ecs.entity_row.items[relocated_index] = source_index;
                 }
-                record.reference = next;
-                record.archetype = dest_id;
-                record.index = dest_index;
-                return record.*;
-            }
-        };
-        /// Full entity record stored in global storage.
-        pub const Entity = struct {
-            /// Handle identifying this entity. Stale copies compare unequal.
-            reference: EntityReference,
-            /// Id of the archetype currently owning the component data.
-            archetype: u32,
-            /// Row position inside the owning archetype storage.
-            index: u32,
-            /// Checks whether this id was ever assigned to an entity.
-            /// - `self` - entity copy to inspect.
-            ///
-            /// Returns `bool` - true when a record slot exists for the id.
-            pub fn exists(self: *const Entity) bool {
-                return self.reference.exists();
-            }
-            /// Checks whether the entity still points at a live record.
-            /// - `self` - entity copy to inspect.
-            ///
-            /// Returns `bool` - true when the slot exists and generations match.
-            pub fn isAlive(self: *const Entity) bool {
-                return self.reference.isAlive();
-            }
-            /// Loads a fresh copy of the entity record behind this reference.
-            /// Useful to refresh a stale copy after a migrate.
-            /// - `self` - entity copy to resolve.
-            ///
-            /// Returns `?Entity` - fresh record copy, or null when not alive.
-            pub fn entity(self: *const Entity) ?Entity {
-                return self.reference.entity();
+                Ecs.entity_generation.items[entity_index] = next.gen;
+                Ecs.entity_archetype.items[entity_index] = dest_id;
+                Ecs.entity_row.items[entity_index] = dest_index;
+                Ecs.setEntityState(entity_index, .none);
+                return next;
             }
         };
         /// Static descriptor of a single component type. Immutable, built once in comptime.
@@ -686,8 +698,8 @@ pub fn ECS(comptime sets: anytype) type {
             if (@typeInfo(T) != .@"struct") {
                 @compileError("Every component must be a struct type.");
             }
-            if (T == Entity or T == EntityReference) {
-                @compileError("Entity and EntityReference cannot be components.");
+            if (T == EntityReference) {
+                @compileError("EntityReference cannot be a component.");
             }
             buf[start] = T;
             return start + 1;
@@ -1083,12 +1095,84 @@ pub fn ECS(comptime sets: anytype) type {
             }
             break :blk tmp;
         };
-        /// Next fresh entity id. Equals the record count while no slots are recycled.
-        var next_entity_id: u32 = 0;
-        /// All entity records by id. A record id always matches its position here.
-        var entities: std.ArrayListUnmanaged(Entity) = .empty;
+        /// Entity slots in SoA form. Position `id` in every column describes
+        /// one slot: `entity_generation[id]` is the live generation,
+        /// `entity_archetype[id]` owns the row, `entity_row[id]` is the row.
+        /// Pending lifecycle states live densely packed in
+        /// `entity_state_words`, 2 bits per slot, 4 slots per byte.
+        /// A slot id always equals its position; ids are never stored.
+        var entity_generation: std.ArrayListUnmanaged(u8) = .empty;
+        /// Owning archetype per slot, parallel to `entity_generation`.
+        var entity_archetype: std.ArrayListUnmanaged(u32) = .empty;
+        /// Row inside the owning archetype storage, parallel to `entity_generation`.
+        var entity_row: std.ArrayListUnmanaged(u32) = .empty;
+        /// Packed pending states, 4 slots per byte, 2 bits per slot.
+        /// Length is `ceil(entityStateLen() / 4)`; slot `id` uses bits
+        /// `2 * (id % 4)` of `words[id / 4]`.
+        var entity_state_words: std.ArrayListUnmanaged(u8) = .empty;
         /// Stack of freed entity ids ready for reuse.
         var free_ids: std.ArrayListUnmanaged(u32) = .empty;
+        /// Counts entity slots. Backs the packed state store length.
+        /// - Returns `usize` - number of slots ever assigned.
+        fn entityStateLen() usize {
+            return Ecs.entity_generation.items.len;
+        }
+        /// Reads one packed 2-bit state. Caller must ensure `id` is in range.
+        /// - `entity_index` - slot id to read.
+        ///
+        /// Returns `EntityState` - stored state of the slot.
+        fn getEntityState(entity_index: u32) EntityState {
+            const word: u8 = Ecs.entity_state_words.items[entity_index >> 2];
+            const shift: u3 = @intCast((entity_index & 3) * 2);
+            const bits: u2 = @intCast((word >> shift) & 0b11);
+            return @enumFromInt(bits);
+        }
+        /// Writes one packed 2-bit state. Caller must ensure `id` is in range
+        /// and words already cover it (see `ensureStateWords`).
+        /// - `entity_index` - slot id to write.
+        /// - `next` - pending state to store.
+        fn setEntityState(entity_index: u32, next: EntityState) void {
+            const slot: *u8 = &Ecs.entity_state_words.items[entity_index >> 2];
+            const shift: u3 = @intCast((entity_index & 3) * 2);
+            const mask: u8 = @as(u8, 0b11) << shift;
+            slot.* = (slot.* & ~mask) | (@as(u8, @intFromEnum(next)) << shift);
+        }
+        /// Grows the packed words with zero (`none`) bytes to cover `slot_count` slots.
+        /// - `allocator` - funds the growth.
+        /// - `slot_count` - number of slots that must be addressable afterwards.
+        fn ensureStateWords(allocator: std.mem.Allocator, slot_count: usize) EcsError!void {
+            const need: usize = (slot_count + 3) >> 2;
+            const have: usize = Ecs.entity_state_words.items.len;
+            if (need > have) {
+                try Ecs.entity_state_words.appendNTimes(allocator, 0, need - have);
+            }
+        }
+        /// Requires the referenced slot to be alive and idle (no queued command).
+        /// - `ref` - entity reference to validate.
+        fn requireIdle(ref: EntityReference) EcsError!u32 {
+            if (!ref.isAlive()) {
+                return EcsError.EntityIsNotAlive;
+            }
+            const entity_index: u32 = ref.id;
+            if (Ecs.getEntityState(entity_index) != .none) {
+                return EcsError.EntityHasPendingCommand;
+            }
+            return entity_index;
+        }
+        /// Marks a slot as pending. Caller must have validated via `requireIdle`.
+        /// - `entity_index` - slot id to mark.
+        /// - `next` - pending state to store.
+        fn markPending(entity_index: u32, next: EntityState) void {
+            Ecs.setEntityState(entity_index, next);
+        }
+        /// Clears the pending flag of a slot, ignoring never-assigned ids.
+        /// Used when discarding queued commands after a failing system.
+        /// - `entity_index` - slot id to release.
+        fn clearPending(entity_index: u32) void {
+            if (entity_index < Ecs.entityStateLen()) {
+                Ecs.setEntityState(entity_index, .none);
+            }
+        }
         /// Names the storage type of one archetype id. Useful to name the
         /// pointer returned by `storage` without repeating the lookup.
         /// - `id` - archetype id. Must be comptime-known.
@@ -1113,11 +1197,11 @@ pub fn ECS(comptime sets: anytype) type {
         /// - `allocator` - funds record and archetype row allocation.
         /// - `types` - component bundle of the destination archetype. Must be declared in `ECS(...)`.
         ///
-        /// Returns `Entity` - freshly stored record copy.
+        /// Returns `EntityReference` - handle of the new entity.
         fn create(
             allocator: std.mem.Allocator,
             comptime types: anytype,
-        ) EcsError!Entity {
+        ) EcsError!EntityReference {
             const id = comptime archetypeId(types);
             return Ecs.createById(allocator, id);
         }
@@ -1126,28 +1210,19 @@ pub fn ECS(comptime sets: anytype) type {
         /// - `allocator` - funds record and archetype row allocation.
         /// - `id` - destination archetype id, an index into `archetypes`.
         ///
-        /// Returns `Entity` - freshly stored record copy.
-        fn createById(allocator: std.mem.Allocator, id: u32) EcsError!Entity {
+        /// Returns `EntityReference` - handle of the new entity.
+        fn createById(allocator: std.mem.Allocator, id: u32) EcsError!EntityReference {
             var new_id: u32 = 0;
             var new_gen: u8 = 0;
-            var slot: *Entity = undefined;
             if (Ecs.free_ids.pop()) |recycled| {
                 new_id = recycled;
-                slot = &Ecs.entities.items[new_id];
-                new_gen = slot.reference.gen;
+                new_gen = Ecs.entity_generation.items[new_id];
             } else {
-                new_id = Ecs.next_entity_id;
-                Ecs.next_entity_id += 1;
-                const placeholder = Entity{
-                    .reference = EntityReference{
-                        .id = @intCast(new_id),
-                        .gen = 0,
-                    },
-                    .archetype = id,
-                    .index = 0,
-                };
-                try Ecs.entities.append(allocator, placeholder);
-                slot = &Ecs.entities.items[new_id];
+                new_id = @intCast(Ecs.entity_generation.items.len);
+                try Ecs.entity_generation.append(allocator, 0);
+                try Ecs.entity_archetype.append(allocator, id);
+                try Ecs.entity_row.append(allocator, 0);
+                try Ecs.ensureStateWords(allocator, Ecs.entity_generation.items.len);
                 new_gen = 0;
             }
             const reference = EntityReference{
@@ -1162,10 +1237,11 @@ pub fn ECS(comptime sets: anytype) type {
                 }
                 unreachable;
             };
-            slot.reference = reference;
-            slot.archetype = id;
-            slot.index = index;
-            return slot.*;
+            Ecs.entity_generation.items[new_id] = new_gen;
+            Ecs.entity_archetype.items[new_id] = id;
+            Ecs.entity_row.items[new_id] = index;
+            Ecs.setEntityState(new_id, .none);
+            return reference;
         }
         /// Counts entities stored in the given archetype.
         /// - `types` - component bundle. Must exactly match a declared archetype.
@@ -1524,8 +1600,11 @@ pub fn ECS(comptime sets: anytype) type {
                     return EcsError.EntityIsNotAlive;
                 }
                 const entity_index: u32 = ref.id;
-                const record: *const Entity = &Ecs.entities.items[entity_index];
-                return Ecs.getComponent(record.archetype, T, record.index);
+                return Ecs.getComponent(
+                    Ecs.entity_archetype.items[entity_index],
+                    T,
+                    Ecs.entity_row.items[entity_index],
+                );
             }
             /// Queues entity creation. Applied after the current system finishes.
             /// - `self` - handler of the running system.
@@ -1570,14 +1649,20 @@ pub fn ECS(comptime sets: anytype) type {
                 }
             }
             /// Queues entity destruction. Applied after the current system finishes.
-            /// Stale references are silently skipped at apply time.
+            /// Fails with `EntityIsNotAlive` when the reference is stale and
+            /// with `EntityHasPendingCommand` when the slot already has a
+            /// queued destroy or migrate: one load of `entity_state`.
             /// - `self` - handler of the running system.
             /// - `ref` - entity reference to destroy.
             pub fn cmdDestroy(self: *const SystemHandler, ref: EntityReference) EcsError!void {
+                const entity_index = try Ecs.requireIdle(ref);
                 try Ecs.commands.append(self.allocator, .{ .destroy = ref });
+                Ecs.markPending(entity_index, .pending_destroy);
             }
             /// Queues entity migration into another archetype.
-            /// Stale references are silently skipped at apply time.
+            /// Same strictness as `cmdDestroy`: stale or already-pending
+            /// slots are rejected at queue time, so a migrate of a
+            /// destroy-pending entity can never be queued.
             /// - `self` - handler of the running system.
             /// - `ref` - entity reference to move.
             /// - `dest` - component bundle of the destination archetype.
@@ -1588,15 +1673,19 @@ pub fn ECS(comptime sets: anytype) type {
                 comptime dest: anytype,
                 copy: bool,
             ) EcsError!void {
+                const entity_index = try Ecs.requireIdle(ref);
                 const dest_id: u32 = @intCast(comptime archetypeId(dest));
                 try Ecs.commands.append(self.allocator, .{ .migrate = .{
                     .ref = ref,
                     .dest = dest_id,
                     .copy = copy,
                 } });
+                Ecs.markPending(entity_index, .pending_migrate);
             }
             /// Queues destruction of every entity on pages matching `include`
             /// and `exclude`. Applied after the current system finishes.
+            /// Each row is validated like `cmdDestroy`, so an already-pending
+            /// row aborts the whole batch with `EntityHasPendingCommand`.
             /// - `self` - handler of the running system.
             /// - `include` - component bundle that must be present.
             /// - `exclude` - component bundle that must be absent.
@@ -1608,12 +1697,16 @@ pub fn ECS(comptime sets: anytype) type {
                 var it = self.pages(include, exclude);
                 while (it.next()) |p| {
                     for (p.entities()) |ref| {
+                        const entity_index = try Ecs.requireIdle(ref);
                         try Ecs.commands.append(self.allocator, .{ .destroy = ref });
+                        Ecs.markPending(entity_index, .pending_destroy);
                     }
                 }
             }
             /// Queues destruction of every entity in one exact archetype.
-            /// Applied after the current system finishes.
+            /// Applied after the current system finishes. Marks every row
+            /// pending up front, so a later `cmdDestroy`/`cmdMigrate` of the
+            /// same slot fails instead of duplicating the command.
             /// - `self` - handler of the running system.
             /// - `bundle` - component bundle. Must exactly match a declared archetype.
             pub fn cmdDestroyPage(
@@ -1621,6 +1714,15 @@ pub fn ECS(comptime sets: anytype) type {
                 comptime bundle: anytype,
             ) EcsError!void {
                 const id: u32 = @intCast(comptime archetypeId(bundle));
+                inline for (0..ARCH_COUNT) |k| {
+                    if (id == k) {
+                        for (Ecs.storages[k].refs.items) |ref| {
+                            const entity_index = try Ecs.requireIdle(ref);
+                            Ecs.markPending(entity_index, .pending_destroy);
+                        }
+                        break;
+                    }
+                }
                 try Ecs.commands.append(self.allocator, .{ .destroy_page = id });
             }
         };
@@ -1690,8 +1792,8 @@ pub fn ECS(comptime sets: anytype) type {
                         if (@typeInfo(FT) != .@"struct") {
                             @compileError("Every value must be a struct value.");
                         }
-                        if (FT == Entity or FT == EntityReference) {
-                            @compileError("Entity and EntityReference cannot be components.");
+                        if (FT == EntityReference) {
+                            @compileError("EntityReference cannot be a component.");
                         }
                         if (FT == T) {
                             found += 1;
@@ -1724,6 +1826,9 @@ pub fn ECS(comptime sets: anytype) type {
             return blob;
         }
         /// Applies every queued command in FIFO order, then clears the queue.
+        /// Queue-time validation (`requireIdle`) already rejected duplicates,
+        /// so flush only keeps a defensive `isAlive` guard. Immediate
+        /// `destroy`/`migrateById` clear the pending flag they resolve.
         /// Private: runs automatically between systems; never call it directly,
         /// or pages held by user code may dangle after reallocation.
         /// - `allocator` - allocator that funded the queue and the changes.
@@ -1734,11 +1839,12 @@ pub fn ECS(comptime sets: anytype) type {
                     .create => |c| {
                         errdefer allocator.free(c.bytes);
                         const created = try Ecs.createById(allocator, c.arch);
+                        const created_row: u32 = Ecs.entity_row.items[created.id];
                         inline for (0..ARCH_COUNT) |k| {
                             if (c.arch == k) {
                                 var off: usize = 0;
                                 inline for (0..Tables.arch_lens[k]) |col| {
-                                    const dst = std.mem.asBytes(&Ecs.storages[k].lists[col].items[created.index]);
+                                    const dst = std.mem.asBytes(&Ecs.storages[k].lists[col].items[created_row]);
                                     @memcpy(dst, c.bytes[off..][0..dst.len]);
                                     off += dst.len;
                                 }
@@ -1749,11 +1855,15 @@ pub fn ECS(comptime sets: anytype) type {
                     .destroy => |ref| {
                         if (ref.isAlive()) {
                             try ref.destroy(allocator);
+                        } else {
+                            Ecs.clearPending(ref.id);
                         }
                     },
                     .migrate => |m| {
                         if (m.ref.isAlive()) {
                             _ = try m.ref.migrateById(allocator, m.dest, m.copy);
+                        } else {
+                            Ecs.clearPending(m.ref.id);
                         }
                     },
                     .destroy_page => |arch| {
@@ -1761,7 +1871,8 @@ pub fn ECS(comptime sets: anytype) type {
                             if (arch == k) {
                                 for (Ecs.storages[k].refs.items) |ref| {
                                     const entity_index: u32 = ref.id;
-                                    Ecs.entities.items[entity_index].reference.gen +%= 1;
+                                    Ecs.entity_generation.items[entity_index] +%= 1;
+                                    Ecs.setEntityState(entity_index, .none);
                                     try Ecs.free_ids.append(allocator, entity_index);
                                 }
                                 inline for (0..Tables.arch_lens[k]) |col| {
@@ -1774,13 +1885,25 @@ pub fn ECS(comptime sets: anytype) type {
                 }
             }
         }
-        /// Drops every queued command without applying it, freeing create blobs.
-        /// Used when a system fails and on teardown.
+        /// Drops every queued command without applying it, freeing create blobs
+        /// and releasing the pending flags set at queue time. Used when a
+        /// system fails and on teardown.
         /// - `allocator` - allocator that funded the queue.
         fn discardCommands(allocator: std.mem.Allocator) void {
             for (Ecs.commands.items) |cmd| {
-                if (cmd == .create) {
-                    allocator.free(cmd.create.bytes);
+                switch (cmd) {
+                    .create => allocator.free(cmd.create.bytes),
+                    .destroy => |ref| Ecs.clearPending(ref.id),
+                    .migrate => |m| Ecs.clearPending(m.ref.id),
+                    .destroy_page => |arch| {
+                        inline for (0..ARCH_COUNT) |k| {
+                            if (arch == k) {
+                                for (Ecs.storages[k].refs.items) |ref| {
+                                    Ecs.clearPending(ref.id);
+                                }
+                            }
+                        }
+                    },
                 }
             }
             Ecs.commands.clearRetainingCapacity();
@@ -1848,11 +1971,16 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.discardCommands(allocator);
             Ecs.commands.deinit(allocator);
             Ecs.commands = .empty;
-            Ecs.entities.deinit(allocator);
-            Ecs.entities = .empty;
+            Ecs.entity_generation.deinit(allocator);
+            Ecs.entity_generation = .empty;
+            Ecs.entity_archetype.deinit(allocator);
+            Ecs.entity_archetype = .empty;
+            Ecs.entity_row.deinit(allocator);
+            Ecs.entity_row = .empty;
+            Ecs.entity_state_words.deinit(allocator);
+            Ecs.entity_state_words = .empty;
             Ecs.free_ids.deinit(allocator);
             Ecs.free_ids = .empty;
-            Ecs.next_entity_id = 0;
         }
     };
 }
@@ -1903,24 +2031,27 @@ test "entity create destroy and slot reuse" {
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
     const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
-    try std.testing.expect(created.reference.exists());
-    try std.testing.expect(created.reference.isAlive());
+    try std.testing.expect(created.exists());
+    try std.testing.expect(created.isAlive());
+    try std.testing.expect(created.state() == .none);
     try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 1);
     const data = Ecs.storage(&[_]type{ Pos, Vel });
-    const pos: *Pos = try data.get(Pos, created.index);
+    const row = try created.indexOf();
+    const pos: *Pos = try data.get(Pos, row);
     pos.horizontal_coordinate = 10;
-    try created.reference.destroy(allocator);
-    try std.testing.expect(created.reference.exists());
-    try std.testing.expect(!created.reference.isAlive());
+    try created.destroy(allocator);
+    try std.testing.expect(created.exists());
+    try std.testing.expect(!created.isAlive());
     try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 0);
     try std.testing.expectError(
         Ecs.EcsError.EntityIsNotAlive,
-        created.reference.destroy(allocator),
+        created.destroy(allocator),
     );
     const recycled = try Ecs.create(allocator, &[_]type{ Pos, Vel });
-    try std.testing.expect(recycled.reference.id == created.reference.id);
-    try std.testing.expect(recycled.reference.gen == created.reference.gen +% 1);
-    try std.testing.expect(recycled.reference.isAlive());
+    try std.testing.expect(recycled.id == created.id);
+    try std.testing.expect(recycled.gen == created.gen +% 1);
+    try std.testing.expect(recycled.isAlive());
+    try std.testing.expect(recycled.state() == .none);
 }
 test "entity migrate copies shared components" {
     const Ecs = ECS(.{ .{ Pos, Vel }, .{ Pos, Health } });
@@ -1930,9 +2061,11 @@ test "entity migrate copies shared components" {
     const source_data = Ecs.storage(&[_]type{ Pos, Vel });
     (try source_data.get(Pos, 0)).horizontal_coordinate = 7;
     (try source_data.get(Vel, 0)).horizontal_speed = 1.5;
-    const migrated = try created.reference.migrate(allocator, &[_]type{ Pos, Health }, true);
+    const migrated = try created.migrate(allocator, &[_]type{ Pos, Health }, true);
     try std.testing.expect(migrated.isAlive());
-    try std.testing.expect(!created.reference.isAlive());
+    try std.testing.expect(migrated.state() == .none);
+    try std.testing.expect(!created.isAlive());
+    try std.testing.expect(try migrated.archetypeOf() == Ecs.archetypeId(&[_]type{ Pos, Health }));
     try std.testing.expect(Ecs.count(&[_]type{ Pos, Vel }) == 0);
     try std.testing.expect(Ecs.count(&[_]type{ Pos, Health }) == 1);
     const dest_data = Ecs.storage(&[_]type{ Pos, Health });
@@ -2051,28 +2184,31 @@ test "nested tuples flatten into component sets" {
     }
     try std.testing.expect(matched == 2);
 }
-test "entity mirrors reference methods" {
+test "entity reference refreshes after migrate" {
     const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
-    var created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
+    const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
     try std.testing.expect(created.exists());
     try std.testing.expect(created.isAlive());
 
     const refreshed = created.entity().?;
-    try std.testing.expect(refreshed.reference.gen == created.reference.gen);
+    try std.testing.expect(refreshed.gen == created.gen);
 
-    const moved_record = try created.reference.migrate(allocator, &[_]type{Pos}, true);
-    try std.testing.expect(moved_record.isAlive());
-    try std.testing.expect(moved_record.archetype == Ecs.archetypeId(&[_]type{Pos}));
+    const moved = try created.migrate(allocator, &[_]type{Pos}, true);
+    try std.testing.expect(moved.isAlive());
+    try std.testing.expect(try moved.archetypeOf() == Ecs.archetypeId(&[_]type{Pos}));
     try std.testing.expect(!created.isAlive());
-    const moved = created.entity();
-    try std.testing.expect(moved == null);
-    const fresh = Ecs.entities.items[created.reference.id];
+    try std.testing.expect(created.entity() == null);
+    // Fresh handle rebuilt from the SoA generation column is alive.
+    const fresh = Ecs.EntityReference{
+        .id = created.id,
+        .gen = Ecs.entity_generation.items[created.id],
+    };
     try std.testing.expect(fresh.isAlive());
-    try std.testing.expect(fresh.reference.gen == moved_record.reference.gen);
+    try std.testing.expect(fresh.gen == moved.gen);
 
-    try fresh.reference.destroy(allocator);
+    try fresh.destroy(allocator);
     try std.testing.expect(!fresh.isAlive());
     try std.testing.expect(fresh.exists());
     try std.testing.expect(fresh.entity() == null);
@@ -2084,23 +2220,23 @@ test "handler getComponent accesses a specific row" {
     const handler = Ecs.SystemHandler{ .allocator = allocator };
     const created = try Ecs.create(allocator, &[_]type{ Pos, Vel });
 
-    const pos_mut: *Pos = try handler.getComponent(created.reference, Pos);
+    const pos_mut: *Pos = try handler.getComponent(created, Pos);
     pos_mut.horizontal_coordinate = 123;
-    const pos_const: *const Pos = try handler.getComponent(created.reference, Pos);
+    const pos_const: *const Pos = try handler.getComponent(created, Pos);
     try std.testing.expect(pos_const.horizontal_coordinate == 123);
 
-    const vel: *const Vel = try handler.getComponent(created.reference, Vel);
+    const vel: *const Vel = try handler.getComponent(created, Vel);
     try std.testing.expect(vel.horizontal_speed == 0.0);
 
     try std.testing.expectError(
         Ecs.EcsError.ComponentNotFoundInArchetype,
-        handler.getComponent(created.reference, Health),
+        handler.getComponent(created, Health),
     );
 
-    try created.reference.destroy(allocator);
+    try created.destroy(allocator);
     try std.testing.expectError(
         Ecs.EcsError.EntityIsNotAlive,
-        handler.getComponent(created.reference, Pos),
+        handler.getComponent(created, Pos),
     );
 }
 test "schedule runs systems in order and applies commands between them" {
@@ -2140,7 +2276,7 @@ test "schedule runs systems in order and applies commands between them" {
     try App.run(allocator);
     try std.testing.expect(Ecs.count(&[_]type{Pos}) == 2);
 }
-test "deferred migrate and destroy apply between systems, stale skipped" {
+test "deferred migrate rejects a second queued command" {
     const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
     const S = struct {
         fn setup(h: *Ecs.SystemHandler) anyerror!void {
@@ -2161,8 +2297,18 @@ test "deferred migrate and destroy apply between systems, stale skipped" {
             }
             const ref = target.?;
             try h.cmdMigrate(ref, &[_]type{Pos}, true);
-            // Same reference destroyed right after: stale at apply time.
-            try h.cmdDestroy(ref);
+            try std.testing.expect(ref.state() == .pending_migrate);
+            // Same slot destroyed right after: rejected at queue time,
+            // so a migrate-pending entity can never become destroy-pending.
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdDestroy(ref),
+            );
+            // Duplicate migrate is rejected as well.
+            try std.testing.expectError(
+                Ecs.EcsError.EntityHasPendingCommand,
+                h.cmdMigrate(ref, &[_]type{Pos}, true),
+            );
         }
         fn verify(h: *Ecs.SystemHandler) anyerror!void {
             try std.testing.expect(h.count(&[_]type{ Pos, Vel }, null) == 0);
@@ -2174,6 +2320,9 @@ test "deferred migrate and destroy apply between systems, stale skipped" {
                     try std.testing.expect(pos.horizontal_coordinate == 9);
                     found = true;
                 }
+                for (page.entities()) |ref| {
+                    try std.testing.expect(ref.state() == .none);
+                }
             }
             try std.testing.expect(found);
         }
@@ -2182,6 +2331,75 @@ test "deferred migrate and destroy apply between systems, stale skipped" {
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
     try App.run(allocator);
+}
+test "pending flags are cleared when a failing system discards commands" {
+    const Ecs = ECS(.{.{Pos}});
+    const CustomError = error{Boom};
+    const S = struct {
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 1,
+            }});
+        }
+        fn queue_then_fail(h: *Ecs.SystemHandler) anyerror!void {
+            var it = h.pages(&[_]type{Pos}, null);
+            var target: ?Ecs.EntityReference = null;
+            while (it.next()) |page| {
+                for (page.entities()) |ref| {
+                    target = ref;
+                }
+            }
+            try h.cmdDestroy(target.?);
+            try std.testing.expect(target.?.state() == .pending_destroy);
+            return CustomError.Boom;
+        }
+        fn retry_destroy(h: *Ecs.SystemHandler) anyerror!void {
+            // Discard above must have reset the flag, so queueing works again.
+            var it = h.pages(&[_]type{Pos}, null);
+            var target: ?Ecs.EntityReference = null;
+            while (it.next()) |page| {
+                for (page.entities()) |ref| {
+                    target = ref;
+                }
+            }
+            try h.cmdDestroy(target.?);
+        }
+        fn verify_empty(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == 0);
+        }
+    };
+    const Failing = Ecs.Schedule(.{ S.spawn, S.queue_then_fail });
+    const Recovery = Ecs.Schedule(.{ S.retry_destroy, S.verify_empty });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
+    try std.testing.expect(Ecs.count(&[_]type{Pos}) == 1);
+    try Recovery.run(allocator);
+}
+test "entity states are densely packed four per byte" {
+    const Ecs = ECS(.{.{Pos}});
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    var refs: [5]Ecs.EntityReference = undefined;
+    for (0..5) |i| {
+        refs[i] = try Ecs.create(allocator, &[_]type{Pos});
+    }
+    // 5 slots fit into 2 bytes.
+    try std.testing.expect(Ecs.entity_state_words.items.len == 2);
+    // Setting one slot must not clobber its neighbours in the same byte.
+    Ecs.setEntityState(refs[1].id, .pending_destroy);
+    Ecs.setEntityState(refs[2].id, .pending_migrate);
+    try std.testing.expect(Ecs.getEntityState(refs[0].id) == .none);
+    try std.testing.expect(Ecs.getEntityState(refs[1].id) == .pending_destroy);
+    try std.testing.expect(Ecs.getEntityState(refs[2].id) == .pending_migrate);
+    try std.testing.expect(Ecs.getEntityState(refs[3].id) == .none);
+    try std.testing.expect(Ecs.getEntityState(refs[4].id) == .none);
+    try std.testing.expect(refs[1].state() == .pending_destroy);
+    Ecs.clearPending(refs[1].id);
+    Ecs.clearPending(refs[2].id);
+    try std.testing.expect(refs[1].state() == .none);
+    try std.testing.expect(Ecs.entity_state_words.items[0] == 0);
 }
 test "bulk commands create and destroy pages" {
     const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
