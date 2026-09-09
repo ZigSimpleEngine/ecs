@@ -517,13 +517,8 @@ pub fn ECS(comptime sets: anytype) type {
                         .id = @intCast(id),
                         .gen = Ecs.entity_generation.items[id],
                     };
-                    inline for (0..ARCH_COUNT) |k| {
-                        if (arch == k) {
-                            Ecs.storages[k].removeRow(row);
-                            _ = try Ecs.storages[k].insertRowAtDepth(allocator, &ref, next_depth);
-                            break;
-                        }
-                    }
+                    Ecs.storages[arch].removeRow(row);
+                    _ = try Ecs.storages[arch].insertRowAtDepth(allocator, &ref, next_depth);
                 }
             }
             /// Moves the entity into another archetype, optionally copying shared data.
@@ -572,16 +567,11 @@ pub fn ECS(comptime sets: anytype) type {
                 // lands in the matching zone of the destination archetype.
                 const depth: u32 = Ecs.entity_depth.items[entity_index];
                 const dest_index: u32 = blk: {
-                    inline for (0..ARCH_COUNT) |k| {
-                        if (dest_id == k) {
-                            const idx = try Ecs.storages[k].insertRowAtDepth(allocator, &next, depth);
-                            if (Ecs.storages[k].count() == 1) {
-                                Ecs.setArchetypeNonEmpty(dest_id);
-                            }
-                            break :blk idx;
-                        }
+                    const idx = try Ecs.storages[dest_id].insertRowAtDepth(allocator, &next, depth);
+                    if (Ecs.storages[dest_id].count() == 1) {
+                        Ecs.setArchetypeNonEmpty(dest_id);
                     }
-                    unreachable;
+                    break :blk idx;
                 };
                 if (copy) {
                     Ecs.copyShared(
@@ -591,14 +581,9 @@ pub fn ECS(comptime sets: anytype) type {
                         dest_index,
                     );
                 }
-                inline for (0..ARCH_COUNT) |k| {
-                    if (source_id == k) {
-                        Ecs.storages[k].removeRow(source_index);
-                        if (Ecs.storages[k].count() == 0) {
-                            Ecs.clearArchetypeNonEmpty(source_id);
-                        }
-                        break;
-                    }
+                Ecs.storages[source_id].removeRow(source_index);
+                if (Ecs.storages[source_id].count() == 0) {
+                    Ecs.clearArchetypeNonEmpty(source_id);
                 }
                 Ecs.entity_generation.items[entity_index] = next.gen;
                 Ecs.entity_archetype.items[entity_index] = dest_id;
@@ -1215,409 +1200,548 @@ pub fn ECS(comptime sets: anytype) type {
         pub fn archetypeInfoById(id: u32) *const ArchetypeInfo {
             return &Ecs.archetypes[id];
         }
-        /// Builds the SOA storage type for one archetype from its component types.
-        /// - `arch_types_fixed` - canonical component types padded to `max_len`, defining the column order.
-        /// - `arch_len` - number of valid entries in `arch_types_fixed`.
-        ///
-        /// Returns `type` - structure-of-arrays storage with component columns and entity refs.
-        fn MakeData(comptime arch_types_fixed: [max_len]type, comptime arch_len: usize) type {
-            const ArchTypes: []const type = arch_types_fixed[0..arch_len];
-            const ListTypes: [ArchTypes.len]type = blk: {
-                var tmp: [ArchTypes.len]type = undefined;
-                for (ArchTypes, 0..) |T, i| {
-                    tmp[i] = std.ArrayListUnmanaged(T);
+        /// Maximum component columns in any archetype. Sizes the fixed
+        /// `columns` array so every storage has one homogeneous type; the
+        /// comptime generation only sets `len` and per-column metadata.
+        const MAX_COLS: usize = max_len;
+        /// One raw component column: manually managed byte buffer holding
+        /// `rows * elem_size` live bytes. The buffer is allocated with the
+        /// component alignment via `rawAlloc`/`rawFree`, so `@alignCast` on
+        /// access is sound. Zero-size components never allocate; their row
+        /// count is implied by `refs` and byte copies are no-ops.
+        const Column = struct {
+            /// Live bytes, `rows * elem_size`. Alignment-1 view over an
+            /// allocation that satisfies `alignment`.
+            bytes: []u8 = &[_]u8{},
+            /// Allocated capacity in rows.
+            cap_rows: usize = 0,
+            /// Byte size of one element. Copied from `ComponentInfo.size`.
+            elem_size: usize = 0,
+            /// Byte alignment of the element. Copied from
+            /// `ComponentInfo.alignment`.
+            alignment: u29 = 1,
+            /// Dense component id. Matches the position of this column in
+            /// `archetypes[arch].component_ids`.
+            comp_id: u32 = std.math.maxInt(u32),
+            /// Ensures room for `need_rows` rows, preserving live bytes.
+            /// - `self` - column to grow.
+            /// - `allocator` - funds the reallocation.
+            /// - `need_rows` - rows that must fit afterwards.
+            fn ensureRowCapacity(
+                self: *Column,
+                allocator: std.mem.Allocator,
+                need_rows: usize,
+            ) EcsError!void {
+                if (need_rows <= self.cap_rows) {
+                    return;
                 }
-                break :blk tmp;
-            };
-            const Lists = std.meta.Tuple(&ListTypes);
-            return struct {
-                const Self = @This();
-                /// One column per component type. Indexed by the canonical position.
-                lists: Lists,
-                /// One row per stored entity, parallel to the component columns.
-                refs: std.ArrayListUnmanaged(EntityReference) = .empty,
-                /// Contiguous depth zones tiling the row array. Maintained by
-                /// every structural operation, so rows are always grouped by
-                /// hierarchy depth: `depth_zones[i]` covers rows
-                /// `[offset, offset + len)`.
-                depth_zones: std.ArrayListUnmanaged(DepthZone) = .empty,
-                /// Builds empty storage. Usable in comptime initializers.
-                ///
-                /// Returns `Self` - storage with every list empty.
-                pub fn empty() Self {
-                    var lists: Lists = undefined;
-                    inline for (0..ArchTypes.len) |i| {
-                        lists[i] = .empty;
-                    }
-                    return Self{
-                        .lists = lists,
-                        .refs = .empty,
-                        .depth_zones = .empty,
-                    };
+                if (self.elem_size == 0) {
+                    self.cap_rows = need_rows;
+                    return;
                 }
-                /// Locates the column index storing the given component type.
-                /// - `Target` - component type to locate. Must be stored here.
-                ///
-                /// Returns `usize` - canonical column index.
-                fn indexOf(comptime Target: type) usize {
-                    return Ecs.indexOfType(ArchTypes, Target);
+                var new_cap: usize = if (self.cap_rows == 0) @max(need_rows, 4) else self.cap_rows * 2;
+                while (new_cap < need_rows) {
+                    new_cap *= 2;
                 }
-                /// Counts stored rows.
-                /// - `self` - storage to inspect.
-                ///
-                /// Returns `u32` - current row count.
-                pub fn count(self: *const Self) u32 {
-                    return @intCast(self.refs.items.len);
+                const new_nbytes = new_cap * self.elem_size;
+                const align_val = std.mem.Alignment.fromByteUnits(self.alignment);
+                const new_ptr = allocator.rawAlloc(new_nbytes, align_val, @returnAddress()) orelse
+                    return EcsError.OutOfMemory;
+                const new_bytes: [*]u8 = new_ptr;
+                if (self.bytes.len > 0) {
+                    @memcpy(new_bytes[0..self.bytes.len], self.bytes);
                 }
-                /// Checks whether a row exists at the given position.
-                /// - `self` - storage to inspect.
-                /// - `index` - row position.
-                ///
-                /// Returns `bool` - true when the position is in range.
-                pub fn exists(self: *const Self, index: u32) bool {
-                    return index < self.refs.items.len;
+                if (self.cap_rows > 0) {
+                    const old_cap_bytes = self.cap_rows * self.elem_size;
+                    allocator.rawFree(self.bytes.ptr[0..old_cap_bytes], align_val, @returnAddress());
                 }
-                /// Fetches the entity reference stored at the given position.
-                /// - `self` - storage to inspect.
-                /// - `index` - row position.
-                ///
-                /// Returns `EntityReference` - reference stored in the row.
-                pub fn entity(self: *const Self, index: u32) EcsError!EntityReference {
-                    if (!self.exists(index)) {
-                        return EcsError.IndexOutOfBounds;
-                    }
-                    return self.refs.items[index];
+                self.bytes = new_bytes[0..self.bytes.len];
+                self.cap_rows = new_cap;
+            }
+            /// Extends the live length by one row, leaving its bytes undefined.
+            /// Caller must have ensured capacity or pass the row count so this
+            /// helper can grow. `row_count` is the count before appending.
+            fn appendUndefined(
+                self: *Column,
+                allocator: std.mem.Allocator,
+                row_count: usize,
+            ) EcsError!void {
+                try self.ensureRowCapacity(allocator, row_count + 1);
+                if (self.elem_size == 0) {
+                    return;
                 }
-                /// Returns a pointer to one component value. The pointer is mutable
-                /// even though the receiver is const: columns live in global
-                /// storage, the storage header itself is never modified.
-                /// - `self` - storage to inspect.
-                /// - `Target` - component type to fetch. Must be stored here.
-                /// - `index` - row position.
-                ///
-                /// Returns `*Target` - pointer into the component column.
-                pub fn get(
-                    self: *const Self,
-                    comptime Target: type,
-                    index: u32,
-                ) EcsError!*Target {
-                    const column: *const std.ArrayListUnmanaged(Target) =
-                        &self.lists[comptime Self.indexOf(Target)];
-                    if (index >= column.items.len) {
-                        return EcsError.IndexOutOfBounds;
-                    }
-                    // Safe: every Data instance lives in the mutable global
-                    // `storages` tuple, so the column is never truly immutable.
-                    return @constCast(&column.items[index]);
+                self.bytes = self.bytes.ptr[0..(row_count + 1) * self.elem_size];
+            }
+            /// Shrinks the live length by one row. `row_count` is the count
+            /// before popping.
+            fn popRow(self: *Column, row_count: usize) void {
+                if (self.elem_size == 0) {
+                    return;
                 }
-                /// Exposes a whole component column as a read-only list.
-                /// - `self` - storage to inspect.
-                /// - `Target` - component type to expose. Must be stored here.
-                ///
-                /// Returns `ReadOnlyList` - live view of the component column.
-                pub fn list(
-                    self: *const Self,
-                    comptime Target: type,
-                ) ReadOnlyList(Target) {
-                    const column: *const std.ArrayListUnmanaged(Target) =
-                        &self.lists[comptime Self.indexOf(Target)];
-                    return ReadOnlyList(Target).init(column);
+                self.bytes = self.bytes.ptr[0..(row_count - 1) * self.elem_size];
+            }
+            /// Copies one row inside the column.
+            fn copyRow(self: *const Column, src_row: u32, dst_row: u32) void {
+                if (self.elem_size == 0) {
+                    return;
                 }
-                /// Exposes the entity reference column as a read-only list.
-                /// - `self` - storage to inspect.
-                ///
-                /// Returns `ReadOnlyList` - live view of the reference column.
-                pub fn entities(self: *const Self) ReadOnlyList(EntityReference) {
-                    return ReadOnlyList(EntityReference).init(&self.refs);
+                const es = self.elem_size;
+                @memcpy(
+                    @constCast(self.bytes.ptr[dst_row * es ..][0..es]),
+                    self.bytes.ptr[src_row * es ..][0..es],
+                );
+            }
+            /// Releases the buffer, keeping the comptime metadata intact.
+            fn deinit(self: *Column, allocator: std.mem.Allocator) void {
+                if (self.cap_rows > 0 and self.elem_size > 0) {
+                    const align_val = std.mem.Alignment.fromByteUnits(self.alignment);
+                    allocator.rawFree(
+                        self.bytes.ptr[0..self.cap_rows * self.elem_size],
+                        align_val,
+                        @returnAddress(),
+                    );
                 }
-                /// Exposes the entity reference column.
-                /// - `self` - storage to inspect.
-                ///
-                /// Returns `[]const EntityReference` - read-only reference list.
-                pub fn entityList(self: *const Self) []const EntityReference {
-                    return self.refs.items;
+                self.bytes = &[_]u8{};
+                self.cap_rows = 0;
+            }
+        };
+        /// Homogeneous archetype storage. One instance per archetype in
+        /// `storages`; only `len` and the `columns` metadata differ. Component
+        /// columns are indexed by canonical position (sorted component id),
+        /// exactly like the old per-archetype `lists` tuple but type-erased
+        /// to bytes. `refs` and `depth_zones` stay typed: they are uniform
+        /// across archetypes and have different lengths, so they are not
+        /// part of the byte slice.
+        const ArchetypeStorage = struct {
+            const Self = @This();
+            /// One row per stored entity, parallel to the component columns.
+            refs: std.ArrayListUnmanaged(EntityReference) = .empty,
+            /// Contiguous depth zones tiling the row array. Maintained by
+            /// every structural operation, so rows are always grouped by
+            /// hierarchy depth: `depth_zones[i]` covers rows
+            /// `[offset, offset + len)`.
+            depth_zones: std.ArrayListUnmanaged(DepthZone) = .empty,
+            /// Fixed backing for component columns; only `columns[0..len]`
+            /// is valid. Comptime generation sets `len` and metadata.
+            columns: [MAX_COLS]Column = [_]Column{.{}} ** MAX_COLS,
+            /// Number of valid entries in `columns`.
+            len: usize = 0,
+            /// Owning archetype id. Used for debug checks and typed lookup.
+            arch: u32 = 0,
+            /// Live component columns.
+            fn cols(self: *Self) []Column {
+                return self.columns[0..self.len];
+            }
+            /// Live component columns, read-only view.
+            fn colsConst(self: *const Self) []const Column {
+                return self.columns[0..self.len];
+            }
+            /// Counts stored rows.
+            /// - `self` - storage to inspect.
+            ///
+            /// Returns `u32` - current row count.
+            pub fn count(self: *const Self) u32 {
+                return @intCast(self.refs.items.len);
+            }
+            /// Checks whether a row exists at the given position.
+            /// - `self` - storage to inspect.
+            /// - `index` - row position.
+            ///
+            /// Returns `bool` - true when the position is in range.
+            pub fn exists(self: *const Self, index: u32) bool {
+                return index < self.refs.items.len;
+            }
+            /// Fetches the entity reference stored at the given position.
+            /// - `self` - storage to inspect.
+            /// - `index` - row position.
+            ///
+            /// Returns `EntityReference` - reference stored in the row.
+            pub fn entity(self: *const Self, index: u32) EcsError!EntityReference {
+                if (!self.exists(index)) {
+                    return EcsError.IndexOutOfBounds;
                 }
-                /// Locates the zone whose region contains the given row index.
-                /// Zones are contiguous, so this is the last zone with
-                /// `offset <= index`.
-                /// - `self` - storage to inspect.
-                /// - `pos` - row position.
-                ///
-                /// Returns `usize` - index into `depth_zones`.
-                fn zoneIndexByOffset(self: *const Self, pos: u32) usize {
-                    var lo: usize = 0;
-                    var hi: usize = self.depth_zones.items.len;
-                    while (lo < hi) {
-                        const mid = (lo + hi) / 2;
-                        if (self.depth_zones.items[mid].offset <= pos) {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    return lo - 1;
+                return self.refs.items[index];
+            }
+            /// Finds the canonical column position of a component id.
+            /// - `self` - storage to inspect.
+            /// - `comp_id` - component id to locate.
+            ///
+            /// Returns `?usize` - column index, or null when absent.
+            fn columnIndexOfId(self: *const Self, comp_id: u32) ?usize {
+                return Ecs.binarySearchIds(
+                    Ecs.archetypes[self.arch].component_ids,
+                    comp_id,
+                );
+            }
+            /// Returns a pointer to one component value. The pointer is mutable
+            /// even though the receiver is const: columns live in global
+            /// storage, the storage header itself is never modified.
+            /// - `self` - storage to inspect.
+            /// - `Target` - component type to fetch. Must be stored here.
+            /// - `index` - row position.
+            ///
+            /// Returns `*Target` - pointer into the component column.
+            pub fn get(
+                self: *const Self,
+                comptime Target: type,
+                index: u32,
+            ) EcsError!*Target {
+                if (comptime Ecs.componentIndex(Target) == null) {
+                    return EcsError.ComponentNotFoundInArchetype;
                 }
-                /// Finds the sorted insertion point of a depth in `depth_zones`.
-                /// - `self` - storage to inspect.
-                /// - `depth` - hierarchy depth.
-                ///
-                /// Returns `usize` - first zone with `depth >= depth`.
-                fn zoneInsertionIndex(self: *const Self, depth: u32) usize {
-                    var lo: usize = 0;
-                    var hi: usize = self.depth_zones.items.len;
-                    while (lo < hi) {
-                        const mid = (lo + hi) / 2;
-                        if (self.depth_zones.items[mid].depth < depth) {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    return lo;
+                const comp_id: u32 = @intCast(comptime Ecs.componentIndex(Target).?);
+                const ci = self.columnIndexOfId(comp_id) orelse
+                    return EcsError.ComponentNotFoundInArchetype;
+                const n: u32 = @intCast(self.refs.items.len);
+                if (index >= n) {
+                    return EcsError.IndexOutOfBounds;
                 }
-                /// Appends an empty raw row (columns plus reference) without
-                /// touching depth zones. Used by bulk creation, which re-sorts
-                /// the zones afterwards in one consolidation pass, and by
-                /// low-level tests.
-                /// - `self` - storage to mutate.
-                /// - `allocator` - funds row allocation.
-                /// - `reference` - handle stored alongside the components.
-                ///
-                /// Returns `u32` - position of the new row.
-                fn add(
-                    self: *Self,
-                    allocator: std.mem.Allocator,
-                    reference: *const EntityReference,
-                ) EcsError!u32 {
-                    inline for (0..ArchTypes.len) |i| {
-                        try self.lists[i].append(allocator, undefined);
-                    }
-                    try self.refs.append(allocator, reference.*);
-                    return @intCast(self.refs.items.len - 1);
+                if (@sizeOf(Target) == 0) {
+                    return @ptrCast(@alignCast(@constCast(self.columns[ci].bytes.ptr)));
                 }
-                /// Appends a row and places it into the zone matching
-                /// `depth`, keeping every zone contiguous and ordered.
-                /// The row lands at the end of its zone; deeper zones then
-                /// shift by one slot, which costs exactly one moved row per
-                /// deeper zone (order inside a zone is irrelevant, so the
-                /// rotation moves only boundary elements). Updates
-                /// `entity_row` for every relocated row.
-                /// - `self` - storage to mutate.
-                /// - `allocator` - funds row and zone-list allocation.
-                /// - `reference` - handle stored alongside the components.
-                /// - `depth` - hierarchy depth of the row.
-                ///
-                /// Returns `u32` - final position of the inserted row.
-                fn insertRowAtDepth(
-                    self: *Self,
-                    allocator: std.mem.Allocator,
-                    reference: *const EntityReference,
-                    depth: u32,
-                ) EcsError!u32 {
-                    inline for (0..ArchTypes.len) |i| {
-                        try self.lists[i].append(allocator, undefined);
-                    }
-                    try self.refs.append(allocator, reference.*);
-                    const n: u32 = @intCast(self.refs.items.len - 1);
-                    const idx = self.zoneInsertionIndex(depth);
-                    const has_zone = idx < self.depth_zones.items.len and
-                        self.depth_zones.items[idx].depth == depth;
-                    const target: u32 = if (has_zone)
-                        self.depth_zones.items[idx].offset + self.depth_zones.items[idx].len
-                    else if (idx == 0)
-                        0
-                    else
-                        self.depth_zones.items[idx - 1].offset + self.depth_zones.items[idx - 1].len;
-                    const m: usize = if (has_zone)
-                        self.depth_zones.items.len - 1 - idx
-                    else
-                        self.depth_zones.items.len - idx;
-                    if (m > 0) {
-                        // Rotation: the new row travels from the end up to the
-                        // tail of its zone; one boundary element per deeper
-                        // zone rotates down in exchange. Chain positions are
-                        // p0 = n and p_i = start offset of zone idx+i-1.
-                        const start = if (has_zone) idx + 1 else idx;
-                        inline for (0..ArchTypes.len) |i| {
-                            const col = self.lists[i].items;
-                            const tmp = col[n];
-                            col[n] = col[self.depth_zones.items[start + m - 1].offset];
-                            var k: usize = m;
-                            while (k > 1) : (k -= 1) {
-                                col[self.depth_zones.items[start + k - 1].offset] =
-                                    col[self.depth_zones.items[start + k - 2].offset];
-                            }
-                            col[self.depth_zones.items[start].offset] = tmp;
-                        }
-                        {
-                            const refs = self.refs.items;
-                            const tmp = refs[n];
-                            refs[n] = refs[self.depth_zones.items[start + m - 1].offset];
-                            var k: usize = m;
-                            while (k > 1) : (k -= 1) {
-                                refs[self.depth_zones.items[start + k - 1].offset] =
-                                    refs[self.depth_zones.items[start + k - 2].offset];
-                            }
-                            refs[self.depth_zones.items[start].offset] = tmp;
-                        }
-                        for (0..m + 1) |i| {
-                            const pos: u32 = if (i == 0)
-                                n
-                            else
-                                self.depth_zones.items[start + i - 1].offset;
-                            Ecs.entity_row.items[self.refs.items[pos].id] = pos;
-                        }
+                const col = &self.columns[ci];
+                std.debug.assert(col.elem_size == @sizeOf(Target));
+                const typed: [*]Target = @ptrCast(@alignCast(col.bytes.ptr));
+                // Safe: every storage lives in the mutable global
+                // `storages` array, so the column is never truly immutable.
+                return @constCast(&typed[index]);
+            }
+            /// Exposes the entity reference column as a read-only list.
+            /// - `self` - storage to inspect.
+            ///
+            /// Returns `ReadOnlyList` - live view of the reference column.
+            pub fn entities(self: *const Self) ReadOnlyList(EntityReference) {
+                return ReadOnlyList(EntityReference).init(&self.refs);
+            }
+            /// Exposes the entity reference column.
+            /// - `self` - storage to inspect.
+            ///
+            /// Returns `[]const EntityReference` - read-only reference list.
+            pub fn entityList(self: *const Self) []const EntityReference {
+                return self.refs.items;
+            }
+            /// Locates the zone whose region contains the given row index.
+            /// Zones are contiguous, so this is the last zone with
+            /// `offset <= index`.
+            /// - `self` - storage to inspect.
+            /// - `pos` - row position.
+            ///
+            /// Returns `usize` - index into `depth_zones`.
+            fn zoneIndexByOffset(self: *const Self, pos: u32) usize {
+                var lo: usize = 0;
+                var hi: usize = self.depth_zones.items.len;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    if (self.depth_zones.items[mid].offset <= pos) {
+                        lo = mid + 1;
                     } else {
-                        Ecs.entity_row.items[reference.id] = n;
+                        hi = mid;
                     }
-                    if (has_zone) {
-                        self.depth_zones.items[idx].len += 1;
-                        for (idx + 1..self.depth_zones.items.len) |z| {
-                            self.depth_zones.items[z].offset += 1;
-                        }
-                    } else {
-                        try self.depth_zones.insert(allocator, idx, .{
-                            .depth = depth,
-                            .offset = target,
-                            .len = 1,
-                        });
-                        for (idx + 1..self.depth_zones.items.len) |z| {
-                            self.depth_zones.items[z].offset += 1;
-                        }
-                    }
-                    return target;
                 }
-                /// Removes a row from its depth zone. The last row of the
-                /// zone swaps into the removed slot (order inside the zone is
-                /// irrelevant), then deeper zones shift down by one slot,
-                /// costing exactly one moved row per deeper zone. Updates
-                /// `entity_row` for every relocated row.
-                /// - `self` - storage to mutate.
-                /// - `index` - row position to remove.
-                fn removeRow(self: *Self, index: u32) void {
-                    const zi = self.zoneIndexByOffset(index);
-                    const zone = self.depth_zones.items[zi];
-                    const e_d: u32 = zone.offset + zone.len - 1;
-                    const m: usize = self.depth_zones.items.len - 1 - zi;
-                    inline for (0..ArchTypes.len) |i| {
-                        self.lists[i].items[index] = self.lists[i].items[e_d];
+                return lo - 1;
+            }
+            /// Finds the sorted insertion point of a depth in `depth_zones`.
+            /// - `self` - storage to inspect.
+            /// - `depth` - hierarchy depth.
+            ///
+            /// Returns `usize` - first zone with `depth >= depth`.
+            fn zoneInsertionIndex(self: *const Self, depth: u32) usize {
+                var lo: usize = 0;
+                var hi: usize = self.depth_zones.items.len;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    if (self.depth_zones.items[mid].depth < depth) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
                     }
-                    self.refs.items[index] = self.refs.items[e_d];
-                    Ecs.entity_row.items[self.refs.items[index].id] = index;
-                    if (m > 0) {
-                        var i: usize = 1;
-                        while (i <= m) : (i += 1) {
-                            const dst: u32 = if (i == 1)
-                                e_d
-                            else
-                                self.depth_zones.items[zi + i - 1].offset +
-                                    self.depth_zones.items[zi + i - 1].len - 1;
-                            const src: u32 = self.depth_zones.items[zi + i].offset +
-                                self.depth_zones.items[zi + i].len - 1;
-                            inline for (0..ArchTypes.len) |c| {
-                                self.lists[c].items[dst] = self.lists[c].items[src];
-                            }
-                            self.refs.items[dst] = self.refs.items[src];
+                }
+                return lo;
+            }
+            /// Appends an empty raw row (columns plus reference) without
+            /// touching depth zones. Used by bulk creation, which re-sorts
+            /// the zones afterwards in one consolidation pass, and by
+            /// low-level tests.
+            /// - `self` - storage to mutate.
+            /// - `allocator` - funds row allocation.
+            /// - `reference` - handle stored alongside the components.
+            ///
+            /// Returns `u32` - position of the new row.
+            fn add(
+                self: *Self,
+                allocator: std.mem.Allocator,
+                reference: *const EntityReference,
+            ) EcsError!u32 {
+                const row_count: usize = self.refs.items.len;
+                for (self.cols()) |*col| {
+                    try col.appendUndefined(allocator, row_count);
+                }
+                try self.refs.append(allocator, reference.*);
+                return @intCast(self.refs.items.len - 1);
+            }
+            /// Appends a row and places it into the zone matching
+            /// `depth`, keeping every zone contiguous and ordered.
+            /// The row lands at the end of its zone; deeper zones then
+            /// shift by one slot, which costs exactly one moved row per
+            /// deeper zone (order inside a zone is irrelevant, so the
+            /// rotation moves only boundary elements). Updates
+            /// `entity_row` for every relocated row.
+            /// - `self` - storage to mutate.
+            /// - `allocator` - funds row and zone-list allocation.
+            /// - `reference` - handle stored alongside the components.
+            /// - `depth` - hierarchy depth of the row.
+            ///
+            /// Returns `u32` - final position of the inserted row.
+            fn insertRowAtDepth(
+                self: *Self,
+                allocator: std.mem.Allocator,
+                reference: *const EntityReference,
+                depth: u32,
+            ) EcsError!u32 {
+                const row_count: usize = self.refs.items.len;
+                for (self.cols()) |*col| {
+                    try col.appendUndefined(allocator, row_count);
+                }
+                try self.refs.append(allocator, reference.*);
+                const n: u32 = @intCast(self.refs.items.len - 1);
+                const idx = self.zoneInsertionIndex(depth);
+                const has_zone = idx < self.depth_zones.items.len and
+                    self.depth_zones.items[idx].depth == depth;
+                const target: u32 = if (has_zone)
+                    self.depth_zones.items[idx].offset + self.depth_zones.items[idx].len
+                else if (idx == 0)
+                    0
+                else
+                    self.depth_zones.items[idx - 1].offset + self.depth_zones.items[idx - 1].len;
+                const m: usize = if (has_zone)
+                    self.depth_zones.items.len - 1 - idx
+                else
+                    self.depth_zones.items.len - idx;
+                if (m > 0) {
+                    // Rotation: the new row travels from the end up to the
+                    // tail of its zone; one boundary element per deeper
+                    // zone rotates down in exchange. Chain positions are
+                    // p0 = n and p_i = start offset of zone idx+i-1.
+                    const start = if (has_zone) idx + 1 else idx;
+                    // One reusable temp sized by the widest column.
+                    var max_es: usize = 0;
+                    for (self.colsConst()) |*col| {
+                        if (col.elem_size > max_es) {
+                            max_es = col.elem_size;
                         }
-                        var j: usize = 0;
-                        while (j < m) : (j += 1) {
-                            const pos: u32 = if (j == 0)
-                                e_d
-                            else
-                                self.depth_zones.items[zi + j].offset +
-                                    self.depth_zones.items[zi + j].len - 1;
-                            Ecs.entity_row.items[self.refs.items[pos].id] = pos;
+                    }
+                    var stack_tmp: [256]u8 = undefined;
+                    const heap_tmp = if (max_es > stack_tmp.len and max_es > 0)
+                        try allocator.alloc(u8, max_es)
+                    else
+                        null;
+                    defer if (heap_tmp) |b| allocator.free(b);
+                    const tmp: []u8 = if (heap_tmp) |b| b else stack_tmp[0..max_es];
+                    for (self.cols()) |*col| {
+                        if (col.elem_size == 0) {
+                            continue;
                         }
-                    }
-                    inline for (0..ArchTypes.len) |i| {
-                        _ = self.lists[i].pop();
-                    }
-                    _ = self.refs.pop();
-                    self.depth_zones.items[zi].len -= 1;
-                    for (zi + 1..self.depth_zones.items.len) |z| {
-                        self.depth_zones.items[z].offset -= 1;
-                    }
-                    if (self.depth_zones.items[zi].len == 0) {
-                        std.mem.copyForwards(
-                            DepthZone,
-                            self.depth_zones.items[zi..],
-                            self.depth_zones.items[zi + 1 ..],
+                        const es = col.elem_size;
+                        const t = tmp[0..es];
+                        const buf = col.bytes.ptr;
+                        @memcpy(t, buf[n * es ..][0..es]);
+                        @memcpy(
+                            buf[n * es ..][0..es],
+                            buf[self.depth_zones.items[start + m - 1].offset * es ..][0..es],
                         );
-                        _ = self.depth_zones.pop();
+                        var k: usize = m;
+                        while (k > 1) : (k -= 1) {
+                            @memcpy(
+                                buf[self.depth_zones.items[start + k - 1].offset * es ..][0..es],
+                                buf[self.depth_zones.items[start + k - 2].offset * es ..][0..es],
+                            );
+                        }
+                        @memcpy(buf[self.depth_zones.items[start].offset * es ..][0..es], t);
+                    }
+                    {
+                        const refs = self.refs.items;
+                        const tmp_ref = refs[n];
+                        refs[n] = refs[self.depth_zones.items[start + m - 1].offset];
+                        var k: usize = m;
+                        while (k > 1) : (k -= 1) {
+                            refs[self.depth_zones.items[start + k - 1].offset] =
+                                refs[self.depth_zones.items[start + k - 2].offset];
+                        }
+                        refs[self.depth_zones.items[start].offset] = tmp_ref;
+                    }
+                    for (0..m + 1) |i| {
+                        const pos: u32 = if (i == 0)
+                            n
+                        else
+                            self.depth_zones.items[start + i - 1].offset;
+                        Ecs.entity_row.items[self.refs.items[pos].id] = pos;
+                    }
+                } else {
+                    Ecs.entity_row.items[reference.id] = n;
+                }
+                if (has_zone) {
+                    self.depth_zones.items[idx].len += 1;
+                    for (idx + 1..self.depth_zones.items.len) |z| {
+                        self.depth_zones.items[z].offset += 1;
+                    }
+                } else {
+                    try self.depth_zones.insert(allocator, idx, .{
+                        .depth = depth,
+                        .offset = target,
+                        .len = 1,
+                    });
+                    for (idx + 1..self.depth_zones.items.len) |z| {
+                        self.depth_zones.items[z].offset += 1;
                     }
                 }
-                /// Re-sorts every row by hierarchy depth and rebuilds the
-                /// depth zones in one pass. Used by bulk creation, where
-                /// appending many rows through `insertRowAtDepth` would pay
-                /// the per-row cascade; a single stable sort is cheaper.
-                /// Updates `entity_row` for every row.
-                /// - `self` - storage to mutate.
-                /// - `allocator` - funds scratch and zone-list allocation.
-                /// - `perm_scratch` - reusable scratch for row indices.
-                /// - `visited_scratch` - reusable scratch for cycle marks.
-                fn consolidateZones(
-                    self: *Self,
-                    allocator: std.mem.Allocator,
-                    perm_scratch: *std.ArrayListUnmanaged(u32),
-                    visited_scratch: *std.ArrayListUnmanaged(u8),
-                ) EcsError!void {
-                    const n = self.refs.items.len;
-                    if (n == 0) {
-                        self.depth_zones.clearRetainingCapacity();
-                        return;
+                return target;
+            }
+            /// Removes a row from its depth zone. The last row of the
+            /// zone swaps into the removed slot (order inside the zone is
+            /// irrelevant), then deeper zones shift down by one slot,
+            /// costing exactly one moved row per deeper zone. Updates
+            /// `entity_row` for every relocated row.
+            /// - `self` - storage to mutate.
+            /// - `index` - row position to remove.
+            fn removeRow(self: *Self, index: u32) void {
+                const zi = self.zoneIndexByOffset(index);
+                const zone = self.depth_zones.items[zi];
+                const e_d: u32 = zone.offset + zone.len - 1;
+                const m: usize = self.depth_zones.items.len - 1 - zi;
+                for (self.cols()) |*col| {
+                    if (col.elem_size == 0) {
+                        continue;
                     }
-                    try perm_scratch.resize(allocator, n);
-                    for (0..n) |i| {
-                        perm_scratch.items[i] = @intCast(i);
+                    if (index == e_d) {
+                        continue;
                     }
-                    const Ctx = struct {
-                        depths: []const u32,
-                        refs: []const EntityReference,
-                        fn lessThan(ctx: @This(), a: u32, b: u32) bool {
-                            const da = ctx.depths[ctx.refs[a].id];
-                            const db = ctx.depths[ctx.refs[b].id];
-                            return da < db or (da == db and a < b);
+                    const es = col.elem_size;
+                    @memcpy(
+                        col.bytes.ptr[index * es ..][0..es],
+                        col.bytes.ptr[e_d * es ..][0..es],
+                    );
+                }
+                self.refs.items[index] = self.refs.items[e_d];
+                Ecs.entity_row.items[self.refs.items[index].id] = index;
+                if (m > 0) {
+                    var i: usize = 1;
+                    while (i <= m) : (i += 1) {
+                        const dst: u32 = if (i == 1)
+                            e_d
+                        else
+                            self.depth_zones.items[zi + i - 1].offset +
+                                self.depth_zones.items[zi + i - 1].len - 1;
+                        const src: u32 = self.depth_zones.items[zi + i].offset +
+                            self.depth_zones.items[zi + i].len - 1;
+                        for (self.cols()) |*col| {
+                            if (col.elem_size == 0) {
+                                continue;
+                            }
+                            const es = col.elem_size;
+                            @memcpy(
+                                col.bytes.ptr[dst * es ..][0..es],
+                                col.bytes.ptr[src * es ..][0..es],
+                            );
                         }
-                    };
-                    std.mem.sort(u32, perm_scratch.items, Ctx{
-                        .depths = Ecs.entity_depth.items,
-                        .refs = self.refs.items,
-                    }, Ctx.lessThan);
-                    try visited_scratch.resize(allocator, n);
-                    @memset(visited_scratch.items[0..n], 0);
-                    const perm = perm_scratch.items;
-                    const visited = visited_scratch.items;
+                        self.refs.items[dst] = self.refs.items[src];
+                    }
+                    var j: usize = 0;
+                    while (j < m) : (j += 1) {
+                        const pos: u32 = if (j == 0)
+                            e_d
+                        else
+                            self.depth_zones.items[zi + j].offset +
+                                self.depth_zones.items[zi + j].len - 1;
+                        Ecs.entity_row.items[self.refs.items[pos].id] = pos;
+                    }
+                }
+                const row_count: usize = self.refs.items.len;
+                for (self.cols()) |*col| {
+                    col.popRow(row_count);
+                }
+                _ = self.refs.pop();
+                self.depth_zones.items[zi].len -= 1;
+                for (zi + 1..self.depth_zones.items.len) |z| {
+                    self.depth_zones.items[z].offset -= 1;
+                }
+                if (self.depth_zones.items[zi].len == 0) {
+                    std.mem.copyForwards(
+                        DepthZone,
+                        self.depth_zones.items[zi..],
+                        self.depth_zones.items[zi + 1 ..],
+                    );
+                    _ = self.depth_zones.pop();
+                }
+            }
+            /// Re-sorts every row by hierarchy depth and rebuilds the
+            /// depth zones in one pass. Used by bulk creation, where
+            /// appending many rows through `insertRowAtDepth` would pay
+            /// the per-row cascade; a single stable sort is cheaper.
+            /// Updates `entity_row` for every row.
+            /// - `self` - storage to mutate.
+            /// - `allocator` - funds scratch and zone-list allocation.
+            /// - `perm_scratch` - reusable scratch for row indices.
+            /// - `visited_scratch` - reusable scratch for cycle marks.
+            fn consolidateZones(
+                self: *Self,
+                allocator: std.mem.Allocator,
+                perm_scratch: *std.ArrayListUnmanaged(u32),
+                visited_scratch: *std.ArrayListUnmanaged(u8),
+            ) EcsError!void {
+                const n = self.refs.items.len;
+                if (n == 0) {
+                    self.depth_zones.clearRetainingCapacity();
+                    return;
+                }
+                try perm_scratch.resize(allocator, n);
+                for (0..n) |i| {
+                    perm_scratch.items[i] = @intCast(i);
+                }
+                const Ctx = struct {
+                    depths: []const u32,
+                    refs: []const EntityReference,
+                    fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                        const da = ctx.depths[ctx.refs[a].id];
+                        const db = ctx.depths[ctx.refs[b].id];
+                        return da < db or (da == db and a < b);
+                    }
+                };
+                std.mem.sort(u32, perm_scratch.items, Ctx{
+                    .depths = Ecs.entity_depth.items,
+                    .refs = self.refs.items,
+                }, Ctx.lessThan);
+                try visited_scratch.resize(allocator, n);
+                @memset(visited_scratch.items[0..n], 0);
+                const perm = perm_scratch.items;
+                const visited = visited_scratch.items;
+                for (self.cols()) |*col| {
+                    if (col.elem_size == 0) {
+                        continue;
+                    }
+                    const es = col.elem_size;
+                    var stack_tmp: [256]u8 = undefined;
+                    const heap_tmp = if (es > stack_tmp.len)
+                        try allocator.alloc(u8, es)
+                    else
+                        null;
+                    defer if (heap_tmp) |b| allocator.free(b);
+                    const tbuf: []u8 = if (heap_tmp) |b| b else stack_tmp[0..es];
+                    const buf = col.bytes.ptr;
+                    @memset(visited[0..n], 0);
                     for (0..n) |start| {
                         if (visited[start] != 0) {
                             continue;
                         }
-                        inline for (0..ArchTypes.len) |c| {
-                            const col = self.lists[c].items;
-                            const tmp = col[start];
-                            var j: usize = start;
-                            while (true) {
-                                const next: usize = perm[j];
-                                if (next == start) {
-                                    col[j] = tmp;
-                                    break;
-                                }
-                                col[j] = col[next];
-                                j = next;
+                        @memcpy(tbuf, buf[start * es ..][0..es]);
+                        var j: usize = start;
+                        while (true) {
+                            const next: usize = perm[j];
+                            if (next == start) {
+                                @memcpy(buf[j * es ..][0..es], tbuf);
+                                break;
                             }
-                        }
-                        {
-                            const refs = self.refs.items;
-                            const tmp = refs[start];
-                            var j: usize = start;
-                            while (true) {
-                                const next: usize = perm[j];
-                                if (next == start) {
-                                    refs[j] = tmp;
-                                    break;
-                                }
-                                refs[j] = refs[next];
-                                j = next;
-                            }
+                            @memcpy(buf[j * es ..][0..es], buf[next * es ..][0..es]);
+                            j = next;
                         }
                         var mark: usize = start;
                         while (true) {
@@ -1628,55 +1752,85 @@ pub fn ECS(comptime sets: anytype) type {
                             }
                         }
                     }
-                    self.depth_zones.clearRetainingCapacity();
-                    var i: usize = 0;
-                    while (i < n) {
-                        const depth = Ecs.entity_depth.items[self.refs.items[i].id];
-                        var j: usize = i + 1;
-                        while (j < n and Ecs.entity_depth.items[self.refs.items[j].id] == depth) : (j += 1) {}
-                        try self.depth_zones.append(allocator, .{
-                            .depth = depth,
-                            .offset = @intCast(i),
-                            .len = @intCast(j - i),
-                        });
-                        // Rewrite entity_row for every row of the run, not
-                        // just its first element.
-                        for (i..j) |pos| {
-                            Ecs.entity_row.items[self.refs.items[pos].id] = @intCast(pos);
+                }
+                {
+                    const refs = self.refs.items;
+                    @memset(visited[0..n], 0);
+                    for (0..n) |start| {
+                        if (visited[start] != 0) {
+                            continue;
                         }
-                        i = j;
+                        const tmp = refs[start];
+                        var j: usize = start;
+                        while (true) {
+                            const next: usize = perm[j];
+                            if (next == start) {
+                                refs[j] = tmp;
+                                break;
+                            }
+                            refs[j] = refs[next];
+                            j = next;
+                        }
+                        var mark: usize = start;
+                        while (true) {
+                            visited[mark] = 1;
+                            mark = perm[mark];
+                            if (mark == start) {
+                                break;
+                            }
+                        }
                     }
                 }
-                /// Releases every column list, the reference list and the
-                /// depth zones.
-                /// - `self` - storage to release.
-                /// - `allocator` - allocator that funded the lists.
-                fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-                    inline for (0..ArchTypes.len) |i| {
-                        self.lists[i].deinit(allocator);
+                self.depth_zones.clearRetainingCapacity();
+                var i: usize = 0;
+                while (i < n) {
+                    const depth = Ecs.entity_depth.items[self.refs.items[i].id];
+                    var j: usize = i + 1;
+                    while (j < n and Ecs.entity_depth.items[self.refs.items[j].id] == depth) : (j += 1) {}
+                    try self.depth_zones.append(allocator, .{
+                        .depth = depth,
+                        .offset = @intCast(i),
+                        .len = @intCast(j - i),
+                    });
+                    // Rewrite entity_row for every row of the run, not
+                    // just its first element.
+                    for (i..j) |pos| {
+                        Ecs.entity_row.items[self.refs.items[pos].id] = @intCast(pos);
                     }
-                    self.refs.deinit(allocator);
-                    self.depth_zones.deinit(allocator);
+                    i = j;
                 }
-            };
-        }
-        /// Concrete storage types, one per archetype, in archetype id order.
-        const DataTypes: [ARCH_COUNT]type = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var tmp: [ARCH_COUNT]type = undefined;
-            for (0..ARCH_COUNT) |j| {
-                tmp[j] = MakeData(Tables.arch_types[j], Tables.arch_lens[j]);
             }
-            break :blk tmp;
+            /// Releases every column buffer, the reference list and the
+            /// depth zones. Column metadata (`len`, `comp_id`, sizes) is
+            /// kept so the storage stays usable without re-init.
+            /// - `self` - storage to release.
+            /// - `allocator` - allocator that funded the lists.
+            fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+                for (self.cols()) |*col| {
+                    col.deinit(allocator);
+                }
+                self.refs.deinit(allocator);
+                self.refs = .empty;
+                self.depth_zones.deinit(allocator);
+                self.depth_zones = .empty;
+            }
         };
-        /// Heterogeneous tuple holding every archetype storage.
-        const Storages = std.meta.Tuple(&DataTypes);
-        /// Every archetype storage. Starts empty; rows are added at runtime.
-        var storages: Storages = blk: {
+        /// Every archetype storage. Homogeneous array: the comptime
+        /// generation only sets each entry's `len`, `arch` and column
+        /// metadata; rows are added at runtime.
+        var storages: [ARCH_COUNT]ArchetypeStorage = blk: {
             @setEvalBranchQuota(10_000_000);
-            var tmp: Storages = undefined;
+            var tmp: [ARCH_COUNT]ArchetypeStorage = undefined;
             for (0..ARCH_COUNT) |j| {
-                tmp[j] = DataTypes[j].empty();
+                tmp[j] = .{ .arch = @intCast(j), .len = Tables.arch_lens[j] };
+                for (0..Tables.arch_lens[j]) |k| {
+                    const T: type = Tables.arch_types[j][k];
+                    tmp[j].columns[k] = .{
+                        .elem_size = @sizeOf(T),
+                        .alignment = @alignOf(T),
+                        .comp_id = Tables.arch_comp[j][k],
+                    };
+                }
             }
             break :blk tmp;
         };
@@ -1707,98 +1861,9 @@ pub fn ECS(comptime sets: anytype) type {
             const bit: u6 = @intCast(arch_id & 63);
             Ecs.archetype_nonempty_bits[arch_id >> 6] &= ~(@as(u64, 1) << bit);
         }
-        /// Raw byte view of one component column: base pointer plus row count.
-        /// The pointer always carries the column element alignment (columns
-        /// are `ArrayListUnmanaged(T)` buffers), so casting back up only
-        /// needs `@alignCast` with the comptime-known `@alignOf(T)`.
-        const RawColumn = struct {
-            ptr: [*]u8,
-            len: usize,
-            /// Byte size of one row element. Lets byte-level writers (command
-            /// flushing) copy columns without any type dispatch or unrolling.
-            elem_size: usize,
-        };
-        /// Builds the column getter for one archetype: resolves a runtime
-        /// column index to the live column bytes. One tiny function per
-        /// archetype; columns per archetype are few, so the inner dispatch
-        /// is trivial and never touches other archetypes.
-        /// - `k` - archetype id. Must be comptime-known.
-        ///
-        /// Returns `*const fn` - getter bound to the archetype storage.
-        fn makeColumnGetter(comptime k: usize) *const fn (col: usize) RawColumn {
-            return struct {
-                fn f(col: usize) RawColumn {
-                    inline for (0..Tables.arch_lens[k]) |c| {
-                        if (col == c) {
-                            const items = Ecs.storages[k].lists[c].items;
-                            return .{
-                                .ptr = @ptrCast(items.ptr),
-                                .len = items.len,
-                                .elem_size = @sizeOf(Tables.arch_types[k][c]),
-                            };
-                        }
-                    }
-                    unreachable;
-                }
-            }.f;
-        }
-        /// Builds the entity-reference getter for one archetype. The element
-        /// type is uniform, so no casting is needed on this path.
-        /// - `k` - archetype id. Must be comptime-known.
-        ///
-        /// Returns `*const fn` - getter bound to the archetype storage.
-        fn makeRefsGetter(comptime k: usize) *const fn () []const EntityReference {
-            return struct {
-                fn f() []const EntityReference {
-                    return Ecs.storages[k].refs.items;
-                }
-            }.f;
-        }
-        /// Builds the depth-zone getter for one archetype. Zones share one
-        /// uniform type, so the getter is cast-free.
-        /// - `k` - archetype id. Must be comptime-known.
-        ///
-        /// Returns `*const fn` - getter bound to the archetype storage.
-        fn makeZonesGetter(comptime k: usize) *const fn () []const DepthZone {
-            return struct {
-                fn f() []const DepthZone {
-                    return Ecs.storages[k].depth_zones.items;
-                }
-            }.f;
-        }
-        /// Direct storage access by runtime archetype id: plain O(1) indexing
-        /// into a homogeneous fn-pointer array, no `inline for` chain over
-        /// all archetypes. The array is `const` (storage addresses and
-        /// getters are fixed), so there is nothing to keep in sync:
-        /// reallocations only replace column buffers, never the headers.
-        const column_getters: [ARCH_COUNT]*const fn (col: usize) RawColumn = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var out: [ARCH_COUNT]*const fn (col: usize) RawColumn = undefined;
-            for (0..ARCH_COUNT) |k| {
-                out[k] = makeColumnGetter(k);
-            }
-            break :blk out;
-        };
-        /// Direct entity-reference access by runtime archetype id. Backs
-        /// `Page.entities` and `countById` with one indirect call.
-        const refs_getters: [ARCH_COUNT]*const fn () []const EntityReference = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var out: [ARCH_COUNT]*const fn () []const EntityReference = undefined;
-            for (0..ARCH_COUNT) |k| {
-                out[k] = makeRefsGetter(k);
-            }
-            break :blk out;
-        };
-        /// Direct depth-zone access by runtime archetype id. Backs the
-        /// `Page` zone API with one indirect call, mirroring `refs_getters`.
-        const zones_getters: [ARCH_COUNT]*const fn () []const DepthZone = blk: {
-            @setEvalBranchQuota(10_000_000);
-            var out: [ARCH_COUNT]*const fn () []const DepthZone = undefined;
-            for (0..ARCH_COUNT) |k| {
-                out[k] = makeZonesGetter(k);
-            }
-            break :blk out;
-        };
+        /// Typed column access by runtime archetype id is plain O(1)
+        /// indexing into the homogeneous `storages` array; no getter
+        /// tables and no `inline for` dispatch chains.
         /// Entity slots in SoA form. Position `id` in every column describes
         /// one slot: `entity_generation[id]` is the live generation,
         /// `entity_archetype[id]` owns the row, `entity_row[id]` is the row.
@@ -2008,16 +2073,11 @@ pub fn ECS(comptime sets: anytype) type {
             const id: u32 = ref.id;
             Ecs.entity_depth.items[id] = depth;
             const index: u32 = blk: {
-                inline for (0..ARCH_COUNT) |k| {
-                    if (arch == k) {
-                        const idx = try Ecs.storages[k].insertRowAtDepth(allocator, &ref, depth);
-                        if (Ecs.storages[k].count() == 1) {
-                            Ecs.setArchetypeNonEmpty(arch);
-                        }
-                        break :blk idx;
-                    }
+                const idx = try Ecs.storages[arch].insertRowAtDepth(allocator, &ref, depth);
+                if (Ecs.storages[arch].count() == 1) {
+                    Ecs.setArchetypeNonEmpty(arch);
                 }
-                unreachable;
+                break :blk idx;
             };
             Ecs.entity_row.items[id] = index;
             Ecs.setEntityState(id, .{});
@@ -2038,20 +2098,14 @@ pub fn ECS(comptime sets: anytype) type {
             refs: []const EntityReference,
         ) EcsError!u32 {
             @setEvalBranchQuota(10_000_000);
-            var row_start: u32 = 0;
-            inline for (0..ARCH_COUNT) |k| {
-                if (arch == k) {
-                    row_start = @intCast(Ecs.storages[k].refs.items.len);
-                    for (refs) |ref| {
-                        const pos = try Ecs.storages[k].add(allocator, &ref);
-                        Ecs.entity_row.items[ref.id] = pos;
-                        Ecs.setEntityState(ref.id, .{});
-                    }
-                    if (row_start == 0) {
-                        Ecs.setArchetypeNonEmpty(arch);
-                    }
-                    break;
-                }
+            const row_start: u32 = @intCast(Ecs.storages[arch].refs.items.len);
+            for (refs) |ref| {
+                const pos = try Ecs.storages[arch].add(allocator, &ref);
+                Ecs.entity_row.items[ref.id] = pos;
+                Ecs.setEntityState(ref.id, .{});
+            }
+            if (row_start == 0) {
+                Ecs.setArchetypeNonEmpty(arch);
             }
             return row_start;
         }
@@ -2121,14 +2175,9 @@ pub fn ECS(comptime sets: anytype) type {
             @setEvalBranchQuota(10_000_000);
             const arch: u32 = Ecs.entity_archetype.items[id];
             const row: u32 = Ecs.entity_row.items[id];
-            inline for (0..ARCH_COUNT) |k| {
-                if (arch == k) {
-                    Ecs.storages[k].removeRow(row);
-                    if (Ecs.storages[k].count() == 0) {
-                        Ecs.clearArchetypeNonEmpty(arch);
-                    }
-                    break;
-                }
+            Ecs.storages[arch].removeRow(row);
+            if (Ecs.storages[arch].count() == 0) {
+                Ecs.clearArchetypeNonEmpty(arch);
             }
             Ecs.unlinkFromParent(id);
             Ecs.entity_parent.items[id] = NO_ENTITY;
@@ -2141,22 +2190,23 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.setEntityState(id, .{});
             try Ecs.free_ids.append(allocator, id);
         }
-        /// Names the storage type of one archetype id. Useful to name the
-        /// pointer returned by `storage` without repeating the lookup.
+        /// Names the storage type of one archetype id. All archetypes share
+        /// the homogeneous `ArchetypeStorage` type.
         /// - `id` - archetype id. Must be comptime-known.
         ///
-        /// Returns `type` - concrete SOA storage type of the archetype.
+        /// Returns `type` - storage type of the archetype.
         /// Private: direct storage access can reallocate; use `SystemHandler`.
         fn Storage(comptime id: usize) type {
-            return DataTypes[id];
+            _ = id;
+            return ArchetypeStorage;
         }
         /// Returns a direct pointer to the storage of the given component bundle.
-        /// Zero-cost typed access with no dispatch.
+        /// Plain array indexing, no dispatch.
         /// Private: direct storage access can reallocate; use `SystemHandler`.
         /// - `types` - component bundle. Must exactly match a declared archetype.
         ///
-        /// Returns `*Storage` - live SOA storage of the archetype.
-        fn storage(comptime types: anytype) *Storage(archetypeId(types)) {
+        /// Returns `*Storage` - live storage of the archetype.
+        fn storage(comptime types: anytype) *ArchetypeStorage {
             const id = comptime archetypeId(types);
             return &Ecs.storages[id];
         }
@@ -2208,16 +2258,11 @@ pub fn ECS(comptime sets: anytype) type {
             // depth-0 zone of its archetype. Recycled slots get every
             // hierarchy field reset, so a reused id never inherits links.
             const index: u32 = blk: {
-                inline for (0..ARCH_COUNT) |k| {
-                    if (id == k) {
-                        const idx = try Ecs.storages[k].insertRowAtDepth(allocator, &reference, 0);
-                        if (Ecs.storages[k].count() == 1) {
-                            Ecs.setArchetypeNonEmpty(id);
-                        }
-                        break :blk idx;
-                    }
+                const idx = try Ecs.storages[id].insertRowAtDepth(allocator, &reference, 0);
+                if (Ecs.storages[id].count() == 1) {
+                    Ecs.setArchetypeNonEmpty(id);
                 }
-                unreachable;
+                break :blk idx;
             };
             Ecs.entity_generation.items[new_id] = new_gen;
             Ecs.entity_archetype.items[new_id] = id;
@@ -2249,12 +2294,12 @@ pub fn ECS(comptime sets: anytype) type {
         ///
         /// Returns `u32` - current row count.
         pub fn countById(id: u32) u32 {
-            return @intCast(Ecs.refs_getters[id]().len);
+            return Ecs.storages[id].count();
         }
         /// Returns a pointer to one component value at a row. The pointer is
         /// mutable: component data lives in global storage, no handle state
-        /// is modified by the lookup. Resolves through the column registry:
-        /// one binary search plus one indirect call, no dispatch chain.
+        /// is modified by the lookup. One binary search over the sorted
+        /// component ids plus direct column indexing, no dispatch chain.
         /// Undeclared and absent types both report
         /// `ComponentNotFoundInArchetype`, exactly as before.
         /// - `arch_id` - archetype id owning the row.
@@ -2276,17 +2321,22 @@ pub fn ECS(comptime sets: anytype) type {
                 Ecs.archetypes[arch_id].component_ids,
                 comp_id,
             ) orelse return EcsError.ComponentNotFoundInArchetype;
-            const raw = Ecs.column_getters[arch_id](col);
-            if (index >= raw.len) {
+            const s = &Ecs.storages[arch_id];
+            const n: usize = s.refs.items.len;
+            if (index >= n) {
                 return EcsError.IndexOutOfBounds;
             }
-            const typed: [*]T = @ptrCast(@alignCast(raw.ptr));
+            if (@sizeOf(T) == 0) {
+                return @ptrCast(@alignCast(@constCast(s.columns[col].bytes.ptr)));
+            }
+            const column = &s.columns[col];
+            std.debug.assert(column.elem_size == @sizeOf(T));
+            const typed: [*]T = @ptrCast(@alignCast(column.bytes.ptr));
             return &typed[index];
         }
         /// Copies values of components shared by two archetype rows.
-        /// Single dispatch on the destination; source columns resolve through
-        /// the shared `getComponent` dispatch instead of a nested `A x A`
-        /// unroll, so codegen stays linear in the archetype count.
+        /// Pure runtime byte copies driven by the sorted component id
+        /// lists; no unrolling over archetypes or component types.
         /// - `src_id` - archetype to read from.
         /// - `src_index` - row position in the source storage.
         /// - `dst_id` - archetype to write to.
@@ -2297,23 +2347,21 @@ pub fn ECS(comptime sets: anytype) type {
             dst_id: u32,
             dst_index: u32,
         ) void {
-            @setEvalBranchQuota(10_000_000);
-            inline for (0..ARCH_COUNT) |d| {
-                if (dst_id == d) {
-                    inline for (0..Tables.arch_lens[d]) |ti| {
-                        const T: type = Tables.arch_types[d][ti];
-                        if (Ecs.getComponent(src_id, T, src_index)) |src_ptr| {
-                            Ecs.storages[d].lists[ti].items[dst_index] = src_ptr.*;
-                        } else |err| {
-                            if (err != EcsError.ComponentNotFoundInArchetype) {
-                                unreachable;
-                            }
-                        }
-                    }
-                    return;
+            const dst = &Ecs.storages[dst_id];
+            const src_ids = Ecs.archetypes[src_id].component_ids;
+            const src = &Ecs.storages[src_id];
+            for (dst.cols()) |*dcol| {
+                if (dcol.elem_size == 0) {
+                    continue;
                 }
+                const scol_idx = Ecs.binarySearchIds(src_ids, dcol.comp_id) orelse continue;
+                const scol = &src.columns[scol_idx];
+                const es = dcol.elem_size;
+                @memcpy(
+                    dcol.bytes.ptr[dst_index * es ..][0..es],
+                    scol.bytes.ptr[src_index * es ..][0..es],
+                );
             }
-            unreachable;
         }
         /// Binary-searches a sorted component id list.
         /// - `ids` - sorted component ids.
@@ -2518,9 +2566,14 @@ pub fn ECS(comptime sets: anytype) type {
                 const PageNamespace = @This();
                 /// Archetype this page reads and writes.
                 arch_id: u32,
-                /// Returns the whole mutable column of one component, resolved
-                /// through the column registry (binary search plus one
-                /// indirect call, no dispatch chain over archetypes).
+                /// Precomputed canonical column index per query component:
+                /// `cols[qi]` is the position in `storages[arch_id].columns`
+                /// of `query[qi]`. Filled once in comptime by
+                /// `PagesContainer`, so `get` needs no binary search.
+                cols: [query.len]u32 = [_]u32{0} ** query.len,
+                /// Returns the whole mutable column of one component via the
+                /// precomputed map: comptime query position plus one runtime
+                /// array load, no search and no indirect call.
                 /// - `self` - page to inspect.
                 /// - `T` - component type, must be part of the query.
                 ///
@@ -2531,22 +2584,28 @@ pub fn ECS(comptime sets: anytype) type {
                             @compileError("Requested component type is not part of this page.");
                         }
                     }
-                    const comp_id: u32 = comptime Ecs.componentId(T);
-                    const col = Ecs.binarySearchIds(
-                        Ecs.archetypes[self.arch_id].component_ids,
-                        comp_id,
-                    ) orelse return &[0]T{};
-                    const raw = Ecs.column_getters[self.arch_id](col);
-                    const typed: [*]T = @ptrCast(@alignCast(raw.ptr));
-                    return typed[0..raw.len];
+                    const qi = comptime indexOfType(query, T);
+                    const s = &Ecs.storages[self.arch_id];
+                    const n = s.refs.items.len;
+                    if (n == 0) {
+                        return &[0]T{};
+                    }
+                    if (@sizeOf(T) == 0) {
+                        const base: [*]T = @ptrCast(@alignCast(@constCast(s.columns[self.cols[qi]].bytes.ptr)));
+                        return base[0..n];
+                    }
+                    const col = &s.columns[self.cols[qi]];
+                    std.debug.assert(col.elem_size == @sizeOf(T));
+                    const typed: [*]T = @ptrCast(@alignCast(col.bytes.ptr));
+                    return typed[0..n];
                 }
-                /// Returns the entity reference column, read-only, via the
-                /// refs registry (one indirect call).
+                /// Returns the entity reference column, read-only, by direct
+                /// indexing into the homogeneous storage array.
                 /// - `self` - page to inspect.
                 ///
                 /// Returns `[]const EntityReference` - read-only reference list.
                 pub fn entities(self: *const PageNamespace) []const EntityReference {
-                    return Ecs.refs_getters[self.arch_id]();
+                    return Ecs.storages[self.arch_id].refs.items;
                 }
                 /// Returns an immutable reference to the source archetype info.
                 /// - `self` - page to inspect.
@@ -2597,13 +2656,18 @@ pub fn ECS(comptime sets: anytype) type {
                                 @compileError("Requested component type is not part of this page.");
                             }
                         }
-                        const comp_id: u32 = comptime Ecs.componentId(T);
-                        const col = Ecs.binarySearchIds(
-                            Ecs.archetypes[self.page.arch_id].component_ids,
-                            comp_id,
-                        ) orelse return &[0]T{};
-                        const raw = Ecs.column_getters[self.page.arch_id](col);
-                        const typed: [*]T = @ptrCast(@alignCast(raw.ptr));
+                        const qi = comptime indexOfType(query, T);
+                        const s = &Ecs.storages[self.page.arch_id];
+                        if (self.zone.len == 0) {
+                            return &[0]T{};
+                        }
+                        if (@sizeOf(T) == 0) {
+                            const base: [*]T = @ptrCast(@alignCast(@constCast(s.columns[self.page.cols[qi]].bytes.ptr)));
+                            return base[self.zone.offset..][0..self.zone.len];
+                        }
+                        const col = &s.columns[self.page.cols[qi]];
+                        std.debug.assert(col.elem_size == @sizeOf(T));
+                        const typed: [*]T = @ptrCast(@alignCast(col.bytes.ptr));
                         return typed[self.zone.offset..][0..self.zone.len];
                     }
                     /// Returns the zone's entity reference slice.
@@ -2611,7 +2675,7 @@ pub fn ECS(comptime sets: anytype) type {
                     ///
                     /// Returns `[]const EntityReference` - zone row references.
                     pub fn entities(self: *const ZoneView) []const EntityReference {
-                        return Ecs.refs_getters[self.page.arch_id]()[self.zone.offset..][0..self.zone.len];
+                        return Ecs.storages[self.page.arch_id].refs.items[self.zone.offset..][0..self.zone.len];
                     }
                 };
                 /// Returns every depth zone of the page, sorted ascending by
@@ -2621,7 +2685,7 @@ pub fn ECS(comptime sets: anytype) type {
                 ///
                 /// Returns `[]const DepthZone` - zone list of the archetype.
                 pub fn depthZones(self: *const PageNamespace) []const DepthZone {
-                    return Ecs.zones_getters[self.arch_id]();
+                    return Ecs.storages[self.arch_id].depth_zones.items;
                 }
                 /// Returns the zone of one depth, or null when the page holds
                 /// no entity at that depth.
@@ -2630,7 +2694,7 @@ pub fn ECS(comptime sets: anytype) type {
                 ///
                 /// Returns `?DepthZone` - zone descriptor, or null.
                 pub fn depthZone(self: *const PageNamespace, depth: u32) ?DepthZone {
-                    const zones = Ecs.zones_getters[self.arch_id]();
+                    const zones = Ecs.storages[self.arch_id].depth_zones.items;
                     var lo: usize = 0;
                     var hi: usize = zones.len;
                     while (lo < hi) {
@@ -2651,14 +2715,14 @@ pub fn ECS(comptime sets: anytype) type {
                 ///
                 /// Returns `usize` - depth zone count.
                 pub fn depthCount(self: *const PageNamespace) usize {
-                    return Ecs.zones_getters[self.arch_id]().len;
+                    return Ecs.storages[self.arch_id].depth_zones.items.len;
                 }
                 /// Deepest depth present in the page, or null when empty.
                 /// - `self` - page to inspect.
                 ///
                 /// Returns `?u32` - deepest depth, or null.
                 pub fn maxDepth(self: *const PageNamespace) ?u32 {
-                    const zones = Ecs.zones_getters[self.arch_id]();
+                    const zones = Ecs.storages[self.arch_id].depth_zones.items;
                     if (zones.len == 0) {
                         return null;
                     }
@@ -2688,7 +2752,7 @@ pub fn ECS(comptime sets: anytype) type {
                 ///
                 /// Returns `ZoneView` - view over the indexed zone rows.
                 pub fn zoneAt(self: *const PageNamespace, index: usize) ZoneView {
-                    const z = Ecs.zones_getters[self.arch_id]()[index];
+                    const z = Ecs.storages[self.arch_id].depth_zones.items[index];
                     return ZoneView{
                         .page = self.*,
                         .zone = z,
@@ -2811,11 +2875,26 @@ pub fn ECS(comptime sets: anytype) type {
                 /// call for the same query.
                 var nonempty_buf: [matched.len]Page(include) = undefined;
                 /// Immutable array of every matched page, precomputed once.
+                /// Each entry carries its archetype id plus the precomputed
+                /// query-to-column map, so `Page.get` needs no search.
                 const all_pages: [matched.len]Page(include) = blk: {
                     @setEvalBranchQuota(10_000_000);
                     var arr: [matched.len]Page(include) = undefined;
                     for (0..matched.len) |i| {
-                        arr[i] = .{ .arch_id = matched.list[i] };
+                        const a = matched.list[i];
+                        var cols: [query.len]u32 = undefined;
+                        for (qids, 0..) |qid, qi| {
+                            const ids = Tables.arch_comp[a][0..Tables.arch_lens[a]];
+                            var found: u32 = 0;
+                            for (ids, 0..) |cid, ci| {
+                                if (cid == qid) {
+                                    found = @intCast(ci);
+                                    break;
+                                }
+                            }
+                            cols[qi] = found;
+                        }
+                        arr[i] = .{ .arch_id = a, .cols = cols };
                     }
                     break :blk arr;
                 };
@@ -3220,14 +3299,9 @@ pub fn ECS(comptime sets: anytype) type {
             ) EcsError!void {
                 @setEvalBranchQuota(10_000_000);
                 const id: u32 = @intCast(comptime archetypeId(bundle));
-                inline for (0..ARCH_COUNT) |k| {
-                    if (id == k) {
-                        for (Ecs.storages[k].refs.items) |ref| {
-                            const entity_index = try Ecs.requireIdle(ref);
-                            Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
-                        }
-                        break;
-                    }
+                for (Ecs.storages[id].refs.items) |ref| {
+                    const entity_index = try Ecs.requireIdle(ref);
+                    Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
                 }
                 try Ecs.commands.append(self.allocator, .{ .destroy_page = id });
             }
@@ -3373,14 +3447,15 @@ pub fn ECS(comptime sets: anytype) type {
         /// - `row` - row position to fill.
         /// - `bytes` - packed values, one element per column.
         fn fillRowBytes(arch: u32, row: u32, bytes: []const u8) void {
-            const ncols: usize = Ecs.archetypes[arch].component_ids.len;
+            const s = &Ecs.storages[arch];
             var off: usize = 0;
-            var col: usize = 0;
-            while (col < ncols) : (col += 1) {
-                const raw = Ecs.column_getters[arch](col);
-                const dst = (raw.ptr + row * raw.elem_size)[0..raw.elem_size];
-                @memcpy(dst, bytes[off..][0..raw.elem_size]);
-                off += raw.elem_size;
+            for (s.cols()) |*col| {
+                const es = col.elem_size;
+                if (es == 0) {
+                    continue;
+                }
+                @memcpy(col.bytes.ptr[row * es ..][0..es], bytes[off..][0..es]);
+                off += es;
             }
         }
         /// Applies every queued command in FIFO order, then clears the queue.
@@ -3411,16 +3486,11 @@ pub fn ECS(comptime sets: anytype) type {
                         }
                         // Rebuild the depth zones once. Rows are still in
                         // append order here; consolidation moves them after.
-                        inline for (0..ARCH_COUNT) |k| {
-                            if (c.arch == k) {
-                                try Ecs.storages[k].consolidateZones(
-                                    allocator,
-                                    &Ecs.zone_scratch_perm,
-                                    &Ecs.zone_scratch_visited,
-                                );
-                                break;
-                            }
-                        }
+                        try Ecs.storages[c.arch].consolidateZones(
+                            allocator,
+                            &Ecs.zone_scratch_perm,
+                            &Ecs.zone_scratch_visited,
+                        );
                         allocator.free(c.bytes);
                         allocator.free(c.reserved);
                         allocator.free(c.from_free);
@@ -3454,16 +3524,11 @@ pub fn ECS(comptime sets: anytype) type {
                         for (c.reserved, 0..) |_, j| {
                             Ecs.fillRowBytes(c.arch, row_start + @as(u32, @intCast(j)), c.bytes);
                         }
-                        inline for (0..ARCH_COUNT) |k| {
-                            if (c.arch == k) {
-                                try Ecs.storages[k].consolidateZones(
-                                    allocator,
-                                    &Ecs.zone_scratch_perm,
-                                    &Ecs.zone_scratch_visited,
-                                );
-                                break;
-                            }
-                        }
+                        try Ecs.storages[c.arch].consolidateZones(
+                            allocator,
+                            &Ecs.zone_scratch_perm,
+                            &Ecs.zone_scratch_visited,
+                        );
                         allocator.free(c.bytes);
                         allocator.free(c.reserved);
                         allocator.free(c.from_free);
@@ -3483,20 +3548,15 @@ pub fn ECS(comptime sets: anytype) type {
                         }
                     },
                     .destroy_page => |arch| {
-                        inline for (0..ARCH_COUNT) |k| {
-                            if (arch == k) {
-                                // Drain from the tail: every destroy cascades
-                                // into the subtree, and swap-removal can touch
-                                // rows of this very archetype, so a forward
-                                // `for` over refs would skip survivors. Taking
-                                // the last row every time re-reads the live
-                                // length and terminates exactly at empty.
-                                while (Ecs.storages[k].refs.items.len > 0) {
-                                    const ref = Ecs.storages[k].refs.items[Ecs.storages[k].refs.items.len - 1];
-                                    try ref.destroy(allocator);
-                                }
-                                break;
-                            }
+                        // Drain from the tail: every destroy cascades
+                        // into the subtree, and swap-removal can touch
+                        // rows of this very archetype, so a forward
+                        // `for` over refs would skip survivors. Taking
+                        // the last row every time re-reads the live
+                        // length and terminates exactly at empty.
+                        while (Ecs.storages[arch].refs.items.len > 0) {
+                            const ref = Ecs.storages[arch].refs.items[Ecs.storages[arch].refs.items.len - 1];
+                            try ref.destroy(allocator);
                         }
                     },
                     .reparent => |r| {
@@ -3585,12 +3645,8 @@ pub fn ECS(comptime sets: anytype) type {
                         }
                     },
                     .destroy_page => |arch| {
-                        inline for (0..ARCH_COUNT) |k| {
-                            if (arch == k) {
-                                for (Ecs.storages[k].refs.items) |ref| {
-                                    Ecs.clearPending(ref.id);
-                                }
-                            }
+                        for (Ecs.storages[arch].refs.items) |ref| {
+                            Ecs.clearPending(ref.id);
                         }
                     },
                 }
@@ -3654,9 +3710,8 @@ pub fn ECS(comptime sets: anytype) type {
         /// - `allocator` - allocator that funded all storage.
         pub fn deinit(allocator: std.mem.Allocator) void {
             @setEvalBranchQuota(10_000_000);
-            inline for (0..ARCH_COUNT) |k| {
-                Ecs.storages[k].deinit(allocator);
-                Ecs.storages[k] = DataTypes[k].empty();
+            for (&Ecs.storages) |*s| {
+                s.deinit(allocator);
             }
             @memset(Ecs.archetype_nonempty_bits[0..], 0);
             Ecs.discardCommands(allocator);
