@@ -44,12 +44,14 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
 fn print(h: *ECS.SystemHandler) anyerror!void {
     std.debug.print("Is player 1 alive: {}\n", .{player1.isAlive()});
     for (h.pages(.{Position}, null).nonEmptyPages()) |p| {
-        for (p.get(Position)) |value| {
-            std.debug.print("Pos: {any}\n", .{value});
-        }
+        for (p.depthZones()) |d| {
+            for (p.get(Position), d.offset..d.len) |value, _| {
+                std.debug.print("Pos: {any}\n", .{value});
+            }
 
-        for (p.entities()) |e| {
-            std.debug.print("Parent: {any}\n", .{e.parent()});
+            for (p.entities()) |e| {
+                std.debug.print("Parent: {any}\n", .{e.parent()});
+            }
         }
     }
 }
