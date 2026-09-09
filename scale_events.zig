@@ -394,6 +394,44 @@ test "bench S6: destroy entities carrying events (purge path, max N)" {
     try std.testing.expect(countEvents(Ecs1, allocator) == 0);
 }
 
+test "bench S9: lifecycle filing overhead (mass create/destroy)" {
+    const allocator = std.testing.allocator;
+    defer Ecs1.deinit(allocator);
+    const n = Ns[Ns.len - 1];
+    const S = struct {
+        const S = @This();
+        var count: u32 = 0;
+        var create_ns: u64 = 0;
+        var kill_ns: u64 = 0;
+        fn create_many(h: *Ecs1.SystemHandler) anyerror!void {
+            const t0 = stamp();
+            _ = try h.cmdCreateN(&[_]type{Pos}, .{Pos{}}, S.count);
+            S.create_ns = nsSince(t0);
+        }
+        fn check_created(h: *Ecs1.SystemHandler) anyerror!void {
+            try std.testing.expect(h.count(&[_]type{Pos}, null) == S.count);
+            var total: usize = 0;
+            for (h.allEvents(Ecs1.Create)) |page| {
+                total += page.count();
+            }
+            try std.testing.expect(total == S.count);
+        }
+        fn kill(h: *Ecs1.SystemHandler) anyerror!void {
+            const t0 = stamp();
+            try h.cmdDestroyPages(&[_]type{Pos}, null);
+            S.kill_ns = nsSince(t0);
+        }
+    };
+    S.count = @intCast(n);
+    var t0 = stamp();
+    try Ecs1.Schedule(.{ S.create_many, S.check_created }).run(allocator);
+    std.debug.print("S9a mass-create 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(S.create_ns), ms(nsSince(t0)) });
+    t0 = stamp();
+    try Ecs1.Schedule(.{S.kill}).run(allocator);
+    std.debug.print("S9b mass-destroy 1-page N={d}: queue {d:.3} ms, frame {d:.2} ms\n", .{ n, ms(S.kill_ns), ms(nsSince(t0)) });
+    try std.testing.expect(countEvents(Ecs1, allocator) == 0);
+}
+
 test "bench S7/S8: batch set and destroy-for at max N (single page)" {
     const allocator = std.testing.allocator;
     defer Ecs1.deinit(allocator);

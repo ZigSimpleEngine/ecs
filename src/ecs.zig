@@ -473,6 +473,7 @@ pub fn ECS(comptime sets: anytype) type {
                     return EcsError.EntityIsNotAlive;
                 }
                 const entity_index: u32 = self.id;
+                const old_parent_id: u32 = Ecs.entity_parent.items[entity_index];
                 if (new_parent_id != NO_ENTITY) {
                     if (new_parent_id == entity_index) {
                         return EcsError.HierarchyCycle;
@@ -498,6 +499,31 @@ pub fn ECS(comptime sets: anytype) type {
                 if (new_parent_id != NO_ENTITY) {
                     Ecs.linkChild(entity_index, new_parent_id);
                 }
+                // Parent change files Reparent (same-parent reorderings are
+                // silent); depth changes file DepthUpdate per member below,
+                // including the root itself.
+                if (old_parent_id != new_parent_id) {
+                    const old_parent: ?EntityReference = if (old_parent_id == NO_ENTITY)
+                        null
+                    else
+                        EntityReference{
+                            .id = @intCast(old_parent_id),
+                            .gen = Ecs.entity_generation.items[old_parent_id],
+                        };
+                    const new_parent: ?EntityReference = if (new_parent_id == NO_ENTITY)
+                        null
+                    else
+                        EntityReference{
+                            .id = @intCast(new_parent_id),
+                            .gen = Ecs.entity_generation.items[new_parent_id],
+                        };
+                    try EventStore(Reparent).fileLifecycle(
+                        allocator,
+                        Ecs.entity_archetype.items[entity_index],
+                        self.*,
+                        .{ .old_parent = old_parent, .new_parent = new_parent },
+                    );
+                }
                 if (delta == 0) {
                     return;
                 }
@@ -517,6 +543,22 @@ pub fn ECS(comptime sets: anytype) type {
                 for (order.items) |id| {
                     const next_depth: u32 = @intCast(@as(i64, Ecs.entity_depth.items[id]) + delta);
                     Ecs.entity_depth.items[id] = next_depth;
+                    // Every moved member files DepthUpdate, the reparented
+                    // root included: one entity may carry both Reparent and
+                    // DepthUpdate records.
+                    const member = EntityReference{
+                        .id = @intCast(id),
+                        .gen = Ecs.entity_generation.items[id],
+                    };
+                    try EventStore(DepthUpdate).fileLifecycle(
+                        allocator,
+                        Ecs.entity_archetype.items[id],
+                        member,
+                        .{
+                            .old_depth = @intCast(@as(i64, next_depth) - delta),
+                            .new_depth = next_depth,
+                        },
+                    );
                     const arch: u32 = Ecs.entity_archetype.items[id];
                     const row: u32 = Ecs.entity_row.items[id];
                     const ref = EntityReference{
@@ -598,6 +640,12 @@ pub fn ECS(comptime sets: anytype) type {
                 Ecs.entity_archetype.items[entity_index] = dest_id;
                 Ecs.entity_row.items[entity_index] = dest_index;
                 Ecs.setEntityState(entity_index, .{});
+                if (source_id != dest_id) {
+                    try EventStore(Migrate).fileLifecycle(allocator, dest_id, next, .{
+                        .from = source_id,
+                        .to = dest_id,
+                    });
+                }
                 return next;
             }
         };
@@ -2090,6 +2138,7 @@ pub fn ECS(comptime sets: anytype) type {
             };
             Ecs.entity_row.items[id] = index;
             Ecs.setEntityState(id, .{});
+            try EventStore(Create).fileLifecycle(allocator, arch, ref, .{});
             return index;
         }
         /// Appends rows for a batch of already-reserved slots (all at their
@@ -2112,6 +2161,7 @@ pub fn ECS(comptime sets: anytype) type {
                 const pos = try Ecs.storages[arch].add(allocator, &ref);
                 Ecs.entity_row.items[ref.id] = pos;
                 Ecs.setEntityState(ref.id, .{});
+                try EventStore(Create).fileLifecycle(allocator, arch, ref, .{});
             }
             if (row_start == 0) {
                 Ecs.setArchetypeNonEmpty(arch);
@@ -2184,6 +2234,7 @@ pub fn ECS(comptime sets: anytype) type {
             @setEvalBranchQuota(10_000_000);
             const arch: u32 = Ecs.entity_archetype.items[id];
             const row: u32 = Ecs.entity_row.items[id];
+            const dead = EntityReference{ .id = @intCast(id), .gen = Ecs.entity_generation.items[id] };
             Ecs.storages[arch].removeRow(row);
             if (Ecs.storages[arch].count() == 0) {
                 Ecs.clearArchetypeNonEmpty(arch);
@@ -2195,9 +2246,13 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_prev_sibling.items[id] = NO_ENTITY;
             Ecs.entity_depth.items[id] = 0;
             Ecs.entity_pending_parent.items[id] = NO_ENTITY;
+            // Purge live-generation entries, then file the Destroy record
+            // with the pre-bump generation: ordering keeps the record while
+            // history of past instances (older generations) also survives.
+            try Ecs.notifyEventEntityDestroyed(id, allocator);
+            try EventStore(Destroy).fileLifecycle(allocator, arch, dead, .{ .archetype = arch });
             Ecs.entity_generation.items[id] +%= 1;
             Ecs.setEntityState(id, .{});
-            try Ecs.notifyEventEntityDestroyed(id, allocator);
             try Ecs.free_ids.append(allocator, id);
         }
         /// Names the storage type of one archetype id. All archetypes share
@@ -2284,6 +2339,7 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_depth.items[new_id] = 0;
             Ecs.entity_pending_parent.items[new_id] = NO_ENTITY;
             Ecs.setEntityState(new_id, .{});
+            try EventStore(Create).fileLifecycle(allocator, id, reference, .{});
             return reference;
         }
         /// Creates `count` entities at once, all roots (depth 0). Slots are
@@ -2977,6 +3033,42 @@ pub fn ECS(comptime sets: anytype) type {
                 index: u32,
             };
         }
+        /// Lifecycle event filed automatically for every created entity, once
+        /// per creation, visible to later systems until the frame end. Empty:
+        /// the entity comes from the page itself.
+        pub const Create = struct {};
+        /// Lifecycle event filed automatically for every destroyed entity.
+        /// The archetype is captured because a dead reference resolves nothing.
+        pub const Destroy = struct {
+            /// Archetype the entity belonged to when destroyed.
+            archetype: u32,
+        };
+        /// Lifecycle event filed automatically for every entity migrate.
+        /// Repeat migrates in one frame append (full history).
+        pub const Migrate = struct {
+            /// Archetype the entity leaves.
+            from: u32,
+            /// Archetype the entity enters.
+            to: u32,
+        };
+        /// Lifecycle event filed automatically when an entity parent changes
+        /// (same-parent reorderings excluded). Depth changes ride in a
+        /// separate `DepthUpdate` record, so one entity may carry both.
+        pub const Reparent = struct {
+            /// Previous parent, or null when the entity was a root.
+            old_parent: ?EntityReference,
+            /// New parent, or null when detached into a root.
+            new_parent: ?EntityReference,
+        };
+        /// Lifecycle event filed automatically for every entity whose
+        /// hierarchy depth changes: reparented roots and moved subtree
+        /// members alike.
+        pub const DepthUpdate = struct {
+            /// Depth before the change.
+            old_depth: u32,
+            /// Depth after the change.
+            new_depth: u32,
+        };
         /// Dense page of events of one payload type over one archetype:
         /// `entities[i]` carries `values[i]`. Pages of one payload are sorted
         /// ascending by `arch_id` and only non-empty pages are stored.
@@ -3002,8 +3094,14 @@ pub fn ECS(comptime sets: anytype) type {
                 values: std.ArrayListUnmanaged(E) = .empty,
                 /// Entity slot id to row position inside this page. Serviced
                 /// by the store on every insert/remove; private by contract,
-                /// never touch it directly.
+                /// never touch it directly. With duplicate rows (lifecycle
+                /// history) it points at one of them; lookups degrade to a
+                /// page scan, which stays exact.
                 index: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+                /// Whether the page may hold several rows for one slot id
+                /// (lifecycle history). Set on the first duplicate append,
+                /// cleared with the page. Steers purge onto the linear path.
+                has_dupes: bool = false,
                 /// Counts events on the page.
                 /// - `self` - page to inspect.
                 ///
@@ -3168,20 +3266,29 @@ pub fn ECS(comptime sets: anytype) type {
                     page: usize,
                     index: usize,
                 };
-                /// Locates a committed event by entity id plus generation.
-                /// Page lookup is binary, row lookup is one hash probe per
-                /// page; pages holding events are few, so this stays flat.
+                /// Locates a committed event by entity id plus generation,
+                /// returning the oldest matching row. Page lookup is binary,
+                /// row lookup is one hash probe per page; pages holding events
+                /// are few, so this stays flat. Only pages flagged with
+                /// duplicates degrade to a linear scan, which stays exact.
                 /// - `ref` - entity reference to look up.
                 ///
                 /// Returns `?Location` - page and row, or null when absent.
                 fn findByEntity(ref: EntityReference) ?Location {
                     for (committed.items, 0..) |*page, pi| {
-                        const k = page.index.get(ref.id) orelse continue;
-                        if (k >= page.entities.items.len) {
-                            continue;
+                        if (page.index.get(ref.id)) |k| {
+                            if (k < page.entities.items.len and
+                                page.entities.items[k].gen == ref.gen)
+                            {
+                                return .{ .page = pi, .index = k };
+                            }
                         }
-                        if (page.entities.items[k].gen == ref.gen) {
-                            return .{ .page = pi, .index = k };
+                        if (page.has_dupes) {
+                            for (page.entities.items, 0..) |e, k| {
+                                if (e.id == ref.id and e.gen == ref.gen) {
+                                    return .{ .page = pi, .index = k };
+                                }
+                            }
                         }
                     }
                     return null;
@@ -3212,6 +3319,59 @@ pub fn ECS(comptime sets: anytype) type {
                         old.index.deinit(allocator);
                     }
                 }
+                /// Appends one committed entry in O(1) amortized, always as a
+                /// new row: unlike `upsertCommitted` it never collapses an
+                /// existing row, so lifecycle actions accumulate full history.
+                /// Growth is atomic (capacities first, index put before the
+                /// infallible appends). Marks the page duplicated when the
+                /// slot id is already present.
+                /// - `allocator` - funds page and row allocation.
+                /// - `arch` - archetype page to file under.
+                /// - `ref` - entity carrying the event.
+                /// - `value` - payload to store.
+                fn appendRow(
+                    allocator: std.mem.Allocator,
+                    arch: u32,
+                    ref: EntityReference,
+                    value: E,
+                ) EcsError!void {
+                    const pi = findPageIndex(arch) orelse blk: {
+                        const pos = pageInsertIndex(arch);
+                        try committed.insert(allocator, pos, .{ .arch_id = arch });
+                        break :blk pos;
+                    };
+                    const page = &committed.items[pi];
+                    const at: u32 = @intCast(page.entities.items.len);
+                    try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + 1);
+                    try page.values.ensureTotalCapacity(allocator, page.values.items.len + 1);
+                    try page.index.ensureTotalCapacity(allocator, @intCast(page.entities.items.len + 1));
+                    if (page.index.get(ref.id) != null) {
+                        page.has_dupes = true;
+                    } else {
+                        page.index.putAssumeCapacity(ref.id, at);
+                    }
+                    page.entities.appendAssumeCapacity(ref);
+                    page.values.appendAssumeCapacity(value);
+                }
+                /// Files one lifecycle event directly into committed pages,
+                /// bypassing the pending queue: lifecycle actions run inside
+                /// the entity flush, after the event flush already passed, so
+                /// queueing would defer them past the frame-end clear.
+                /// Registers the payload on first use (for frame-end clear
+                /// and deinit). Repeat actions append history, never collapse.
+                /// - `allocator` - funds page and row allocation.
+                /// - `arch` - archetype page to file under (live archetype).
+                /// - `ref` - entity carrying the event.
+                /// - `value` - payload to store.
+                fn fileLifecycle(
+                    allocator: std.mem.Allocator,
+                    arch: u32,
+                    ref: EntityReference,
+                    value: E,
+                ) EcsError!void {
+                    try Store.ensureRegistered(allocator);
+                    try appendRow(allocator, arch, ref, value);
+                }
                 /// Inserts or rewrites one committed entry in O(1) amortized,
                 /// creating the page when missing. Row lookup is one hash
                 /// probe; growth is atomic: every capacity is ensured up
@@ -3234,9 +3394,24 @@ pub fn ECS(comptime sets: anytype) type {
                     };
                     const page = &committed.items[pi];
                     if (page.index.get(ref.id)) |k| {
-                        page.entities.items[k] = ref;
-                        page.values.items[k] = value;
-                        return;
+                        if (k < page.entities.items.len) {
+                            page.entities.items[k] = ref;
+                            page.values.items[k] = value;
+                            return;
+                        }
+                    }
+                    // Probe miss on a duplicated page: collapse the oldest
+                    // match and repair the index. Never runs while the map
+                    // is exact, so fresh appends stay O(1).
+                    if (page.has_dupes) {
+                        for (page.entities.items, 0..) |e, k| {
+                            if (e.id == ref.id) {
+                                page.entities.items[k] = ref;
+                                page.values.items[k] = value;
+                                try page.index.put(allocator, ref.id, @intCast(k));
+                                return;
+                            }
+                        }
                     }
                     const at: u32 = @intCast(page.entities.items.len);
                     try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + 1);
@@ -3245,14 +3420,18 @@ pub fn ECS(comptime sets: anytype) type {
                     page.entities.appendAssumeCapacity(ref);
                     page.values.appendAssumeCapacity(value);
                 }
-                /// Removes one committed entry by entity reference, dropping
-                /// the page when it becomes empty. Silent when absent.
-                /// - `allocator` - funds the moved-row index update and frees
-                ///   an emptied page.
+                /// Removes every committed entry of an entity reference
+                /// (all history rows sharing its id plus generation),
+                /// dropping pages that become empty. Silent when absent.
+                /// Handles of one `(entity, generation)` pair are aliases:
+                /// destroying one destroys them all.
+                /// - `allocator` - funds moved-row index updates and frees
+                ///   emptied pages.
                 /// - `ref` - entity reference to remove.
                 fn removeCommitted(allocator: std.mem.Allocator, ref: EntityReference) EcsError!void {
-                    const loc = findByEntity(ref) orelse return;
-                    try removeAt(allocator, loc.page, loc.index);
+                    while (findByEntity(ref)) |loc| {
+                        try removeAt(allocator, loc.page, loc.index);
+                    }
                 }
                 /// Shared target check for every set path: the slot must exist
                 /// and be alive or reserved by `cmdCreate` in the same system;
@@ -3373,8 +3552,9 @@ pub fn ECS(comptime sets: anytype) type {
                 /// Queues destroys for a slice of entities in O(n): every
                 /// entry is validated first (present, not destroy-pending),
                 /// so a bad entry fails the batch before anything is queued.
-                /// A duplicated entity in the slice reports
-                /// `EventHasPendingCommand`, mirroring the double-destroy rule.
+                /// A duplicated entity inside one call collapses silently;
+                /// a repeated call reports `EventHasPendingCommand`, mirroring
+                /// the double-destroy rule.
                 /// - `allocator` - funds the queued ops.
                 /// - `entities` - entity references holding the events. Only
                 ///   id plus generation are used; handles are not required.
@@ -3396,6 +3576,11 @@ pub fn ECS(comptime sets: anytype) type {
                     try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
                     for (entities) |e| {
                         if (pending_index.get(e.id)) |idx| {
+                            // Pre-existing destroys errored above; a destroy
+                            // met here was queued by this very call: skip it.
+                            if (pending.items[idx].op == .destroy) {
+                                continue;
+                            }
                             pending.items[idx].op = .{ .destroy = {} };
                         } else {
                             pending_index.putAssumeCapacity(e.id, @intCast(pending.items.len));
@@ -3493,26 +3678,71 @@ pub fn ECS(comptime sets: anytype) type {
                     pending_index = .empty;
                 }
                 /// Purges every committed entry of one destroyed slot in
-                /// O(pages): one hash probe per page plus O(1) removals.
-                /// Matched by id alone: the slot is dead, so any generation
-                /// is stale.
+                /// O(pages) when rows are unique: one hash probe per page
+                /// plus O(1) removals. Only live-generation rows go: history
+                /// rows of past slot instances (older generations) survive,
+                /// so destroy-create-destroy keeps every `Destroy` record.
+                /// Pages with duplicate rows take one linear pass instead.
                 /// - `id` - destroyed entity slot id.
                 /// - `allocator` - funds moved-row index updates and frees
                 ///   emptied pages.
                 fn onEntityDestroyed(id: u32, allocator: std.mem.Allocator) EcsError!void {
+                    const live: u8 = Ecs.entity_generation.items[id];
                     var pi: usize = 0;
                     while (pi < committed.items.len) {
+                        if (!committed.items[pi].has_dupes) {
+                            const before: usize = committed.items.len;
+                            const hit = committed.items[pi].index.get(id);
+                            if (hit) |k| {
+                                if (k < committed.items[pi].entities.items.len and
+                                    committed.items[pi].entities.items[k].gen == live)
+                                {
+                                    try removeAt(allocator, pi, k);
+                                    if (committed.items.len == before) {
+                                        pi += 1;
+                                    }
+                                    continue;
+                                }
+                            } else {
+                                pi += 1;
+                                continue;
+                            }
+                        }
+                        // Slow path (duplicates, or a stale row shadowing a
+                        // live one): backward scan drops every live match.
+                        // Swap moves land in already-visited positions whose
+                        // verdicts are final, so no row is skipped.
                         const before: usize = committed.items.len;
-                        const k = committed.items[pi].index.get(id) orelse {
-                            pi += 1;
-                            continue;
-                        };
-                        try removeAt(allocator, pi, k);
-                        // One slot id appears at most once per page: advance
-                        // unless the page itself was dropped (the next page
-                        // shifted into its position).
+                        var k: usize = committed.items[pi].entities.items.len;
+                        while (k > 0) {
+                            k -= 1;
+                            const e = committed.items[pi].entities.items[k];
+                            if (e.id == id and e.gen == live) {
+                                try removeAt(allocator, pi, k);
+                                if (committed.items.len != before) {
+                                    break;
+                                }
+                            }
+                        }
                         if (committed.items.len == before) {
+                            rebuildIndex(pi);
                             pi += 1;
+                        }
+                    }
+                }
+                /// Rebuilds one page index from scratch, recomputing the
+                /// duplicate flag. Runs only after the linear purge path;
+                /// puts cannot fail: the map just shed rows, capacity suffices.
+                /// - `pi` - position of the page in `committed`.
+                fn rebuildIndex(pi: usize) void {
+                    const page = &committed.items[pi];
+                    page.index.clearRetainingCapacity();
+                    page.has_dupes = false;
+                    for (page.entities.items, 0..) |e, k| {
+                        if (page.index.get(e.id) != null) {
+                            page.has_dupes = true;
+                        } else {
+                            page.index.putAssumeCapacity(e.id, @intCast(k));
                         }
                     }
                 }
@@ -3534,22 +3764,57 @@ pub fn ECS(comptime sets: anytype) type {
                     const fresh = EntityReference{ .id = @intCast(id), .gen = new_gen };
                     if (old_arch == new_arch) {
                         if (findPageIndex(old_arch)) |pi| {
-                            const page = &committed.items[pi];
-                            if (page.index.get(id)) |k| {
-                                page.entities.items[k] = fresh;
+                            for (committed.items[pi].entities.items) |*e| {
+                                if (e.id == id) {
+                                    e.* = fresh;
+                                }
                             }
                         }
                         return;
                     }
-                    var moved: ?E = null;
-                    if (findPageIndex(old_arch)) |pi| {
-                        if (committed.items[pi].index.get(id)) |k| {
-                            moved = committed.items[pi].values.items[k];
-                            try removeAt(allocator, pi, k);
+                    // Move every row of the slot, oldest first: probe, else
+                    // the lowest matching row. Each step re-resolves the page
+                    // because removals and inserts shift `committed`.
+                    while (try moveOneRow(allocator, id, old_arch, new_arch, fresh)) {}
+                }
+                /// Moves a single event row of one slot to the destination
+                /// archetype page, refreshing its generation. History rows
+                /// append as new records, never collapsing.
+                /// - `allocator` - funds page and row allocation.
+                /// - `id` - migrated entity slot id.
+                /// - `old_arch` - archetype page to take from.
+                /// - `new_arch` - archetype page to file under.
+                /// - `fresh` - entity reference with the new generation.
+                ///
+                /// Returns `bool` - false when no row of the slot is left.
+                fn moveOneRow(
+                    allocator: std.mem.Allocator,
+                    id: u32,
+                    old_arch: u32,
+                    new_arch: u32,
+                    fresh: EntityReference,
+                ) EcsError!bool {
+                    const pi = findPageIndex(old_arch) orelse return false;
+                    const page = &committed.items[pi];
+                    var slot: ?usize = null;
+                    if (page.index.get(id)) |kk| {
+                        if (kk < page.entities.items.len) {
+                            slot = kk;
                         }
                     }
-                    const v = moved orelse return;
-                    try upsertCommitted(allocator, new_arch, fresh, v);
+                    if (slot == null and page.has_dupes) {
+                        for (page.entities.items, 0..) |e, kk| {
+                            if (e.id == id) {
+                                slot = kk;
+                                break;
+                            }
+                        }
+                    }
+                    const k = slot orelse return false;
+                    const v = page.values.items[k];
+                    try removeAt(allocator, pi, k);
+                    try appendRow(allocator, new_arch, fresh, v);
+                    return true;
                 }
             };
         }
@@ -4089,9 +4354,11 @@ pub fn ECS(comptime sets: anytype) type {
             /// only from `EventPage.handleAt`, so both misuse cases are
             /// observable: unknown or already gone events fail with
             /// `EventNotFound`, a second destroy queued in the same system
-            /// fails with `EventHasPendingCommand`. Each destroy costs one
-            /// lookup; to wipe everything you read, prefer a single
-            /// `cmdDestroyEvents` instead of a per-handle loop.
+            /// fails with `EventHasPendingCommand`. Handles of one
+            /// `(entity, generation)` pair are aliases when lifecycle history
+            /// duplicated the row: destroying one destroys them all. Each
+            /// destroy costs one lookup; to wipe everything you read, prefer
+            /// a single `cmdDestroyEvents` instead of a per-handle loop.
             /// - `self` - handler of the running system.
             /// - `handle` - handle issued by `allEvents`/`filterEvents` pages.
             pub fn cmdDestroyEvent(self: *const SystemHandler, handle: anytype) EcsError!void {
@@ -4608,7 +4875,9 @@ pub fn ECS(comptime sets: anytype) type {
                 /// If a system fails, its unapplied commands are discarded and
                 /// the error propagates; already applied changes stay applied.
                 /// Committed events live until the whole frame ends and are
-                /// cleared automatically after the last system.
+                /// cleared automatically after the last system. Events (user
+                /// and lifecycle alike) filed by the last system are therefore
+                /// cleared unseen: order producers before consumers.
                 /// - `allocator` - funds the command queue and flushed changes.
                 pub fn run(allocator: std.mem.Allocator) anyerror!void {
                     var handler = Ecs.SystemHandler{ .allocator = allocator };
@@ -6871,4 +7140,380 @@ test "cmdDestroyEventsFor collapses duplicates inside one call" {
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
     try App.run(allocator);
+}
+test "lifecycle Create is filed for every created entity" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const S = struct {
+        const S = @This();
+        var a: Ecs.EntityReference = undefined;
+        var b: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.a = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.b = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 2, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+            // Filing happens at flush, not at queue time.
+            try std.testing.expect(h.allEvents(Ecs.Create).len == 0);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Ecs.Create);
+            try std.testing.expect(pages.len == 2);
+            var found_a = false;
+            var found_b = false;
+            for (pages) |page| {
+                for (page.entityList()) |e| {
+                    if (e.id == S.a.id) {
+                        found_a = true;
+                    }
+                    if (e.id == S.b.id) {
+                        found_b = true;
+                    }
+                }
+            }
+            try std.testing.expect(found_a and found_b);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+    // Frame-end clear covers lifecycle payloads.
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try std.testing.expect(handler.allEvents(Ecs.Create).len == 0);
+}
+test "lifecycle Destroy records the archetype and survives the purge" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 1, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 5 });
+        }
+        fn kill(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroy(S.target);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(!S.target.isAlive());
+            // The user event is purged with the entity...
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+            // ...while the Destroy record survives it.
+            const pages = h.allEvents(Ecs.Destroy);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].entityAt(0).id == S.target.id);
+            try std.testing.expect(pages[0].entityAt(0).gen == S.target.gen);
+            try std.testing.expect(pages[0].valueAt(0).archetype == Ecs.archetypeId(&[_]type{ Pos, Vel }));
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.kill, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "lifecycle Migrate keeps full history" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos}, .{Vel} });
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 1, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn move1(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdMigrate(S.target, &[_]type{Pos}, true);
+        }
+        fn move2(h: *Ecs.SystemHandler) anyerror!void {
+            var live: ?Ecs.EntityReference = null;
+            for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
+                for (page.entities()) |ref| {
+                    live = ref;
+                }
+            }
+            S.target = live.?;
+            try h.cmdMigrate(S.target, &[_]type{Vel}, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pv = Ecs.archetypeId(&[_]type{ Pos, Vel });
+            const p = Ecs.archetypeId(&[_]type{Pos});
+            const v = Ecs.archetypeId(&[_]type{Vel});
+            // Both records follow the entity into V: history coalesces.
+            const pages = h.allEvents(Ecs.Migrate);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].arch_id == v);
+            try std.testing.expect(pages[0].count() == 2);
+            try std.testing.expect(pages[0].entityAt(0).isAlive());
+            try std.testing.expect(pages[0].entityAt(1).isAlive());
+            // Chronological: PV->P first, then P->V.
+            try std.testing.expect(pages[0].valueAt(0).from == pv);
+            try std.testing.expect(pages[0].valueAt(0).to == p);
+            try std.testing.expect(pages[0].valueAt(1).from == p);
+            try std.testing.expect(pages[0].valueAt(1).to == v);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.move1, S.move2, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "lifecycle Reparent and DepthUpdate partition the move" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        var r2: Ecs.EntityReference = undefined;
+        var r3: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        var g: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.r = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.r2 = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            S.r3 = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+            S.c = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 4,
+                .vertical_coordinate = 0,
+            }});
+            S.g = try h.cmdCreateChild(S.c, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn move1(h: *Ecs.SystemHandler) anyerror!void {
+            // Same depth (1 -> 1): Reparent only, no DepthUpdate.
+            try h.cmdReparent(S.c, S.r2);
+        }
+        fn move2(h: *Ecs.SystemHandler) anyerror!void {
+            // The R2 subtree sinks one level.
+            try h.cmdReparent(S.r2, S.r3);
+        }
+        fn check_and_reorder(h: *Ecs.SystemHandler) anyerror!void {
+            var reps: usize = 0;
+            var found_c = false;
+            var found_r2 = false;
+            for (h.allEvents(Ecs.Reparent)) |page| {
+                reps += page.count();
+                for (0..page.count()) |i| {
+                    const e = page.entityAt(i);
+                    const v = page.valueAt(i);
+                    if (e.id == S.c.id) {
+                        try std.testing.expect(v.old_parent.?.id == S.r.id);
+                        try std.testing.expect(v.new_parent.?.id == S.r2.id);
+                        found_c = true;
+                    } else if (e.id == S.r2.id) {
+                        try std.testing.expect(v.old_parent == null);
+                        try std.testing.expect(v.new_parent.?.id == S.r3.id);
+                        found_r2 = true;
+                    } else {
+                        try std.testing.expect(false);
+                    }
+                }
+            }
+            try std.testing.expect(reps == 2);
+            try std.testing.expect(found_c and found_r2);
+            var depths: usize = 0;
+            var seen_r2 = false;
+            var seen_c = false;
+            var seen_g = false;
+            for (h.allEvents(Ecs.DepthUpdate)) |page| {
+                depths += page.count();
+                for (0..page.count()) |i| {
+                    const e = page.entityAt(i);
+                    const v = page.valueAt(i);
+                    if (e.id == S.r2.id) {
+                        try std.testing.expect(v.old_depth == 0 and v.new_depth == 1);
+                        seen_r2 = true;
+                    } else if (e.id == S.c.id) {
+                        try std.testing.expect(v.old_depth == 1 and v.new_depth == 2);
+                        seen_c = true;
+                    } else if (e.id == S.g.id) {
+                        try std.testing.expect(v.old_depth == 2 and v.new_depth == 3);
+                        seen_g = true;
+                    } else {
+                        try std.testing.expect(false);
+                    }
+                }
+            }
+            try std.testing.expect(depths == 3);
+            try std.testing.expect(seen_r2 and seen_c and seen_g);
+            // Same-parent reorder files nothing.
+            try h.cmdReparent(S.c, S.r2);
+        }
+        fn verify_quiet(h: *Ecs.SystemHandler) anyerror!void {
+            var reps: usize = 0;
+            for (h.allEvents(Ecs.Reparent)) |page| {
+                reps += page.count();
+            }
+            var depths: usize = 0;
+            for (h.allEvents(Ecs.DepthUpdate)) |page| {
+                depths += page.count();
+            }
+            try std.testing.expect(reps == 2);
+            try std.testing.expect(depths == 3);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.move1, S.move2, S.check_and_reorder, S.verify_quiet });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "lifecycle history duplicates share handles as aliases" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        var r2: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.r = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.r2 = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            S.c = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn move1(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdReparent(S.c, S.r2);
+        }
+        fn move2(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdReparent(S.c, S.r);
+        }
+        fn wipe(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Ecs.Reparent);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 2);
+            // One destroy takes both alias rows...
+            try h.cmdDestroyEvent(pages[0].handleAt(1));
+            // ...so the second handle is already destroy-pending.
+            try std.testing.expectError(
+                Ecs.EcsError.EventHasPendingCommand,
+                h.cmdDestroyEvent(pages[0].handleAt(0)),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Ecs.Reparent).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.move1, S.move2, S.wipe, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "lifecycle Destroy keeps every instance across slot recycle" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var first: Ecs.EntityReference = undefined;
+        var second: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.first = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn kill1(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroy(S.first);
+        }
+        fn respawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.second = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            // The freed slot is recycled with a bumped generation.
+            try std.testing.expect(S.second.id == S.first.id);
+            try std.testing.expect(S.second.gen == S.first.gen +% 1);
+        }
+        fn mid(h: *Ecs.SystemHandler) anyerror!void {
+            const creates = h.allEvents(Ecs.Create);
+            try std.testing.expect(creates.len == 1);
+            try std.testing.expect(creates[0].count() == 1);
+            try std.testing.expect(creates[0].entityAt(0).gen == S.second.gen);
+            const destroys = h.allEvents(Ecs.Destroy);
+            try std.testing.expect(destroys.len == 1);
+            try std.testing.expect(destroys[0].count() == 1);
+            try std.testing.expect(destroys[0].entityAt(0).gen == S.first.gen);
+        }
+        fn kill2(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroy(S.second);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            // The second purge spared the stale first record.
+            try std.testing.expect(h.allEvents(Ecs.Create).len == 0);
+            const destroys = h.allEvents(Ecs.Destroy);
+            try std.testing.expect(destroys.len == 1);
+            try std.testing.expect(destroys[0].count() == 2);
+            var found_first = false;
+            var found_second = false;
+            for (destroys[0].entityList()) |e| {
+                if (e.gen == S.first.gen) {
+                    found_first = true;
+                }
+                if (e.gen == S.second.gen) {
+                    found_second = true;
+                }
+            }
+            try std.testing.expect(found_first and found_second);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.kill1, S.respawn, S.mid, S.kill2, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "lifecycle events clear at frame end and survive deinit reuse" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            _ = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Ecs.Create);
+            var total: usize = 0;
+            for (pages) |page| {
+                total += page.count();
+            }
+            try std.testing.expect(total == 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify });
+    const allocator = std.testing.allocator;
+    try App.run(allocator);
+    Ecs.deinit(allocator);
+    // Reuse after deinit re-registers lifecycle payloads on first filing.
+    try App.run(allocator);
+    Ecs.deinit(allocator);
 }
