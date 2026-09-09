@@ -23,6 +23,7 @@ const Empty2 = struct {};
 const Empty3 = struct {};
 const Empty4 = struct {};
 const Empty5 = struct {};
+const Enable = struct {};
 
 const App = ECS.Schedule(.{ setup, print, print_all_vs_nonempty });
 var player1: ECS.EntityReference = undefined;
@@ -32,13 +33,15 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
         Scale{ .w = 1, .h = 1 },
         Health{ .value = 100 },
     });
+    try h.cmdSetEvent(player1, Enable, .{});
     std.log.debug("Is player 1 alive: {}", .{player1.isAlive()});
-    _ = try h.cmdCreateChild(player1, .{ Player, Enemy }, .{
+    const player2 = try h.cmdCreateChild(player1, .{ Player, Enemy }, .{
         Position{ .x = 55, .y = 2 },
         Scale{ .w = 2, .h = 2 },
         Health{ .value = 50 },
         Enemy{},
     });
+    try h.cmdSetEvent(player2, Enable, .{});
 }
 
 fn print(h: *ECS.SystemHandler) anyerror!void {
@@ -52,6 +55,12 @@ fn print(h: *ECS.SystemHandler) anyerror!void {
             for (p.entities()) |e| {
                 std.debug.print("Parent: {any}\n", .{e.parent()});
             }
+        }
+    }
+
+    for (h.filterEvents(Enable, .{Health}, .{Enemy})) |p| {
+        for (p.entityList()) |e| {
+            std.debug.print("Enabled entity: {any}\n", .{e});
         }
     }
 }

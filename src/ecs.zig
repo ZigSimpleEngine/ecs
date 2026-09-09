@@ -91,6 +91,12 @@ pub fn ECS(comptime sets: anytype) type {
             ComponentNotFoundInArchetype,
             /// Reparenting would create a cycle in the hierarchy.
             HierarchyCycle,
+            /// No event of this type is registered for the entity.
+            EventNotFound,
+            /// A destroy command is already queued for this event in this batch.
+            EventHasPendingCommand,
+            /// Parallel slices passed to a batch command have different lengths.
+            CountMismatch,
         };
         /// Sentinel slot id meaning "no entity": no parent, no children, no siblings.
         /// Real entity ids are `u24`, so this never collides with a live slot.
@@ -563,6 +569,9 @@ pub fn ECS(comptime sets: anytype) type {
                     .id = self.id,
                     .gen = self.gen +% 1,
                 };
+                // Events follow the entity: relocate them before the storage
+                // surgery, so an allocation failure leaves the entity untouched.
+                try Ecs.notifyEventEntityMigrated(entity_index, source_id, dest_id, next.gen, allocator);
                 // Hierarchy survives a migrate: the row keeps its depth and
                 // lands in the matching zone of the destination archetype.
                 const depth: u32 = Ecs.entity_depth.items[entity_index];
@@ -2188,6 +2197,7 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_pending_parent.items[id] = NO_ENTITY;
             Ecs.entity_generation.items[id] +%= 1;
             Ecs.setEntityState(id, .{});
+            try Ecs.notifyEventEntityDestroyed(id, allocator);
             try Ecs.free_ids.append(allocator, id);
         }
         /// Names the storage type of one archetype id. All archetypes share
@@ -2927,6 +2937,751 @@ pub fn ECS(comptime sets: anytype) type {
                 }
             };
         }
+        /// Validates an event payload type. Events are plain structs living
+        /// outside the archetype/component registry: any struct works, it
+        /// never has to be declared in `ECS(...)`. Zero-size structs are
+        /// valid marker events.
+        /// - `E` - event payload type. Must be a struct, never `EntityReference`.
+        fn validateEventType(comptime E: type) void {
+            if (@typeInfo(E) != .@"struct") {
+                @compileError("Event type must be a struct type.");
+            }
+            if (E == EntityReference) {
+                @compileError("EntityReference cannot be an event type.");
+            }
+        }
+        /// Opaque handle of one registered event. Issued only by
+        /// `EventPage.handleAt`, never built by hand: `cmdDestroyEvent`
+        /// validates the handle against committed events, so forged handles
+        /// fail with `EventNotFound`. Lookup is by entity id plus generation;
+        /// `arch_id` and `index` are placement hints only. A handle stays
+        /// usable within the frame while its entity is neither migrated nor
+        /// destroyed: both operations invalidate the stored generation.
+        /// - `E` - event payload type the handle refers to.
+        ///
+        /// Returns `type` - handle type bound to the payload.
+        pub fn EventHandle(comptime E: type) type {
+            validateEventType(E);
+            return struct {
+                /// Payload tag. Lets `cmdDestroyEvent` infer `E` from the
+                /// handle type and reject handles of foreign payloads.
+                pub const EventPayload = E;
+                /// Entity the event is attached to, with the generation
+                /// observed when the handle was issued.
+                entity: EntityReference,
+                /// Archetype page holding the event when the handle was
+                /// issued. Placement hint only.
+                arch_id: u32,
+                /// Row inside that page when the handle was issued.
+                /// Placement hint only.
+                index: u32,
+            };
+        }
+        /// Dense page of events of one payload type over one archetype:
+        /// `entities[i]` carries `values[i]`. Pages of one payload are sorted
+        /// ascending by `arch_id` and only non-empty pages are stored.
+        /// Read-only by contract: mutate only through `cmdSetEvent` /
+        /// `cmdDestroyEvent`, and treat the view as valid only until the
+        /// current system returns. Rows are appended in emission order, but
+        /// destroys swap the last row into the removed slot, so positions
+        /// are unstable: address events by handle, never by index, across
+        /// systems.
+        /// - `E` - event payload type stored in the page.
+        ///
+        /// Returns `type` - page type holding one archetype id.
+        pub fn EventPage(comptime E: type) type {
+            validateEventType(E);
+            return struct {
+                const Self = @This();
+                /// Archetype the page events were filed under: the live
+                /// archetype of every listed entity.
+                arch_id: u32,
+                /// Entities carrying the event, parallel to `values`.
+                entities: std.ArrayListUnmanaged(EntityReference) = .empty,
+                /// Event payloads, parallel to `entities`.
+                values: std.ArrayListUnmanaged(E) = .empty,
+                /// Entity slot id to row position inside this page. Serviced
+                /// by the store on every insert/remove; private by contract,
+                /// never touch it directly.
+                index: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+                /// Counts events on the page.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `usize` - number of stored events.
+                pub fn count(self: *const Self) usize {
+                    return self.entities.items.len;
+                }
+                /// Checks whether the page holds no events.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `bool` - true when the page is empty.
+                pub fn isEmpty(self: *const Self) bool {
+                    return self.entities.items.len == 0;
+                }
+                /// Fetches the entity carrying the event at the given position.
+                /// - `self` - page to inspect.
+                /// - `index` - event position.
+                ///
+                /// Returns `EntityReference` - handle stored in the row.
+                pub fn entityAt(self: *const Self, index: usize) EntityReference {
+                    return self.entities.items[index];
+                }
+                /// Fetches the payload stored at the given position.
+                /// - `self` - page to inspect.
+                /// - `index` - event position.
+                ///
+                /// Returns `*const E` - pointer into the payload column.
+                pub fn valueAt(self: *const Self, index: usize) *const E {
+                    return &self.values.items[index];
+                }
+                /// Issues the destroy handle of the event at the given
+                /// position. The only legal source of `cmdDestroyEvent` input.
+                /// - `self` - page to inspect.
+                /// - `index` - event position.
+                ///
+                /// Returns `EventHandle(E)` - handle of the event.
+                pub fn handleAt(self: *const Self, index: usize) EventHandle(E) {
+                    return .{
+                        .entity = self.entities.items[index],
+                        .arch_id = self.arch_id,
+                        .index = @intCast(index),
+                    };
+                }
+                /// Exposes the entity column, read-only.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const EntityReference` - entities carrying events.
+                pub fn entityList(self: *const Self) []const EntityReference {
+                    return self.entities.items;
+                }
+                /// Exposes the payload column, read-only.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const E` - stored payloads.
+                pub fn eventList(self: *const Self) []const E {
+                    return self.values.items;
+                }
+                /// Returns an immutable reference to the source archetype info.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `*const ArchetypeInfo` - source archetype descriptor.
+                pub fn archetypeInfo(self: *const Self) *const ArchetypeInfo {
+                    return &Ecs.archetypes[self.arch_id];
+                }
+            };
+        }
+        /// Committed pages plus the pending queue of one event payload type.
+        /// One instantiation per payload: `committed` is the sparse sorted
+        /// page list read by `allEvents`/`filterEvents`, `pending` holds the
+        /// collapsed net commands of the running system (at most one op per
+        /// entity, rewritten in place by repeated `cmdSetEvent`).
+        /// - `E` - event payload type.
+        ///
+        /// Returns `type` - store namespace with per-payload static state.
+        /// Private: stores are only reached through `SystemHandler` and the
+        /// flush/discard/clear plumbing.
+        fn EventStore(comptime E: type) type {
+            return struct {
+                const Store = @This();
+                /// One pending command of the running system.
+                const Pending = struct {
+                    entity: EntityReference,
+                    op: union(enum) {
+                        set: E,
+                        destroy: void,
+                    },
+                };
+                /// Committed pages, sorted ascending by `arch_id`, non-empty only.
+                var committed: std.ArrayListUnmanaged(EventPage(E)) = .empty;
+                /// Collapsed net commands of the running system.
+                var pending: std.ArrayListUnmanaged(Pending) = .empty;
+                /// Entity slot id to position in `pending`. Makes repeated
+                /// `cmdSetEvent` O(1): rewrites happen in place, indices stay
+                /// valid because pending entries are only ever appended or
+                /// cleared wholesale.
+                var pending_index: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+                /// Whether the payload registered its type-erased callbacks.
+                var registered: bool = false;
+                /// Lazily appends the payload callbacks to the event registry
+                /// on first queued command. Read-only payloads never register.
+                /// - `allocator` - funds the registry append.
+                fn ensureRegistered(allocator: std.mem.Allocator) EcsError!void {
+                    if (registered) {
+                        return;
+                    }
+                    try Ecs.event_registry.append(allocator, .{
+                        .name = @typeName(E),
+                        .flush = flushPending,
+                        .discardPending = discardPending,
+                        .clearCommitted = clearCommitted,
+                        .deinitStore = deinitStore,
+                        .onEntityDestroyed = onEntityDestroyed,
+                        .onEntityMigrated = onEntityMigrated,
+                        .resetRegistered = resetRegistered,
+                    });
+                    registered = true;
+                }
+                /// Marks the payload as unregistered, so a reused ECS after
+                /// `deinit` registers it again on next use.
+                fn resetRegistered() void {
+                    registered = false;
+                }
+                /// Locates the committed page of one archetype.
+                /// - `arch` - archetype id to look up.
+                ///
+                /// Returns `?usize` - position in `committed`, or null.
+                fn findPageIndex(arch: u32) ?usize {
+                    var low: usize = 0;
+                    var high: usize = committed.items.len;
+                    while (low < high) {
+                        const mid: usize = low + (high - low) / 2;
+                        const a: u32 = committed.items[mid].arch_id;
+                        if (a < arch) {
+                            low = mid + 1;
+                        } else if (a > arch) {
+                            high = mid;
+                        } else {
+                            return mid;
+                        }
+                    }
+                    return null;
+                }
+                /// Finds the sorted insertion point of an archetype id.
+                /// - `arch` - archetype id to insert.
+                ///
+                /// Returns `usize` - first page with `arch_id >= arch`.
+                fn pageInsertIndex(arch: u32) usize {
+                    var low: usize = 0;
+                    var high: usize = committed.items.len;
+                    while (low < high) {
+                        const mid: usize = low + (high - low) / 2;
+                        if (committed.items[mid].arch_id < arch) {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    return low;
+                }
+                /// Position of one committed event.
+                const Location = struct {
+                    page: usize,
+                    index: usize,
+                };
+                /// Locates a committed event by entity id plus generation.
+                /// Page lookup is binary, row lookup is one hash probe per
+                /// page; pages holding events are few, so this stays flat.
+                /// - `ref` - entity reference to look up.
+                ///
+                /// Returns `?Location` - page and row, or null when absent.
+                fn findByEntity(ref: EntityReference) ?Location {
+                    for (committed.items, 0..) |*page, pi| {
+                        const k = page.index.get(ref.id) orelse continue;
+                        if (k >= page.entities.items.len) {
+                            continue;
+                        }
+                        if (page.entities.items[k].gen == ref.gen) {
+                            return .{ .page = pi, .index = k };
+                        }
+                    }
+                    return null;
+                }
+                /// Removes the row at the given position with swap-remove:
+                /// the last row travels into the gap and its index entry is
+                /// repaired, so removal is O(1) plus one hash update. Drops
+                /// the page when it becomes empty.
+                /// - `allocator` - funds the moved-row index update and frees
+                ///   an emptied page.
+                /// - `pi` - position of the page in `committed`.
+                /// - `k` - row position inside the page.
+                fn removeAt(allocator: std.mem.Allocator, pi: usize, k: usize) EcsError!void {
+                    const page = &committed.items[pi];
+                    const gone_id: u32 = page.entities.items[k].id;
+                    const last: usize = page.entities.items.len - 1;
+                    _ = page.entities.swapRemove(k);
+                    _ = page.values.swapRemove(k);
+                    _ = page.index.remove(gone_id);
+                    if (k != last) {
+                        const moved_id: u32 = page.entities.items[k].id;
+                        try page.index.put(allocator, moved_id, @intCast(k));
+                    }
+                    if (page.entities.items.len == 0) {
+                        var old = committed.orderedRemove(pi);
+                        old.entities.deinit(allocator);
+                        old.values.deinit(allocator);
+                        old.index.deinit(allocator);
+                    }
+                }
+                /// Inserts or rewrites one committed entry in O(1) amortized,
+                /// creating the page when missing. Row lookup is one hash
+                /// probe; growth is atomic: every capacity is ensured up
+                /// front and the index put precedes the infallible appends,
+                /// so a failed grow cannot leave a torn row behind.
+                /// - `allocator` - funds page and row allocation.
+                /// - `arch` - archetype page to file under.
+                /// - `ref` - entity carrying the event.
+                /// - `value` - payload to store.
+                fn upsertCommitted(
+                    allocator: std.mem.Allocator,
+                    arch: u32,
+                    ref: EntityReference,
+                    value: E,
+                ) EcsError!void {
+                    const pi = findPageIndex(arch) orelse blk: {
+                        const pos = pageInsertIndex(arch);
+                        try committed.insert(allocator, pos, .{ .arch_id = arch });
+                        break :blk pos;
+                    };
+                    const page = &committed.items[pi];
+                    if (page.index.get(ref.id)) |k| {
+                        page.entities.items[k] = ref;
+                        page.values.items[k] = value;
+                        return;
+                    }
+                    const at: u32 = @intCast(page.entities.items.len);
+                    try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + 1);
+                    try page.values.ensureTotalCapacity(allocator, page.values.items.len + 1);
+                    try page.index.put(allocator, ref.id, at);
+                    page.entities.appendAssumeCapacity(ref);
+                    page.values.appendAssumeCapacity(value);
+                }
+                /// Removes one committed entry by entity reference, dropping
+                /// the page when it becomes empty. Silent when absent.
+                /// - `allocator` - funds the moved-row index update and frees
+                ///   an emptied page.
+                /// - `ref` - entity reference to remove.
+                fn removeCommitted(allocator: std.mem.Allocator, ref: EntityReference) EcsError!void {
+                    const loc = findByEntity(ref) orelse return;
+                    try removeAt(allocator, loc.page, loc.index);
+                }
+                /// Shared target check for every set path: the slot must exist
+                /// and be alive or reserved by `cmdCreate` in the same system;
+                /// destroy-pending slots are rejected. Does not mutate.
+                /// - `ref` - entity reference to validate.
+                fn validateSetTarget(ref: EntityReference) EcsError!void {
+                    if (!ref.exists()) {
+                        return EcsError.EntityIsNotAlive;
+                    }
+                    const state = Ecs.getEntityState(ref.id);
+                    if (state.pending_create) {
+                        if (Ecs.entity_generation.items[ref.id] != ref.gen) {
+                            return EcsError.EntityIsNotAlive;
+                        }
+                    } else {
+                        if (!ref.isAlive()) {
+                            return EcsError.EntityIsNotAlive;
+                        }
+                        if (state.pending_destroy) {
+                            return EcsError.EntityHasPendingCommand;
+                        }
+                    }
+                }
+                /// Queues a set command in O(1) amortized, rewriting a pending
+                /// op for the same slot in place: a pending destroy becomes a
+                /// set (the destroy is cancelled and the payload updated).
+                /// The append is atomic: queue capacity is ensured first, so
+                /// a failed index grow cannot leave an unindexed entry behind.
+                /// - `allocator` - funds the queue append.
+                /// - `ref` - entity carrying the event.
+                /// - `value` - payload to store.
+                fn queueSet(allocator: std.mem.Allocator, ref: EntityReference, value: E) EcsError!void {
+                    if (pending_index.get(ref.id)) |idx| {
+                        pending.items[idx].entity = ref;
+                        pending.items[idx].op = .{ .set = value };
+                        return;
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
+                    try pending_index.put(allocator, ref.id, @intCast(pending.items.len));
+                    pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
+                }
+                /// Queues a destroy command for a validated handle in O(1)
+                /// amortized. A pending set for the same slot becomes a
+                /// destroy (the set is cancelled); a pending destroy is a
+                /// double destroy.
+                /// - `allocator` - funds the queue append.
+                /// - `handle` - handle issued by `EventPage.handleAt`.
+                fn queueDestroy(allocator: std.mem.Allocator, handle: EventHandle(E)) EcsError!void {
+                    if (findByEntity(handle.entity) == null) {
+                        return EcsError.EventNotFound;
+                    }
+                    if (pending_index.get(handle.entity.id)) |idx| {
+                        if (pending.items[idx].op == .destroy) {
+                            return EcsError.EventHasPendingCommand;
+                        }
+                        pending.items[idx].op = .{ .destroy = {} };
+                        return;
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
+                    try pending_index.put(allocator, handle.entity.id, @intCast(pending.items.len));
+                    pending.appendAssumeCapacity(.{ .entity = handle.entity, .op = .{ .destroy = {} } });
+                }
+                /// Queues one payload for a whole slice of entities in O(n):
+                /// every target is validated first, so a bad reference fails
+                /// the batch before anything is queued. Capacity for the whole
+                /// batch is reserved up front, then the loop itself cannot fail.
+                /// - `allocator` - funds the queued ops.
+                /// - `entities` - entities carrying the event.
+                /// - `value` - payload stored with every event.
+                fn queueSetMany(
+                    allocator: std.mem.Allocator,
+                    entities: []const EntityReference,
+                    value: E,
+                ) EcsError!void {
+                    for (entities) |ref| {
+                        try validateSetTarget(ref);
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
+                    for (entities) |ref| {
+                        if (pending_index.get(ref.id)) |idx| {
+                            pending.items[idx].entity = ref;
+                            pending.items[idx].op = .{ .set = value };
+                        } else {
+                            pending_index.putAssumeCapacity(ref.id, @intCast(pending.items.len));
+                            pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
+                        }
+                    }
+                }
+                /// Queues one payload per entity, pairwise, in O(n). Same
+                /// validate-first, reserve-up-front discipline as `queueSetMany`.
+                /// - `allocator` - funds the queued ops.
+                /// - `entities` - entities carrying the events.
+                /// - `values` - payload per entity, same length as `entities`.
+                fn queueSetEach(
+                    allocator: std.mem.Allocator,
+                    entities: []const EntityReference,
+                    values: []const E,
+                ) EcsError!void {
+                    if (entities.len != values.len) {
+                        return EcsError.CountMismatch;
+                    }
+                    for (entities) |ref| {
+                        try validateSetTarget(ref);
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
+                    for (entities, values) |ref, value| {
+                        if (pending_index.get(ref.id)) |idx| {
+                            pending.items[idx].entity = ref;
+                            pending.items[idx].op = .{ .set = value };
+                        } else {
+                            pending_index.putAssumeCapacity(ref.id, @intCast(pending.items.len));
+                            pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
+                        }
+                    }
+                }
+                /// Queues destroys for a slice of entities in O(n): every
+                /// entry is validated first (present, not destroy-pending),
+                /// so a bad entry fails the batch before anything is queued.
+                /// A duplicated entity in the slice reports
+                /// `EventHasPendingCommand`, mirroring the double-destroy rule.
+                /// - `allocator` - funds the queued ops.
+                /// - `entities` - entity references holding the events. Only
+                ///   id plus generation are used; handles are not required.
+                fn queueDestroyMany(
+                    allocator: std.mem.Allocator,
+                    entities: []const EntityReference,
+                ) EcsError!void {
+                    for (entities) |e| {
+                        if (findByEntity(e) == null) {
+                            return EcsError.EventNotFound;
+                        }
+                        if (pending_index.get(e.id)) |idx| {
+                            if (pending.items[idx].op == .destroy) {
+                                return EcsError.EventHasPendingCommand;
+                            }
+                        }
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
+                    for (entities) |e| {
+                        if (pending_index.get(e.id)) |idx| {
+                            pending.items[idx].op = .{ .destroy = {} };
+                        } else {
+                            pending_index.putAssumeCapacity(e.id, @intCast(pending.items.len));
+                            pending.appendAssumeCapacity(.{ .entity = e, .op = .{ .destroy = {} } });
+                        }
+                    }
+                }
+                /// Queues destruction of every event of the payload in O(pending
+                /// + committed): pending sets are converted to destroys and a
+                /// destroy is queued for every committed entry, so only sets
+                /// queued after this call survive the flush.
+                /// - `allocator` - funds the queued destroys.
+                fn queueDestroyAll(allocator: std.mem.Allocator) EcsError!void {
+                    for (pending.items) |*p| {
+                        p.op = .{ .destroy = {} };
+                    }
+                    for (committed.items) |*page| {
+                        for (page.entities.items) |e| {
+                            if (pending_index.get(e.id) == null) {
+                                try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
+                                try pending_index.put(allocator, e.id, @intCast(pending.items.len));
+                                pending.appendAssumeCapacity(.{ .entity = e, .op = .{ .destroy = {} } });
+                            }
+                        }
+                    }
+                }
+                /// Moves the pending queue into committed pages, resolving
+                /// every set under the entity live archetype. Stale sets
+                /// (dead or recycled slots) and stale destroys are skipped
+                /// silently, mirroring entity flush semantics.
+                /// - `allocator` - funds page and row allocation.
+                fn flushPending(allocator: std.mem.Allocator) EcsError!void {
+                    defer {
+                        pending.clearRetainingCapacity();
+                        pending_index.clearRetainingCapacity();
+                    }
+                    for (pending.items) |op| {
+                        switch (op.op) {
+                            .set => |v| {
+                                const id: u32 = op.entity.id;
+                                if (id >= Ecs.entity_generation.items.len) {
+                                    continue;
+                                }
+                                if (Ecs.entity_generation.items[id] != op.entity.gen) {
+                                    continue;
+                                }
+                                const st = Ecs.getEntityState(id);
+                                if (!op.entity.isAlive() and !st.pending_create) {
+                                    continue;
+                                }
+                                const arch: u32 = Ecs.entity_archetype.items[id];
+                                try upsertCommitted(allocator, arch, op.entity, v);
+                            },
+                            .destroy => {
+                                try removeCommitted(allocator, op.entity);
+                            },
+                        }
+                    }
+                }
+                /// Drops the pending queue without applying it.
+                fn discardPending() void {
+                    pending.clearRetainingCapacity();
+                    pending_index.clearRetainingCapacity();
+                }
+                /// Clears committed pages for the frame boundary. Inner page
+                /// lists and index maps are freed (the outer page headers
+                /// stay retained): retaining them would orphan their buffers
+                /// behind the reset outer length. Next frame reallocates
+                /// them on first use.
+                /// - `allocator` - allocator that funded the page lists.
+                fn clearCommitted(allocator: std.mem.Allocator) void {
+                    for (committed.items) |*page| {
+                        page.entities.deinit(allocator);
+                        page.values.deinit(allocator);
+                        page.entities = .empty;
+                        page.values = .empty;
+                        page.index.deinit(allocator);
+                        page.index = .empty;
+                    }
+                    committed.clearRetainingCapacity();
+                }
+                /// Frees committed pages and the pending queue.
+                /// - `allocator` - allocator that funded the store.
+                fn deinitStore(allocator: std.mem.Allocator) void {
+                    for (committed.items) |*page| {
+                        page.entities.deinit(allocator);
+                        page.values.deinit(allocator);
+                        page.index.deinit(allocator);
+                    }
+                    committed.deinit(allocator);
+                    committed = .empty;
+                    pending.deinit(allocator);
+                    pending = .empty;
+                    pending_index.deinit(allocator);
+                    pending_index = .empty;
+                }
+                /// Purges every committed entry of one destroyed slot in
+                /// O(pages): one hash probe per page plus O(1) removals.
+                /// Matched by id alone: the slot is dead, so any generation
+                /// is stale.
+                /// - `id` - destroyed entity slot id.
+                /// - `allocator` - funds moved-row index updates and frees
+                ///   emptied pages.
+                fn onEntityDestroyed(id: u32, allocator: std.mem.Allocator) EcsError!void {
+                    var pi: usize = 0;
+                    while (pi < committed.items.len) {
+                        const before: usize = committed.items.len;
+                        const k = committed.items[pi].index.get(id) orelse {
+                            pi += 1;
+                            continue;
+                        };
+                        try removeAt(allocator, pi, k);
+                        // One slot id appears at most once per page: advance
+                        // unless the page itself was dropped (the next page
+                        // shifted into its position).
+                        if (committed.items.len == before) {
+                            pi += 1;
+                        }
+                    }
+                }
+                /// Relocates one entity entries to the destination archetype
+                /// page and refreshes their generation, keeping the invariant
+                /// that a page arch always equals the live entity archetype.
+                /// - `id` - migrated entity slot id.
+                /// - `old_arch` - archetype id the entity leaves.
+                /// - `new_arch` - archetype id the entity enters.
+                /// - `new_gen` - generation after the migrate.
+                /// - `allocator` - funds the destination page slot.
+                fn onEntityMigrated(
+                    id: u32,
+                    old_arch: u32,
+                    new_arch: u32,
+                    new_gen: u8,
+                    allocator: std.mem.Allocator,
+                ) EcsError!void {
+                    const fresh = EntityReference{ .id = @intCast(id), .gen = new_gen };
+                    if (old_arch == new_arch) {
+                        if (findPageIndex(old_arch)) |pi| {
+                            const page = &committed.items[pi];
+                            if (page.index.get(id)) |k| {
+                                page.entities.items[k] = fresh;
+                            }
+                        }
+                        return;
+                    }
+                    var moved: ?E = null;
+                    if (findPageIndex(old_arch)) |pi| {
+                        if (committed.items[pi].index.get(id)) |k| {
+                            moved = committed.items[pi].values.items[k];
+                            try removeAt(allocator, pi, k);
+                        }
+                    }
+                    const v = moved orelse return;
+                    try upsertCommitted(allocator, new_arch, fresh, v);
+                }
+            };
+        }
+        /// Filtered view over one payload committed pages: the comptime
+        /// `pages()` match intersected with the sparse page list in one merge
+        /// pass. Both sides are ascending by archetype id, so the result is
+        /// dense and sorted without any search.
+        /// - `E` - event payload type.
+        /// - `include` - component bundle that must be present.
+        /// - `exclude` - component bundle that must be absent.
+        ///
+        /// Returns `type` - filter namespace with a single `filter` function.
+        /// Private: filters are only issued by `SystemHandler`.
+        fn EventFilter(comptime E: type, comptime include: anytype, comptime exclude: anytype) type {
+            const Container = PagesContainer(include, exclude);
+            const container: Container = .{};
+            const matched_pages = container.allPages();
+            return struct {
+                /// Per-filter static scratch for the dense prefix. Same
+                /// lifetime rule as `nonEmptyPages`: valid until the next
+                /// `filterEvents` call for the same payload and query.
+                var buf: [matched_pages.len]EventPage(E) = undefined;
+                /// Intersects the query match with committed pages.
+                ///
+                /// Returns `[]const EventPage(E)` - matching pages, dense.
+                fn filter() []const EventPage(E) {
+                    const pages = EventStore(E).committed.items;
+                    var total: usize = 0;
+                    var i: usize = 0;
+                    var j: usize = 0;
+                    while (i < matched_pages.len and j < pages.len) {
+                        const a: u32 = matched_pages[i].arch_id;
+                        const b: u32 = pages[j].arch_id;
+                        if (a == b) {
+                            buf[total] = pages[j];
+                            total += 1;
+                            i += 1;
+                            j += 1;
+                        } else if (a < b) {
+                            i += 1;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    return buf[0..total];
+                }
+            };
+        }
+        /// Type-erased per-payload callbacks. One entry per event payload
+        /// type with ever-queued commands; the entry is appended lazily on
+        /// first use, so payloads that are only read never register.
+        const EventRegistryEntry = struct {
+            /// Payload type name, for debuggers only.
+            name: []const u8,
+            /// Moves the payload pending queue into committed pages.
+            flush: *const fn (std.mem.Allocator) EcsError!void,
+            /// Drops the payload pending queue without applying it.
+            discardPending: *const fn () void,
+            /// Clears committed pages, freeing page lists for the frame boundary.
+            clearCommitted: *const fn (std.mem.Allocator) void,
+            /// Frees committed pages and the pending queue.
+            deinitStore: *const fn (std.mem.Allocator) void,
+            /// Purges every committed entry of one destroyed entity slot.
+            onEntityDestroyed: *const fn (u32, std.mem.Allocator) EcsError!void,
+            /// Moves one entity entries to the destination archetype page.
+            onEntityMigrated: *const fn (u32, u32, u32, u8, std.mem.Allocator) EcsError!void,
+            /// Marks the payload store as unregistered, so a reused ECS
+            /// registers it again after `deinit`.
+            resetRegistered: *const fn () void,
+        };
+        /// Every event payload type with queued commands in any frame so far.
+        var event_registry: std.ArrayListUnmanaged(EventRegistryEntry) = .empty;
+        /// Applies every queued event command, payload by payload. Runs
+        /// before the entity commands of the same flush: sets file under the
+        /// pre-command archetype, then queued migrates relocate them and
+        /// queued destroys purge them, so an event always follows its entity
+        /// within one flush.
+        /// - `allocator` - funds page and row allocation.
+        fn flushEventPending(allocator: std.mem.Allocator) EcsError!void {
+            for (Ecs.event_registry.items) |entry| {
+                try entry.flush(allocator);
+            }
+        }
+        /// Drops every queued event command without applying it. Committed
+        /// events of earlier systems stay untouched.
+        fn discardEventPending() void {
+            for (Ecs.event_registry.items) |entry| {
+                entry.discardPending();
+            }
+        }
+        /// Clears every committed event page. Runs once after the last
+        /// system of a successful schedule: events live for exactly one frame.
+        /// - `allocator` - allocator that funded the page lists.
+        fn clearAllEvents(allocator: std.mem.Allocator) void {
+            for (Ecs.event_registry.items) |entry| {
+                entry.clearCommitted(allocator);
+            }
+        }
+        /// Purges committed events of one destroyed slot, payload by payload.
+        /// Skipped entirely when no event type was ever registered.
+        /// - `id` - destroyed entity slot id.
+        /// - `allocator` - funds moved-row index updates and frees emptied pages.
+        fn notifyEventEntityDestroyed(id: u32, allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.event_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.event_registry.items) |entry| {
+                try entry.onEntityDestroyed(id, allocator);
+            }
+        }
+        /// Relocates committed events of one migrated entity to the
+        /// destination archetype page and refreshes their generation.
+        /// Skipped entirely when no event type was ever registered.
+        /// - `id` - migrated entity slot id.
+        /// - `old_arch` - archetype id the entity leaves.
+        /// - `new_arch` - archetype id the entity enters.
+        /// - `new_gen` - generation after the migrate.
+        /// - `allocator` - funds the destination page slot.
+        fn notifyEventEntityMigrated(
+            id: u32,
+            old_arch: u32,
+            new_arch: u32,
+            new_gen: u8,
+            allocator: std.mem.Allocator,
+        ) EcsError!void {
+            if (Ecs.event_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.event_registry.items) |entry| {
+                try entry.onEntityMigrated(id, old_arch, new_arch, new_gen, allocator);
+            }
+        }
         /// Handle passed to every system function. It is the only way to read
         /// page data and the only way to schedule structural changes.
         /// Data obtained through the handler (pointers, slices, pages) is valid
@@ -3305,6 +4060,159 @@ pub fn ECS(comptime sets: anytype) type {
                 }
                 try Ecs.commands.append(self.allocator, .{ .destroy_page = id });
             }
+            /// Queues an event for the entity, creating it when absent and
+            /// overwriting the payload when present (upsert). Applied at the
+            /// next flush and visible to the following system. A repeated
+            /// `cmdSetEvent` for the same slot in one system rewrites the
+            /// queued payload instead of duplicating the event. Does not mark
+            /// the entity pending: entity commands stay independent. Accepts
+            /// live entities and slots reserved by `cmdCreate` in the same
+            /// system; rejects destroy-pending slots. Returns no handle:
+            /// handles come only from `allEvents`/`filterEvents` pages.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity carrying the event.
+            /// - `E` - event payload struct type. Needs no `ECS(...)` declaration.
+            /// - `value` - payload stored with the event.
+            pub fn cmdSetEvent(
+                self: *const SystemHandler,
+                ref: EntityReference,
+                comptime E: type,
+                value: E,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = EventStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.validateSetTarget(ref);
+                try Store.queueSet(self.allocator, ref, value);
+            }
+            /// Queues destruction of the event behind the handle. Handles come
+            /// only from `EventPage.handleAt`, so both misuse cases are
+            /// observable: unknown or already gone events fail with
+            /// `EventNotFound`, a second destroy queued in the same system
+            /// fails with `EventHasPendingCommand`. Each destroy costs one
+            /// lookup; to wipe everything you read, prefer a single
+            /// `cmdDestroyEvents` instead of a per-handle loop.
+            /// - `self` - handler of the running system.
+            /// - `handle` - handle issued by `allEvents`/`filterEvents` pages.
+            pub fn cmdDestroyEvent(self: *const SystemHandler, handle: anytype) EcsError!void {
+                const HT = @TypeOf(handle);
+                if (!@hasDecl(HT, "EventPayload")) {
+                    @compileError("cmdDestroyEvent expects an EventHandle(E) from EventPage.handleAt().");
+                }
+                const E = HT.EventPayload;
+                if (HT != EventHandle(E)) {
+                    @compileError("cmdDestroyEvent expects an EventHandle(E) from EventPage.handleAt().");
+                }
+                validateEventType(E);
+                const Store = EventStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueDestroy(self.allocator, handle);
+            }
+            /// Queues destruction of every event of the payload type in one
+            /// linear pass. Pending sets are converted, so only sets queued
+            /// after this call survive the flush. No-op when nothing was ever
+            /// queued for the payload.
+            /// - `self` - handler of the running system.
+            /// - `E` - event payload struct type.
+            pub fn cmdDestroyEvents(self: *const SystemHandler, comptime E: type) EcsError!void {
+                validateEventType(E);
+                const Store = EventStore(E);
+                if (!Store.registered) {
+                    return;
+                }
+                try Store.queueDestroyAll(self.allocator);
+            }
+            /// Queues one payload for a whole slice of entities in O(n):
+            /// one shared validation pass, one capacity reservation, then an
+            /// infallible loop. Accepts the same targets as `cmdSetEvent`,
+            /// including reserved `cmdCreate` handles. An empty slice is a no-op.
+            /// - `self` - handler of the running system.
+            /// - `entities` - entities carrying the event.
+            /// - `E` - event payload struct type. Needs no `ECS(...)` declaration.
+            /// - `value` - payload stored with every event.
+            pub fn cmdSetEvents(
+                self: *const SystemHandler,
+                entities: []const EntityReference,
+                comptime E: type,
+                value: E,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = EventStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueSetMany(self.allocator, entities, value);
+            }
+            /// Queues one payload per entity, pairwise, in O(n). Lengths must
+            /// match, otherwise the batch fails with `CountMismatch` before
+            /// anything is queued. An empty pair of slices is a no-op.
+            /// - `self` - handler of the running system.
+            /// - `entities` - entities carrying the events.
+            /// - `E` - event payload struct type. Needs no `ECS(...)` declaration.
+            /// - `values` - payload per entity, same length as `entities`.
+            pub fn cmdSetEventsEach(
+                self: *const SystemHandler,
+                entities: []const EntityReference,
+                comptime E: type,
+                values: []const E,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = EventStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueSetEach(self.allocator, entities, values);
+            }
+            /// Queues destroys for a slice of entity references in O(n),
+            /// without handles: each entry is matched by id plus generation,
+            /// so stale references fail with `EventNotFound` and a repeated
+            /// entry fails with `EventHasPendingCommand`. The batch is
+            /// validated before anything is queued. An empty slice is a no-op.
+            /// - `self` - handler of the running system.
+            /// - `entities` - entity references holding the events.
+            /// - `E` - event payload struct type.
+            pub fn cmdDestroyEventsFor(
+                self: *const SystemHandler,
+                entities: []const EntityReference,
+                comptime E: type,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = EventStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueDestroyMany(self.allocator, entities);
+            }
+            /// Returns every non-empty event page of the payload type: dense
+            /// and sorted by archetype id. Read-only by contract, valid only
+            /// until the current system returns.
+            /// - `self` - handler of the running system.
+            /// - `E` - event payload struct type.
+            ///
+            /// Returns `[]const EventPage(E)` - live committed pages.
+            pub fn allEvents(self: *const SystemHandler, comptime E: type) []const EventPage(E) {
+                validateEventType(E);
+                _ = self;
+                return EventStore(E).committed.items;
+            }
+            /// Returns the dense subset of event pages whose archetype holds
+            /// all `include` components and none of the `exclude` components.
+            /// The match reuses the `pages()` query, intersected with the
+            /// committed pages in one merge pass. Read-only by contract; the
+            /// slice lives in a per-query static buffer until the next
+            /// `filterEvents` call for the same payload and query, exactly
+            /// like `nonEmptyPages`.
+            /// - `self` - handler of the running system.
+            /// - `E` - event payload struct type.
+            /// - `include` - component bundle that must be present.
+            /// - `exclude` - component bundle that must be absent. `null` and empty
+            ///   bundles are equivalent to no exclusion.
+            ///
+            /// Returns `[]const EventPage(E)` - matching pages, dense.
+            pub fn filterEvents(
+                self: *const SystemHandler,
+                comptime E: type,
+                comptime include: anytype,
+                comptime exclude: anytype,
+            ) []const EventPage(E) {
+                validateEventType(E);
+                _ = self;
+                return EventFilter(E, include, exclude).filter();
+            }
         };
         /// Deferred structural change, applied between systems in FIFO order.
         const Command = union(enum) {
@@ -3470,6 +4378,9 @@ pub fn ECS(comptime sets: anytype) type {
         fn flushCommands(allocator: std.mem.Allocator) EcsError!void {
             @setEvalBranchQuota(10_000_000);
             defer Ecs.commands.clearRetainingCapacity();
+            // Events flush first: sets file under the pre-command archetype,
+            // then entity migrates relocate them and destroys purge them.
+            try Ecs.flushEventPending(allocator);
             for (Ecs.commands.items) |cmd| {
                 switch (cmd) {
                     .create => |c| {
@@ -3592,6 +4503,9 @@ pub fn ECS(comptime sets: anytype) type {
         /// - `allocator` - allocator that funded the queue.
         fn discardCommands(allocator: std.mem.Allocator) void {
             @setEvalBranchQuota(10_000_000);
+            // Event pendings of the failing system are dropped; committed
+            // events of earlier systems stay untouched.
+            Ecs.discardEventPending();
             var i: usize = Ecs.commands.items.len;
             while (i > 0) {
                 i -= 1;
@@ -3693,6 +4607,8 @@ pub fn ECS(comptime sets: anytype) type {
                 /// automatically after each system and before the next one.
                 /// If a system fails, its unapplied commands are discarded and
                 /// the error propagates; already applied changes stay applied.
+                /// Committed events live until the whole frame ends and are
+                /// cleared automatically after the last system.
                 /// - `allocator` - funds the command queue and flushed changes.
                 pub fn run(allocator: std.mem.Allocator) anyerror!void {
                     var handler = Ecs.SystemHandler{ .allocator = allocator };
@@ -3701,6 +4617,7 @@ pub fn ECS(comptime sets: anytype) type {
                         try sys(&handler);
                         try Ecs.flushCommands(allocator);
                     }
+                    Ecs.clearAllEvents(allocator);
                 }
             };
         }
@@ -3717,6 +4634,12 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.discardCommands(allocator);
             Ecs.commands.deinit(allocator);
             Ecs.commands = .empty;
+            for (Ecs.event_registry.items) |entry| {
+                entry.deinitStore(allocator);
+                entry.resetRegistered();
+            }
+            Ecs.event_registry.deinit(allocator);
+            Ecs.event_registry = .empty;
             Ecs.entity_generation.deinit(allocator);
             Ecs.entity_generation = .empty;
             Ecs.entity_archetype.deinit(allocator);
@@ -5335,4 +6258,617 @@ test "discard returns recycled reservations to the free list" {
     const Recovery = Ecs.Schedule(.{ S.retry, S.verify });
     try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
     try Recovery.run(allocator);
+}
+test "events flow to the next system and clear at frame end" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 2,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 10 });
+            // Queued, not yet visible.
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+        }
+        fn consume(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(!pages[0].isEmpty());
+            try std.testing.expect(pages[0].entityAt(0).id == S.target.id);
+            try std.testing.expect(pages[0].valueAt(0).amount == 10);
+            try std.testing.expect(pages[0].entityList().len == 1);
+            try std.testing.expect(pages[0].eventList()[0].amount == 10);
+            try std.testing.expect(pages[0].archetypeInfo().component_ids.len == 1);
+            try h.cmdDestroyEvent(pages[0].handleAt(0));
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.consume, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+    // Frame-end auto clear: nothing leaks into the next frame.
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try std.testing.expect(handler.allEvents(Damage).len == 0);
+}
+test "event set rewrites the queued payload" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit_twice(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 10 });
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 25 });
+        }
+        fn rewrite_committed(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 25);
+            // Re-emitting over a committed event updates it in place.
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 40 });
+        }
+        fn verify_updated(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 40);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit_twice, S.rewrite_committed, S.verify_updated });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "event destroy validates handles" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        var other: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.other = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 5 });
+        }
+        fn destroy_twice(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            const handle = pages[0].handleAt(0);
+            try h.cmdDestroyEvent(handle);
+            // Second destroy in the same system: rejected at queue time.
+            try std.testing.expectError(
+                Ecs.EcsError.EventHasPendingCommand,
+                h.cmdDestroyEvent(handle),
+            );
+            // Forged handle over an entity without the event.
+            const forged = Ecs.EventHandle(Damage){
+                .entity = S.other,
+                .arch_id = pages[0].arch_id,
+                .index = 0,
+            };
+            try std.testing.expectError(
+                Ecs.EcsError.EventNotFound,
+                h.cmdDestroyEvent(forged),
+            );
+            // Stale generation never matches a committed entry.
+            const stale = Ecs.EventHandle(Damage){
+                .entity = .{ .id = S.target.id, .gen = S.target.gen +% 1 },
+                .arch_id = pages[0].arch_id,
+                .index = 0,
+            };
+            try std.testing.expectError(
+                Ecs.EcsError.EventNotFound,
+                h.cmdDestroyEvent(stale),
+            );
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.destroy_twice, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "filterEvents honors include and exclude" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var small: Ecs.EntityReference = undefined;
+        var big: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.small = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.big = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 2, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            // Queue big first: committed pages must still come out sorted.
+            try h.cmdSetEvent(S.big, Damage, .{ .amount = 2 });
+            try h.cmdSetEvent(S.small, Damage, .{ .amount = 1 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const all = h.allEvents(Damage);
+            try std.testing.expect(all.len == 2);
+            try std.testing.expect(all[0].arch_id < all[1].arch_id);
+            const no_vel = h.filterEvents(Damage, &[_]type{Pos}, &[_]type{Vel});
+            try std.testing.expect(no_vel.len == 1);
+            try std.testing.expect(no_vel[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(no_vel[0].valueAt(0).amount == 1);
+            const with_vel = h.filterEvents(Damage, &[_]type{ Pos, Vel }, null);
+            try std.testing.expect(with_vel.len == 1);
+            try std.testing.expect(with_vel[0].arch_id == Ecs.archetypeId(&[_]type{ Pos, Vel }));
+            try std.testing.expect(with_vel[0].valueAt(0).amount == 2);
+            const none = h.filterEvents(Damage, &[_]type{Vel}, &[_]type{Pos});
+            try std.testing.expect(none.len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "destroying an entity purges its events" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 7 });
+        }
+        fn kill(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 1);
+            try h.cmdDestroy(S.target);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+            try std.testing.expect(!S.target.isAlive());
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.kill, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "migrating an entity moves its events" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        var stale: Ecs.EventHandle(Damage) = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 7, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 1, .vertical_speed = 1 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 9 });
+        }
+        fn capture_and_move(h: *Ecs.SystemHandler) anyerror!void {
+            S.stale = h.allEvents(Damage)[0].handleAt(0);
+            try h.cmdMigrate(S.target, &[_]type{Pos}, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(pages[0].valueAt(0).amount == 9);
+            const filtered = h.filterEvents(Damage, &[_]type{Pos}, null);
+            try std.testing.expect(filtered.len == 1);
+            const missing = h.filterEvents(Damage, &[_]type{Pos, Vel}, null);
+            try std.testing.expect(missing.len == 0);
+            // The pre-migrate handle is invalidated by the generation bump.
+            try std.testing.expectError(
+                Ecs.EcsError.EventNotFound,
+                h.cmdDestroyEvent(S.stale),
+            );
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.capture_and_move, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "failing system discards event commands" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const CustomError = error{Boom};
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 10 });
+        }
+        fn queue_then_fail(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 99 });
+            // Pending rewrite is invisible until flush.
+            try std.testing.expect(h.allEvents(Damage)[0].valueAt(0).amount == 10);
+            return CustomError.Boom;
+        }
+        fn verify_kept(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 10);
+        }
+    };
+    const Failing = Ecs.Schedule(.{ S.spawn, S.emit, S.queue_then_fail });
+    const Recovery = Ecs.Schedule(.{S.verify_kept});
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
+    try Recovery.run(allocator);
+}
+test "events attach to reserved handles and support marker payloads" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const Marker = struct {};
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn_and_emit(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 11 });
+            try h.cmdSetEvent(S.target, Marker, .{});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(S.target.isAlive());
+            const damages = h.allEvents(Damage);
+            try std.testing.expect(damages.len == 1);
+            try std.testing.expect(damages[0].count() == 1);
+            try std.testing.expect(damages[0].valueAt(0).amount == 11);
+            const markers = h.allEvents(Marker);
+            try std.testing.expect(markers.len == 1);
+            try std.testing.expect(markers[0].count() == 1);
+            try h.cmdDestroyEvent(damages[0].handleAt(0));
+            try h.cmdDestroyEvent(markers[0].handleAt(0));
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+            try std.testing.expect(h.allEvents(Marker).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn_and_emit, S.verify, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdDestroyEvents wipes the whole payload" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var small: Ecs.EntityReference = undefined;
+        var big: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.small = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.big = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 2, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.small, Damage, .{ .amount = 1 });
+            try h.cmdSetEvent(S.big, Damage, .{ .amount = 2 });
+        }
+        fn wipe_all(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 2);
+            // A set queued before the wipe is cancelled by it...
+            try h.cmdSetEvent(S.small, Damage, .{ .amount = 99 });
+            try h.cmdDestroyEvents(Damage);
+            // ...while a set queued after the wipe survives.
+            try h.cmdSetEvent(S.big, Damage, .{ .amount = 7 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].entityAt(0).id == S.big.id);
+            try std.testing.expect(pages[0].valueAt(0).amount == 7);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.wipe_all, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+    // Bulk over a payload with nothing queued is a no-op, not an error.
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try handler.cmdDestroyEvents(Damage);
+}
+test "mass per-handle destroy keeps the index consistent" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 200;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            for (S.refs, 0..) |ref, i| {
+                try h.cmdSetEvent(ref, Damage, .{ .amount = @intCast(i) });
+            }
+        }
+        fn destroy_odd(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+            // Collect handles first: rows move under swap-remove, so live
+            // indices would skip entries while handles stay valid.
+            var handles: [N / 2]Ecs.EventHandle(Damage) = undefined;
+            var hn: usize = 0;
+            for (0..pages[0].count()) |i| {
+                if (i % 2 == 1) {
+                    handles[hn] = pages[0].handleAt(i);
+                    hn += 1;
+                }
+            }
+            for (handles) |handle| {
+                try h.cmdDestroyEvent(handle);
+            }
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N / 2);
+            // Even payloads 0..198 survive regardless of row order.
+            var sum: u64 = 0;
+            for (pages[0].eventList()) |ev| {
+                try std.testing.expect(ev.amount % 2 == 0);
+                sum += ev.amount;
+            }
+            try std.testing.expect(sum == 9900);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.destroy_odd, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdSetEvents emits one payload for many entities" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 300;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            // Single set first: the batch overwrites it via the pending index.
+            try h.cmdSetEvent(S.refs[0], Damage, .{ .amount = 1 });
+            try h.cmdSetEvents(S.refs[0..], Damage, .{ .amount = 5 });
+            try h.cmdSetEvents(&.{}, Damage, .{ .amount = 9 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+            var sum: u64 = 0;
+            for (pages[0].eventList()) |ev| {
+                try std.testing.expect(ev.amount == 5);
+                sum += ev.amount;
+            }
+            try std.testing.expect(sum == 5 * N);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdSetEventsEach pairs entities with payloads" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 200;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        var values: [N]Damage = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+                S.values[i] = .{ .amount = @intCast(i) };
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEventsEach(S.refs[0..], Damage, S.values[0..]);
+            try std.testing.expectError(
+                Ecs.EcsError.CountMismatch,
+                h.cmdSetEventsEach(S.refs[0..10], Damage, S.values[0..9]),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+            var sum: u64 = 0;
+            for (pages[0].eventList()) |ev| {
+                sum += ev.amount;
+            }
+            try std.testing.expect(sum == N * (N - 1) / 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdDestroyEventsFor validates the batch before queueing" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 200;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            var values: [N]Damage = undefined;
+            for (0..N) |i| {
+                values[i] = .{ .amount = @intCast(i) };
+            }
+            try h.cmdSetEventsEach(S.refs[0..], Damage, values[0..]);
+        }
+        fn errors(h: *Ecs.SystemHandler) anyerror!void {
+            const forged = Ecs.EntityReference{ .id = S.refs[0].id, .gen = S.refs[0].gen +% 1 };
+            try std.testing.expectError(
+                Ecs.EcsError.EventNotFound,
+                h.cmdDestroyEventsFor(&.{forged}, Damage),
+            );
+            // Mixed batch fails as a whole...
+            try std.testing.expectError(
+                Ecs.EcsError.EventNotFound,
+                h.cmdDestroyEventsFor(&[_]Ecs.EntityReference{ S.refs[4], forged }, Damage),
+            );
+            // ...while a repeated batch call is a double destroy.
+            try h.cmdDestroyEventsFor(S.refs[2..3], Damage);
+            try std.testing.expectError(
+                Ecs.EcsError.EventHasPendingCommand,
+                h.cmdDestroyEventsFor(S.refs[2..3], Damage),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            // refs[2] is gone (first batch applied); refs[4] survived the
+            // failed mixed batch, proving nothing was queued for it.
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N - 1);
+            var found2 = false;
+            var found4 = false;
+            var sum: u64 = 0;
+            for (pages[0].eventList()) |ev| {
+                if (ev.amount == 2) {
+                    found2 = true;
+                }
+                if (ev.amount == 4) {
+                    found4 = true;
+                }
+                sum += ev.amount;
+            }
+            try std.testing.expect(!found2);
+            try std.testing.expect(found4);
+            try std.testing.expect(sum == N * (N - 1) / 2 - 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.errors, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdDestroyEventsFor collapses duplicates inside one call" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var refs: [3]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, 3);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            const values = [_]Damage{ .{ .amount = 10 }, .{ .amount = 20 }, .{ .amount = 30 } };
+            try h.cmdSetEventsEach(S.refs[0..], Damage, values[0..]);
+        }
+        fn wipe_dup(h: *Ecs.SystemHandler) anyerror!void {
+            // No error: the duplicated entry collapses into one destroy.
+            try h.cmdDestroyEventsFor(&[_]Ecs.EntityReference{ S.refs[0], S.refs[0] }, Damage);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 2);
+            var sum: u64 = 0;
+            for (pages[0].eventList()) |ev| {
+                sum += ev.amount;
+            }
+            try std.testing.expect(sum == 50);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.wipe_dup, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
 }
