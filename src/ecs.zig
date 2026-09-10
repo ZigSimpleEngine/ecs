@@ -3069,6 +3069,23 @@ pub fn ECS(comptime sets: anytype) type {
             /// Depth after the change.
             new_depth: u32,
         };
+        /// Optional per-payload buffer budgets. Unset (`null`) fields grow
+        /// forever, exactly like today. Set fields pre-grow on assignment
+        /// (warmup) and trim back down at every frame end; mid-frame growth
+        /// past any budget is always allowed (correctness first).
+        pub const EventLimits = struct {
+            /// Entity slot coverage of the slot maps. Warmup only in effect:
+            /// trimming never drops live coverage, only spare capacity.
+            slots: ?u32 = null,
+            /// Pending queue capacity. Warmed on assignment, trimmed post-clear.
+            pending: ?u32 = null,
+            /// Page column capacity, pooled shells included. Warmed on
+            /// assignment (shell count comes from `pages`), trimmed post-clear.
+            events_per_page: ?u32 = null,
+            /// Committed outer capacity plus pooled shell count. Warmed on
+            /// assignment, trimmed post-clear.
+            pages: ?u32 = null,
+        };
         /// Dense page of events of one payload type over one archetype:
         /// `entities[i]` carries `values[i]`. Pages of one payload are sorted
         /// ascending by `arch_id` and only non-empty pages are stored.
@@ -3092,16 +3109,10 @@ pub fn ECS(comptime sets: anytype) type {
                 entities: std.ArrayListUnmanaged(EntityReference) = .empty,
                 /// Event payloads, parallel to `entities`.
                 values: std.ArrayListUnmanaged(E) = .empty,
-                /// Entity slot id to row position inside this page. Serviced
-                /// by the store on every insert/remove; private by contract,
-                /// never touch it directly. With duplicate rows (lifecycle
-                /// history) it points at one of them; lookups degrade to a
-                /// page scan, which stays exact.
-                index: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-                /// Whether the page may hold several rows for one slot id
-                /// (lifecycle history). Set on the first duplicate append,
-                /// cleared with the page. Steers purge onto the linear path.
-                has_dupes: bool = false,
+                /// Chain links for the per-slot rows, packed like the store
+                /// `rows` map (high 32 bits: archetype id, low 32: row).
+                /// `NO_PACK` terminates. Private by contract.
+                next: std.ArrayListUnmanaged(u64) = .empty,
                 /// Counts events on the page.
                 /// - `self` - page to inspect.
                 ///
@@ -3193,11 +3204,34 @@ pub fn ECS(comptime sets: anytype) type {
                 var committed: std.ArrayListUnmanaged(EventPage(E)) = .empty;
                 /// Collapsed net commands of the running system.
                 var pending: std.ArrayListUnmanaged(Pending) = .empty;
-                /// Entity slot id to position in `pending`. Makes repeated
-                /// `cmdSetEvent` O(1): rewrites happen in place, indices stay
-                /// valid because pending entries are only ever appended or
-                /// cleared wholesale.
-                var pending_index: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+                /// Empty page shells with retained buffers, reused across
+                /// frames so steady-state event flow allocates nothing.
+                var page_pool: std.ArrayListUnmanaged(EventPage(E)) = .empty;
+                /// Entity slot id to the head of its committed chain, packed
+                /// as `(arch_id << 32) | row`; `NO_PACK` means no entry.
+                /// Every lookup is array loads, no hashing.
+                var rows: std.ArrayListUnmanaged(u64) = .empty;
+                /// Entity slot id to position in `pending`, or `NO_PENDING`.
+                /// Rewrites happen in place; indices stay valid because
+                /// pending entries are only appended or cleared wholesale.
+                var pending_rows: std.ArrayListUnmanaged(u32) = .empty;
+                /// Bulk-wipe armed by `queueDestroyAll`: the flush drops every
+                /// committed page instead of removing rows one by one. Reset
+                /// by every flush and every discard, so it never leaks across.
+                var wiped: bool = false;
+                /// Pending length at bulk time: ops below it die with the
+                /// wipe, ops at and above it (queued after) apply normally.
+                var wipe_mark: usize = 0;
+                /// Whether committed holds anything worth clearing.
+                var dirty: bool = false;
+                /// Optional budgets (see `EventLimits`): replace-semantics via
+                /// `setEventLimits`, cleared by `clearEventLimits`. Read only
+                /// in the setter and at frame-end clear; never on hot paths.
+                var limits: EventLimits = .{};
+                /// Empty chain link / empty slot value.
+                const NO_PACK: u64 = std.math.maxInt(u64);
+                /// Empty pending slot value.
+                const NO_PENDING: u32 = std.math.maxInt(u32);
                 /// Whether the payload registered its type-erased callbacks.
                 var registered: bool = false;
                 /// Lazily appends the payload callbacks to the event registry
@@ -3266,65 +3300,158 @@ pub fn ECS(comptime sets: anytype) type {
                     page: usize,
                     index: usize,
                 };
-                /// Locates a committed event by entity id plus generation,
-                /// returning the oldest matching row. Page lookup is binary,
-                /// row lookup is one hash probe per page; pages holding events
-                /// are few, so this stays flat. Only pages flagged with
-                /// duplicates degrade to a linear scan, which stays exact.
+                /// Packs an archetype id plus a row into one chain link.
+                /// - `arch` - archetype id (high 32 bits).
+                /// - `row` - row position (low 32 bits).
+                ///
+                /// Returns `u64` - packed link.
+                fn packRow(arch: u32, row: u32) u64 {
+                    return (@as(u64, arch) << 32) | @as(u64, row);
+                }
+                /// Resolves a packed link to a live location. Page indices
+                /// shift on page insert/drop, but packs store the immutable
+                /// archetype id, so resolution re-searches by archetype and
+                /// stays exact; bounds-checked against row moves. Bursts
+                /// usually hit a single page: that case skips the binary
+                /// search with two loads.
+                /// - `link` - packed `(arch_id, row)` link.
+                ///
+                /// Returns `?Location` - live page and row, or null.
+                fn resolvePacked(link: u64) ?Location {
+                    const arch: u32 = @intCast(link >> 32);
+                    const row: u32 = @intCast(link & 0xFFFF_FFFF);
+                    if (committed.items.len == 1 and committed.items[0].arch_id == arch) {
+                        if (row >= committed.items[0].entities.items.len) {
+                            return null;
+                        }
+                        return .{ .page = 0, .index = row };
+                    }
+                    const pi = findPageIndex(arch) orelse return null;
+                    if (row >= committed.items[pi].entities.items.len) {
+                        return null;
+                    }
+                    return .{ .page = pi, .index = row };
+                }
+                /// Grows the slot maps to cover one slot id, filling with
+                /// empty sentinels. Each side grows independently, so a
+                /// partial failure can never desynchronize them.
+                /// - `allocator` - funds the growth.
+                /// - `slot` - entity slot id that must be addressable.
+                fn ensureSlot(allocator: std.mem.Allocator, slot: u32) EcsError!void {
+                    const need: usize = @as(usize, slot) + 1;
+                    if (need > rows.items.len) {
+                        try rows.appendNTimes(allocator, NO_PACK, need - rows.items.len);
+                    }
+                    if (need > pending_rows.items.len) {
+                        try pending_rows.appendNTimes(allocator, NO_PENDING, need - pending_rows.items.len);
+                    }
+                }
+                /// Repoints one chain link: the head when it matches, else
+                /// the predecessor found by walking the chain.
+                /// - `slot` - entity slot id owning the chain.
+                /// - `from_packed` - link value to replace.
+                /// - `to_packed` - replacement link value.
+                fn repointSlot(slot: u32, from_packed: u64, to_packed: u64) void {
+                    if (slot >= rows.items.len) {
+                        return;
+                    }
+                    if (rows.items[slot] == from_packed) {
+                        rows.items[slot] = to_packed;
+                        return;
+                    }
+                    var cur = rows.items[slot];
+                    while (cur != NO_PACK) {
+                        const loc = resolvePacked(cur) orelse return;
+                        if (committed.items[loc.page].next.items[loc.index] == from_packed) {
+                            committed.items[loc.page].next.items[loc.index] = to_packed;
+                            return;
+                        }
+                        cur = committed.items[loc.page].next.items[loc.index];
+                    }
+                }
+                /// Locates the oldest committed row of one slot id plus
+                /// generation by walking its chain.
+                /// - `id` - entity slot id.
+                /// - `gen` - entity generation.
+                ///
+                /// Returns `?Location` - page and row, or null when absent.
+                fn findSlotRow(id: u32, gen: u8) ?Location {
+                    if (id >= rows.items.len) {
+                        return null;
+                    }
+                    var cur = rows.items[id];
+                    while (cur != NO_PACK) {
+                        const loc = resolvePacked(cur) orelse return null;
+                        const e = committed.items[loc.page].entities.items[loc.index];
+                        if (e.id == id and e.gen == gen) {
+                            return loc;
+                        }
+                        cur = committed.items[loc.page].next.items[loc.index];
+                    }
+                    return null;
+                }
+                /// Locates a committed event by entity reference.
                 /// - `ref` - entity reference to look up.
                 ///
                 /// Returns `?Location` - page and row, or null when absent.
                 fn findByEntity(ref: EntityReference) ?Location {
-                    for (committed.items, 0..) |*page, pi| {
-                        if (page.index.get(ref.id)) |k| {
-                            if (k < page.entities.items.len and
-                                page.entities.items[k].gen == ref.gen)
-                            {
-                                return .{ .page = pi, .index = k };
-                            }
-                        }
-                        if (page.has_dupes) {
-                            for (page.entities.items, 0..) |e, k| {
-                                if (e.id == ref.id and e.gen == ref.gen) {
-                                    return .{ .page = pi, .index = k };
-                                }
-                            }
-                        }
-                    }
-                    return null;
+                    return findSlotRow(ref.id, ref.gen);
                 }
                 /// Removes the row at the given position with swap-remove:
-                /// the last row travels into the gap and its index entry is
-                /// repaired, so removal is O(1) plus one hash update. Drops
-                /// the page when it becomes empty.
-                /// - `allocator` - funds the moved-row index update and frees
-                ///   an emptied page.
+                /// the last row travels into the gap and every chain link
+                /// addressing either row is repaired, so removal stays O(1)
+                /// plus chain walks. Emptied pages go to the pool with
+                /// buffers retained.
+                /// - `allocator` - funds the pool push of a dropped page.
                 /// - `pi` - position of the page in `committed`.
                 /// - `k` - row position inside the page.
                 fn removeAt(allocator: std.mem.Allocator, pi: usize, k: usize) EcsError!void {
                     const page = &committed.items[pi];
+                    const arch = page.arch_id;
                     const gone_id: u32 = page.entities.items[k].id;
+                    const gone_next: u64 = page.next.items[k];
                     const last: usize = page.entities.items.len - 1;
-                    _ = page.entities.swapRemove(k);
-                    _ = page.values.swapRemove(k);
-                    _ = page.index.remove(gone_id);
+                    repointSlot(gone_id, packRow(arch, @intCast(k)), gone_next);
                     if (k != last) {
-                        const moved_id: u32 = page.entities.items[k].id;
-                        try page.index.put(allocator, moved_id, @intCast(k));
+                        const moved_id: u32 = page.entities.items[last].id;
+                        page.entities.items[k] = page.entities.items[last];
+                        page.values.items[k] = page.values.items[last];
+                        page.next.items[k] = page.next.items[last];
+                        repointSlot(moved_id, packRow(arch, @intCast(last)), packRow(arch, @intCast(k)));
                     }
+                    _ = page.entities.pop();
+                    _ = page.values.pop();
+                    _ = page.next.pop();
+                    dirty = true;
                     if (page.entities.items.len == 0) {
-                        var old = committed.orderedRemove(pi);
-                        old.entities.deinit(allocator);
-                        old.values.deinit(allocator);
-                        old.index.deinit(allocator);
+                        const shell = committed.orderedRemove(pi);
+                        try page_pool.append(allocator, shell);
                     }
                 }
+                /// Returns the page index for one archetype, reusing a pooled
+                /// shell when the page is new.
+                /// - `allocator` - funds the page slot.
+                /// - `arch` - archetype id to look up.
+                ///
+                /// Returns `usize` - position in `committed`.
+                fn pageIndexFor(allocator: std.mem.Allocator, arch: u32) EcsError!usize {
+                    if (findPageIndex(arch)) |pi| {
+                        return pi;
+                    }
+                    const pos = pageInsertIndex(arch);
+                    if (page_pool.pop()) |shell| {
+                        try committed.insert(allocator, pos, shell);
+                        committed.items[pos].arch_id = arch;
+                    } else {
+                        try committed.insert(allocator, pos, .{ .arch_id = arch });
+                    }
+                    return pos;
+                }
                 /// Appends one committed entry in O(1) amortized, always as a
-                /// new row: unlike `upsertCommitted` it never collapses an
+                /// new row: unlike `upsertBySlot` it never collapses an
                 /// existing row, so lifecycle actions accumulate full history.
-                /// Growth is atomic (capacities first, index put before the
-                /// infallible appends). Marks the page duplicated when the
-                /// slot id is already present.
+                /// The row is push-fronted onto its slot chain. Growth is
+                /// atomic (capacities first, then infallible appends).
                 /// - `allocator` - funds page and row allocation.
                 /// - `arch` - archetype page to file under.
                 /// - `ref` - entity carrying the event.
@@ -3335,23 +3462,18 @@ pub fn ECS(comptime sets: anytype) type {
                     ref: EntityReference,
                     value: E,
                 ) EcsError!void {
-                    const pi = findPageIndex(arch) orelse blk: {
-                        const pos = pageInsertIndex(arch);
-                        try committed.insert(allocator, pos, .{ .arch_id = arch });
-                        break :blk pos;
-                    };
+                    try ensureSlot(allocator, ref.id);
+                    const pi = try pageIndexFor(allocator, arch);
                     const page = &committed.items[pi];
                     const at: u32 = @intCast(page.entities.items.len);
                     try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + 1);
                     try page.values.ensureTotalCapacity(allocator, page.values.items.len + 1);
-                    try page.index.ensureTotalCapacity(allocator, @intCast(page.entities.items.len + 1));
-                    if (page.index.get(ref.id) != null) {
-                        page.has_dupes = true;
-                    } else {
-                        page.index.putAssumeCapacity(ref.id, at);
-                    }
+                    try page.next.ensureTotalCapacity(allocator, page.next.items.len + 1);
                     page.entities.appendAssumeCapacity(ref);
                     page.values.appendAssumeCapacity(value);
+                    page.next.appendAssumeCapacity(rows.items[ref.id]);
+                    rows.items[ref.id] = packRow(arch, at);
+                    dirty = true;
                 }
                 /// Files one lifecycle event directly into committed pages,
                 /// bypassing the pending queue: lifecycle actions run inside
@@ -3372,53 +3494,34 @@ pub fn ECS(comptime sets: anytype) type {
                     try Store.ensureRegistered(allocator);
                     try appendRow(allocator, arch, ref, value);
                 }
-                /// Inserts or rewrites one committed entry in O(1) amortized,
-                /// creating the page when missing. Row lookup is one hash
-                /// probe; growth is atomic: every capacity is ensured up
-                /// front and the index put precedes the infallible appends,
-                /// so a failed grow cannot leave a torn row behind.
+                /// Inserts or rewrites one committed entry in O(1) amortized:
+                /// the slot chain is walked for a same-generation row and
+                /// updated in place, otherwise the row appends to the arch
+                /// page. No hashing anywhere on this path.
                 /// - `allocator` - funds page and row allocation.
                 /// - `arch` - archetype page to file under.
                 /// - `ref` - entity carrying the event.
                 /// - `value` - payload to store.
-                fn upsertCommitted(
+                fn upsertBySlot(
                     allocator: std.mem.Allocator,
                     arch: u32,
                     ref: EntityReference,
                     value: E,
                 ) EcsError!void {
-                    const pi = findPageIndex(arch) orelse blk: {
-                        const pos = pageInsertIndex(arch);
-                        try committed.insert(allocator, pos, .{ .arch_id = arch });
-                        break :blk pos;
-                    };
-                    const page = &committed.items[pi];
-                    if (page.index.get(ref.id)) |k| {
-                        if (k < page.entities.items.len) {
-                            page.entities.items[k] = ref;
-                            page.values.items[k] = value;
+                    try ensureSlot(allocator, ref.id);
+                    var cur = rows.items[ref.id];
+                    while (cur != NO_PACK) {
+                        const loc = resolvePacked(cur) orelse break;
+                        const e = committed.items[loc.page].entities.items[loc.index];
+                        if (e.id == ref.id and e.gen == ref.gen) {
+                            committed.items[loc.page].entities.items[loc.index] = ref;
+                            committed.items[loc.page].values.items[loc.index] = value;
+                            dirty = true;
                             return;
                         }
+                        cur = committed.items[loc.page].next.items[loc.index];
                     }
-                    // Probe miss on a duplicated page: collapse the oldest
-                    // match and repair the index. Never runs while the map
-                    // is exact, so fresh appends stay O(1).
-                    if (page.has_dupes) {
-                        for (page.entities.items, 0..) |e, k| {
-                            if (e.id == ref.id) {
-                                page.entities.items[k] = ref;
-                                page.values.items[k] = value;
-                                try page.index.put(allocator, ref.id, @intCast(k));
-                                return;
-                            }
-                        }
-                    }
-                    const at: u32 = @intCast(page.entities.items.len);
-                    try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + 1);
-                    try page.values.ensureTotalCapacity(allocator, page.values.items.len + 1);
-                    try page.index.put(allocator, ref.id, at);
-                    page.entities.appendAssumeCapacity(ref);
-                    page.values.appendAssumeCapacity(value);
+                    try appendRow(allocator, arch, ref, value);
                 }
                 /// Removes every committed entry of an entity reference
                 /// (all history rows sharing its id plus generation),
@@ -3435,24 +3538,21 @@ pub fn ECS(comptime sets: anytype) type {
                 }
                 /// Shared target check for every set path: the slot must exist
                 /// and be alive or reserved by `cmdCreate` in the same system;
-                /// destroy-pending slots are rejected. Does not mutate.
+                /// destroy-pending slots are rejected. Single straight-line
+                /// check without re-reading generation: exactly the
+                /// `exists` + `isAlive` + pending semantics, fused.
                 /// - `ref` - entity reference to validate.
                 fn validateSetTarget(ref: EntityReference) EcsError!void {
-                    if (!ref.exists()) {
+                    const id: u32 = ref.id;
+                    if (id >= Ecs.entity_generation.items.len) {
                         return EcsError.EntityIsNotAlive;
                     }
-                    const state = Ecs.getEntityState(ref.id);
-                    if (state.pending_create) {
-                        if (Ecs.entity_generation.items[ref.id] != ref.gen) {
-                            return EcsError.EntityIsNotAlive;
-                        }
-                    } else {
-                        if (!ref.isAlive()) {
-                            return EcsError.EntityIsNotAlive;
-                        }
-                        if (state.pending_destroy) {
-                            return EcsError.EntityHasPendingCommand;
-                        }
+                    const state = Ecs.getEntityState(id);
+                    if (Ecs.entity_generation.items[id] != ref.gen) {
+                        return EcsError.EntityIsNotAlive;
+                    }
+                    if (!state.pending_create and state.pending_destroy) {
+                        return EcsError.EntityHasPendingCommand;
                     }
                 }
                 /// Queues a set command in O(1) amortized, rewriting a pending
@@ -3464,13 +3564,15 @@ pub fn ECS(comptime sets: anytype) type {
                 /// - `ref` - entity carrying the event.
                 /// - `value` - payload to store.
                 fn queueSet(allocator: std.mem.Allocator, ref: EntityReference, value: E) EcsError!void {
-                    if (pending_index.get(ref.id)) |idx| {
-                        pending.items[idx].entity = ref;
-                        pending.items[idx].op = .{ .set = value };
+                    try ensureSlot(allocator, ref.id);
+                    const slot = pending_rows.items[ref.id];
+                    if (slot != NO_PENDING) {
+                        pending.items[slot].entity = ref;
+                        pending.items[slot].op = .{ .set = value };
                         return;
                     }
                     try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
-                    try pending_index.put(allocator, ref.id, @intCast(pending.items.len));
+                    pending_rows.items[ref.id] = @intCast(pending.items.len);
                     pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
                 }
                 /// Queues a destroy command for a validated handle in O(1)
@@ -3483,15 +3585,17 @@ pub fn ECS(comptime sets: anytype) type {
                     if (findByEntity(handle.entity) == null) {
                         return EcsError.EventNotFound;
                     }
-                    if (pending_index.get(handle.entity.id)) |idx| {
-                        if (pending.items[idx].op == .destroy) {
+                    try ensureSlot(allocator, handle.entity.id);
+                    const slot = pending_rows.items[handle.entity.id];
+                    if (slot != NO_PENDING) {
+                        if (pending.items[slot].op == .destroy) {
                             return EcsError.EventHasPendingCommand;
                         }
-                        pending.items[idx].op = .{ .destroy = {} };
+                        pending.items[slot].op = .{ .destroy = {} };
                         return;
                     }
                     try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
-                    try pending_index.put(allocator, handle.entity.id, @intCast(pending.items.len));
+                    pending_rows.items[handle.entity.id] = @intCast(pending.items.len);
                     pending.appendAssumeCapacity(.{ .entity = handle.entity, .op = .{ .destroy = {} } });
                 }
                 /// Queues one payload for a whole slice of entities in O(n):
@@ -3509,14 +3613,17 @@ pub fn ECS(comptime sets: anytype) type {
                     for (entities) |ref| {
                         try validateSetTarget(ref);
                     }
-                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
-                    try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
                     for (entities) |ref| {
-                        if (pending_index.get(ref.id)) |idx| {
-                            pending.items[idx].entity = ref;
-                            pending.items[idx].op = .{ .set = value };
+                        try ensureSlot(allocator, ref.id);
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    for (entities) |ref| {
+                        const slot = pending_rows.items[ref.id];
+                        if (slot != NO_PENDING) {
+                            pending.items[slot].entity = ref;
+                            pending.items[slot].op = .{ .set = value };
                         } else {
-                            pending_index.putAssumeCapacity(ref.id, @intCast(pending.items.len));
+                            pending_rows.items[ref.id] = @intCast(pending.items.len);
                             pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
                         }
                     }
@@ -3537,14 +3644,17 @@ pub fn ECS(comptime sets: anytype) type {
                     for (entities) |ref| {
                         try validateSetTarget(ref);
                     }
+                    for (entities) |ref| {
+                        try ensureSlot(allocator, ref.id);
+                    }
                     try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
-                    try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
                     for (entities, values) |ref, value| {
-                        if (pending_index.get(ref.id)) |idx| {
-                            pending.items[idx].entity = ref;
-                            pending.items[idx].op = .{ .set = value };
+                        const slot = pending_rows.items[ref.id];
+                        if (slot != NO_PENDING) {
+                            pending.items[slot].entity = ref;
+                            pending.items[slot].op = .{ .set = value };
                         } else {
-                            pending_index.putAssumeCapacity(ref.id, @intCast(pending.items.len));
+                            pending_rows.items[ref.id] = @intCast(pending.items.len);
                             pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
                         }
                     }
@@ -3566,58 +3676,71 @@ pub fn ECS(comptime sets: anytype) type {
                         if (findByEntity(e) == null) {
                             return EcsError.EventNotFound;
                         }
-                        if (pending_index.get(e.id)) |idx| {
-                            if (pending.items[idx].op == .destroy) {
-                                return EcsError.EventHasPendingCommand;
-                            }
+                        try ensureSlot(allocator, e.id);
+                        const slot = pending_rows.items[e.id];
+                        if (slot != NO_PENDING and pending.items[slot].op == .destroy) {
+                            return EcsError.EventHasPendingCommand;
                         }
                     }
                     try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
-                    try pending_index.ensureTotalCapacity(allocator, @intCast(pending.items.len + entities.len));
                     for (entities) |e| {
-                        if (pending_index.get(e.id)) |idx| {
+                        const slot = pending_rows.items[e.id];
+                        if (slot != NO_PENDING) {
                             // Pre-existing destroys errored above; a destroy
                             // met here was queued by this very call: skip it.
-                            if (pending.items[idx].op == .destroy) {
+                            if (pending.items[slot].op == .destroy) {
                                 continue;
                             }
-                            pending.items[idx].op = .{ .destroy = {} };
+                            pending.items[slot].op = .{ .destroy = {} };
                         } else {
-                            pending_index.putAssumeCapacity(e.id, @intCast(pending.items.len));
+                            pending_rows.items[e.id] = @intCast(pending.items.len);
                             pending.appendAssumeCapacity(.{ .entity = e, .op = .{ .destroy = {} } });
                         }
                     }
                 }
-                /// Queues destruction of every event of the payload in O(pending
-                /// + committed): pending sets are converted to destroys and a
-                /// destroy is queued for every committed entry, so only sets
-                /// queued after this call survive the flush.
-                /// - `allocator` - funds the queued destroys.
-                fn queueDestroyAll(allocator: std.mem.Allocator) EcsError!void {
-                    for (pending.items) |*p| {
-                        p.op = .{ .destroy = {} };
-                    }
-                    for (committed.items) |*page| {
-                        for (page.entities.items) |e| {
-                            if (pending_index.get(e.id) == null) {
-                                try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
-                                try pending_index.put(allocator, e.id, @intCast(pending.items.len));
-                                pending.appendAssumeCapacity(.{ .entity = e, .op = .{ .destroy = {} } });
-                            }
-                        }
-                    }
+                /// Arms a bulk wipe: O(1), no queue traffic. The flush drops
+                /// every committed page to the pool instead of removing rows
+                /// one by one; only ops queued after this call survive it.
+                /// Idempotent within one system.
+                fn queueDestroyAll() void {
+                    wipe_mark = pending.items.len;
+                    wiped = true;
                 }
                 /// Moves the pending queue into committed pages, resolving
                 /// every set under the entity live archetype. Stale sets
                 /// (dead or recycled slots) and stale destroys are skipped
-                /// silently, mirroring entity flush semantics.
+                /// silently, mirroring entity flush semantics. The pending
+                /// slot map resets inline, so no second pass is needed.
                 /// - `allocator` - funds page and row allocation.
                 fn flushPending(allocator: std.mem.Allocator) EcsError!void {
                     defer {
                         pending.clearRetainingCapacity();
-                        pending_index.clearRetainingCapacity();
+                        wiped = false;
                     }
-                    for (pending.items) |op| {
+                    var start: usize = 0;
+                    if (wiped) {
+                        // Bulk wipe: drop every page to the pool and reset
+                        // the slot map wholesale; ops below the mark die
+                        // with it, ops at and above it apply normally.
+                        for (rows.items) |*r| {
+                            r.* = NO_PACK;
+                        }
+                        try page_pool.ensureTotalCapacity(allocator, page_pool.items.len + committed.items.len);
+                        for (committed.items) |*page| {
+                            page.entities.items.len = 0;
+                            page.values.items.len = 0;
+                            page.next.items.len = 0;
+                            page_pool.appendAssumeCapacity(page.*);
+                        }
+                        committed.clearRetainingCapacity();
+                        for (pending.items[0..wipe_mark]) |op| {
+                            pending_rows.items[op.entity.id] = NO_PENDING;
+                        }
+                        start = wipe_mark;
+                        dirty = false;
+                    }
+                    for (pending.items[start..]) |op| {
+                        pending_rows.items[op.entity.id] = NO_PENDING;
                         switch (op.op) {
                             .set => |v| {
                                 const id: u32 = op.entity.id;
@@ -3632,7 +3755,7 @@ pub fn ECS(comptime sets: anytype) type {
                                     continue;
                                 }
                                 const arch: u32 = Ecs.entity_archetype.items[id];
-                                try upsertCommitted(allocator, arch, op.entity, v);
+                                try upsertBySlot(allocator, arch, op.entity, v);
                             },
                             .destroy => {
                                 try removeCommitted(allocator, op.entity);
@@ -3640,115 +3763,146 @@ pub fn ECS(comptime sets: anytype) type {
                         }
                     }
                 }
-                /// Drops the pending queue without applying it.
+                /// Drops the pending queue without applying it. Also disarms
+                /// a bulk wipe queued by the failing system.
                 fn discardPending() void {
+                    for (pending.items) |op| {
+                        pending_rows.items[op.entity.id] = NO_PENDING;
+                    }
                     pending.clearRetainingCapacity();
-                    pending_index.clearRetainingCapacity();
+                    wiped = false;
+                    wipe_mark = 0;
                 }
-                /// Clears committed pages for the frame boundary. Inner page
-                /// lists and index maps are freed (the outer page headers
-                /// stay retained): retaining them would orphan their buffers
-                /// behind the reset outer length. Next frame reallocates
-                /// them on first use.
-                /// - `allocator` - allocator that funded the page lists.
-                fn clearCommitted(allocator: std.mem.Allocator) void {
+                /// Clears committed pages for the frame boundary without
+                /// freeing: slot maps reset by memset, page shells (buffers
+                /// retained) return to the pool, the outer list keeps
+                /// capacity. Steady-state frames allocate nothing here.
+                /// Assigned budgets (`setEventLimits`) trim back what exceeds
+                /// twice their target, so trimming stays idempotent across
+                /// frames despite geometric rounding.
+                /// - `allocator` - funds the pool reservation (once).
+                fn clearCommitted(allocator: std.mem.Allocator) EcsError!void {
+                    if (!dirty) {
+                        return;
+                    }
+                    for (rows.items) |*r| {
+                        r.* = NO_PACK;
+                    }
+                    try page_pool.ensureTotalCapacity(allocator, page_pool.items.len + committed.items.len);
                     for (committed.items) |*page| {
-                        page.entities.deinit(allocator);
-                        page.values.deinit(allocator);
-                        page.entities = .empty;
-                        page.values = .empty;
-                        page.index.deinit(allocator);
-                        page.index = .empty;
+                        page.entities.items.len = 0;
+                        page.values.items.len = 0;
+                        page.next.items.len = 0;
+                        page_pool.appendAssumeCapacity(page.*);
                     }
                     committed.clearRetainingCapacity();
+                    if (limits.pages) |pg| {
+                        const max_shells: usize = pg;
+                        while (page_pool.items.len > max_shells) {
+                            var shell = page_pool.pop().?;
+                            shell.entities.deinit(allocator);
+                            shell.values.deinit(allocator);
+                            shell.next.deinit(allocator);
+                        }
+                        if (committed.capacity > 2 * max_shells) {
+                            committed.deinit(allocator);
+                            committed = .empty;
+                            try committed.ensureTotalCapacity(allocator, max_shells);
+                        }
+                    }
+                    if (limits.events_per_page) |ec| {
+                        const cap: usize = ec;
+                        for (page_pool.items) |*shell| {
+                            if (shell.entities.capacity > 2 * cap) {
+                                shell.entities.deinit(allocator);
+                                shell.entities = .empty;
+                                try shell.entities.ensureTotalCapacity(allocator, cap);
+                            }
+                            if (shell.values.capacity > 2 * cap) {
+                                shell.values.deinit(allocator);
+                                shell.values = .empty;
+                                try shell.values.ensureTotalCapacity(allocator, cap);
+                            }
+                            if (shell.next.capacity > 2 * cap) {
+                                shell.next.deinit(allocator);
+                                shell.next = .empty;
+                                try shell.next.ensureTotalCapacity(allocator, cap);
+                            }
+                        }
+                    }
+                    if (limits.pending) |pcap| {
+                        const cap: usize = pcap;
+                        if (pending.capacity > 2 * cap) {
+                            pending.deinit(allocator);
+                            pending = .empty;
+                            try pending.ensureTotalCapacity(allocator, cap);
+                        }
+                    }
+                    if (limits.slots) |sc| {
+                        // Live length is the floor: slot coverage must never
+                        // drop, only spare capacity above it is reclaimed.
+                        const floor: usize = @max(rows.items.len, sc);
+                        if (rows.capacity > 2 * floor) {
+                            const keep = rows.items.len;
+                            rows.deinit(allocator);
+                            rows = .empty;
+                            try rows.appendNTimes(allocator, NO_PACK, keep);
+                        }
+                        const pfloor: usize = @max(pending_rows.items.len, sc);
+                        if (pending_rows.capacity > 2 * pfloor) {
+                            const keep = pending_rows.items.len;
+                            pending_rows.deinit(allocator);
+                            pending_rows = .empty;
+                            try pending_rows.appendNTimes(allocator, NO_PENDING, keep);
+                        }
+                    }
+                    dirty = false;
                 }
-                /// Frees committed pages and the pending queue.
+                /// Frees committed pages, pooled shells, queues and slot maps.
                 /// - `allocator` - allocator that funded the store.
                 fn deinitStore(allocator: std.mem.Allocator) void {
                     for (committed.items) |*page| {
                         page.entities.deinit(allocator);
                         page.values.deinit(allocator);
-                        page.index.deinit(allocator);
+                        page.next.deinit(allocator);
                     }
                     committed.deinit(allocator);
                     committed = .empty;
+                    for (page_pool.items) |*page| {
+                        page.entities.deinit(allocator);
+                        page.values.deinit(allocator);
+                        page.next.deinit(allocator);
+                    }
+                    page_pool.deinit(allocator);
+                    page_pool = .empty;
                     pending.deinit(allocator);
                     pending = .empty;
-                    pending_index.deinit(allocator);
-                    pending_index = .empty;
+                    rows.deinit(allocator);
+                    rows = .empty;
+                    pending_rows.deinit(allocator);
+                    pending_rows = .empty;
+                    dirty = false;
                 }
-                /// Purges every committed entry of one destroyed slot in
-                /// O(pages) when rows are unique: one hash probe per page
-                /// plus O(1) removals. Only live-generation rows go: history
-                /// rows of past slot instances (older generations) survive,
-                /// so destroy-create-destroy keeps every `Destroy` record.
-                /// Pages with duplicate rows take one linear pass instead.
+                /// Purges every live-generation row of one destroyed slot by
+                /// walking its chain: O(chain), no page scans. History rows
+                /// of past slot instances (older generations) survive, so
+                /// destroy-create-destroy keeps every `Destroy` record.
                 /// - `id` - destroyed entity slot id.
-                /// - `allocator` - funds moved-row index updates and frees
-                ///   emptied pages.
+                /// - `allocator` - funds the pool push of a dropped page.
                 fn onEntityDestroyed(id: u32, allocator: std.mem.Allocator) EcsError!void {
+                    if (id >= rows.items.len) {
+                        return;
+                    }
                     const live: u8 = Ecs.entity_generation.items[id];
-                    var pi: usize = 0;
-                    while (pi < committed.items.len) {
-                        if (!committed.items[pi].has_dupes) {
-                            const before: usize = committed.items.len;
-                            const hit = committed.items[pi].index.get(id);
-                            if (hit) |k| {
-                                if (k < committed.items[pi].entities.items.len and
-                                    committed.items[pi].entities.items[k].gen == live)
-                                {
-                                    try removeAt(allocator, pi, k);
-                                    if (committed.items.len == before) {
-                                        pi += 1;
-                                    }
-                                    continue;
-                                }
-                            } else {
-                                pi += 1;
-                                continue;
-                            }
-                        }
-                        // Slow path (duplicates, or a stale row shadowing a
-                        // live one): backward scan drops every live match.
-                        // Swap moves land in already-visited positions whose
-                        // verdicts are final, so no row is skipped.
-                        const before: usize = committed.items.len;
-                        var k: usize = committed.items[pi].entities.items.len;
-                        while (k > 0) {
-                            k -= 1;
-                            const e = committed.items[pi].entities.items[k];
-                            if (e.id == id and e.gen == live) {
-                                try removeAt(allocator, pi, k);
-                                if (committed.items.len != before) {
-                                    break;
-                                }
-                            }
-                        }
-                        if (committed.items.len == before) {
-                            rebuildIndex(pi);
-                            pi += 1;
-                        }
+                    while (findSlotRow(id, live)) |loc| {
+                        try removeAt(allocator, loc.page, loc.index);
                     }
                 }
-                /// Rebuilds one page index from scratch, recomputing the
-                /// duplicate flag. Runs only after the linear purge path;
-                /// puts cannot fail: the map just shed rows, capacity suffices.
-                /// - `pi` - position of the page in `committed`.
-                fn rebuildIndex(pi: usize) void {
-                    const page = &committed.items[pi];
-                    page.index.clearRetainingCapacity();
-                    page.has_dupes = false;
-                    for (page.entities.items, 0..) |e, k| {
-                        if (page.index.get(e.id) != null) {
-                            page.has_dupes = true;
-                        } else {
-                            page.index.putAssumeCapacity(e.id, @intCast(k));
-                        }
-                    }
-                }
-                /// Relocates one entity entries to the destination archetype
+                /// Relocates one entity rows to the destination archetype
                 /// page and refreshes their generation, keeping the invariant
                 /// that a page arch always equals the live entity archetype.
+                /// Only live-generation rows move: history rows of past
+                /// instances keep their generation and stay put.
                 /// - `id` - migrated entity slot id.
                 /// - `old_arch` - archetype id the entity leaves.
                 /// - `new_arch` - archetype id the entity enters.
@@ -3761,60 +3915,52 @@ pub fn ECS(comptime sets: anytype) type {
                     new_gen: u8,
                     allocator: std.mem.Allocator,
                 ) EcsError!void {
+                    if (id >= rows.items.len) {
+                        return;
+                    }
                     const fresh = EntityReference{ .id = @intCast(id), .gen = new_gen };
+                    const old_gen: u8 = new_gen -% 1;
                     if (old_arch == new_arch) {
-                        if (findPageIndex(old_arch)) |pi| {
-                            for (committed.items[pi].entities.items) |*e| {
-                                if (e.id == id) {
-                                    e.* = fresh;
-                                }
+                        var cur = rows.items[id];
+                        while (cur != NO_PACK) {
+                            const loc = resolvePacked(cur) orelse break;
+                            const e = committed.items[loc.page].entities.items[loc.index];
+                            const nxt = committed.items[loc.page].next.items[loc.index];
+                            if (e.id == id and e.gen == old_gen) {
+                                committed.items[loc.page].entities.items[loc.index] = fresh;
                             }
+                            cur = nxt;
                         }
                         return;
                     }
-                    // Move every row of the slot, oldest first: probe, else
-                    // the lowest matching row. Each step re-resolves the page
-                    // because removals and inserts shift `committed`.
-                    while (try moveOneRow(allocator, id, old_arch, new_arch, fresh)) {}
+                    // Move every live-generation row, oldest first. Each step
+                    // re-resolves because removals and inserts shift packs.
+                    while (findSlotRowGen(id, old_gen)) |loc| {
+                        const v = committed.items[loc.page].values.items[loc.index];
+                        try removeAt(allocator, loc.page, loc.index);
+                        try appendRow(allocator, new_arch, fresh, v);
+                    }
                 }
-                /// Moves a single event row of one slot to the destination
-                /// archetype page, refreshing its generation. History rows
-                /// append as new records, never collapsing.
-                /// - `allocator` - funds page and row allocation.
-                /// - `id` - migrated entity slot id.
-                /// - `old_arch` - archetype page to take from.
-                /// - `new_arch` - archetype page to file under.
-                /// - `fresh` - entity reference with the new generation.
+                /// Locates the oldest committed row of one slot id plus
+                /// generation by walking its chain.
+                /// - `id` - entity slot id.
+                /// - `gen` - entity generation.
                 ///
-                /// Returns `bool` - false when no row of the slot is left.
-                fn moveOneRow(
-                    allocator: std.mem.Allocator,
-                    id: u32,
-                    old_arch: u32,
-                    new_arch: u32,
-                    fresh: EntityReference,
-                ) EcsError!bool {
-                    const pi = findPageIndex(old_arch) orelse return false;
-                    const page = &committed.items[pi];
-                    var slot: ?usize = null;
-                    if (page.index.get(id)) |kk| {
-                        if (kk < page.entities.items.len) {
-                            slot = kk;
-                        }
+                /// Returns `?Location` - page and row, or null when absent.
+                fn findSlotRowGen(id: u32, gen: u8) ?Location {
+                    if (id >= rows.items.len) {
+                        return null;
                     }
-                    if (slot == null and page.has_dupes) {
-                        for (page.entities.items, 0..) |e, kk| {
-                            if (e.id == id) {
-                                slot = kk;
-                                break;
-                            }
+                    var cur = rows.items[id];
+                    while (cur != NO_PACK) {
+                        const loc = resolvePacked(cur) orelse return null;
+                        const e = committed.items[loc.page].entities.items[loc.index];
+                        if (e.id == id and e.gen == gen) {
+                            return loc;
                         }
+                        cur = committed.items[loc.page].next.items[loc.index];
                     }
-                    const k = slot orelse return false;
-                    const v = page.values.items[k];
-                    try removeAt(allocator, pi, k);
-                    try appendRow(allocator, new_arch, fresh, v);
-                    return true;
+                    return null;
                 }
             };
         }
@@ -3873,8 +4019,8 @@ pub fn ECS(comptime sets: anytype) type {
             flush: *const fn (std.mem.Allocator) EcsError!void,
             /// Drops the payload pending queue without applying it.
             discardPending: *const fn () void,
-            /// Clears committed pages, freeing page lists for the frame boundary.
-            clearCommitted: *const fn (std.mem.Allocator) void,
+            /// Clears committed pages into the pool, retaining buffers.
+            clearCommitted: *const fn (std.mem.Allocator) EcsError!void,
             /// Frees committed pages and the pending queue.
             deinitStore: *const fn (std.mem.Allocator) void,
             /// Purges every committed entry of one destroyed entity slot.
@@ -3905,12 +4051,14 @@ pub fn ECS(comptime sets: anytype) type {
                 entry.discardPending();
             }
         }
-        /// Clears every committed event page. Runs once after the last
-        /// system of a successful schedule: events live for exactly one frame.
-        /// - `allocator` - allocator that funded the page lists.
-        fn clearAllEvents(allocator: std.mem.Allocator) void {
+        /// Clears every committed event page into its pool, retaining all
+        /// buffers. Runs once after the last system of a successful
+        /// schedule: events live for exactly one frame. Skips stores that
+        /// filed nothing. Steady-state frames allocate nothing here.
+        /// - `allocator` - funds the one-time pool reservation.
+        fn clearAllEvents(allocator: std.mem.Allocator) EcsError!void {
             for (Ecs.event_registry.items) |entry| {
-                entry.clearCommitted(allocator);
+                try entry.clearCommitted(allocator);
             }
         }
         /// Purges committed events of one destroyed slot, payload by payload.
@@ -4375,19 +4523,22 @@ pub fn ECS(comptime sets: anytype) type {
                 try Store.ensureRegistered(self.allocator);
                 try Store.queueDestroy(self.allocator, handle);
             }
-            /// Queues destruction of every event of the payload type in one
-            /// linear pass. Pending sets are converted, so only sets queued
-            /// after this call survive the flush. No-op when nothing was ever
-            /// queued for the payload.
+            /// Queues destruction of every event of the payload type in O(1):
+            /// arms a bulk wipe that the flush applies in O(pages), dropping
+            /// whole pages to the pool instead of removing rows one by one.
+            /// Pending sets convert implicitly (they die with the wipe), so
+            /// only sets queued after this call survive the flush. No-op
+            /// when nothing was ever queued for the payload.
             /// - `self` - handler of the running system.
             /// - `E` - event payload struct type.
             pub fn cmdDestroyEvents(self: *const SystemHandler, comptime E: type) EcsError!void {
+                _ = self;
                 validateEventType(E);
                 const Store = EventStore(E);
                 if (!Store.registered) {
                     return;
                 }
-                try Store.queueDestroyAll(self.allocator);
+                Store.queueDestroyAll();
             }
             /// Queues one payload for a whole slice of entities in O(n):
             /// one shared validation pass, one capacity reservation, then an
@@ -4443,6 +4594,81 @@ pub fn ECS(comptime sets: anytype) type {
                 const Store = EventStore(E);
                 try Store.ensureRegistered(self.allocator);
                 try Store.queueDestroyMany(self.allocator, entities);
+            }
+            /// Assigns buffer budgets for one event payload type, replacing
+            /// any previous assignment wholesale. Grows buffers toward the
+            /// budgets immediately (warmup); budgets trim back down at every
+            /// frame end. Mid-frame growth past any budget is always allowed.
+            /// Warmup never touches live committed data, so calling mid-frame
+            /// is safe. Unset (`null`) fields grow forever.
+            /// - `self` - handler of the running system.
+            /// - `E` - event payload struct type.
+            /// - `limits` - budgets to assign.
+            pub fn setEventLimits(
+                self: *const SystemHandler,
+                comptime E: type,
+                limits: EventLimits,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = EventStore(E);
+                try Store.ensureRegistered(self.allocator);
+                if (limits.slots) |s| {
+                    if (s > 0) {
+                        try Store.ensureSlot(self.allocator, s - 1);
+                    }
+                }
+                if (limits.pending) |p| {
+                    try Store.pending.ensureTotalCapacity(self.allocator, p);
+                }
+                const col_cap: usize = limits.events_per_page orelse 0;
+                if (limits.pages) |pg| {
+                    const want: usize = pg;
+                    try Store.committed.ensureTotalCapacity(self.allocator, want);
+                    for (Store.page_pool.items) |*shell| {
+                        try shell.entities.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.values.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.next.ensureTotalCapacity(self.allocator, col_cap);
+                    }
+                    while (Store.page_pool.items.len < want) {
+                        var shell = EventPage(E){ .arch_id = 0 };
+                        errdefer shell.entities.deinit(self.allocator);
+                        errdefer shell.values.deinit(self.allocator);
+                        errdefer shell.next.deinit(self.allocator);
+                        try shell.entities.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.values.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.next.ensureTotalCapacity(self.allocator, col_cap);
+                        try Store.page_pool.append(self.allocator, shell);
+                    }
+                } else if (limits.events_per_page) |ec| {
+                    const cc: usize = ec;
+                    for (Store.page_pool.items) |*shell| {
+                        try shell.entities.ensureTotalCapacity(self.allocator, cc);
+                        try shell.values.ensureTotalCapacity(self.allocator, cc);
+                        try shell.next.ensureTotalCapacity(self.allocator, cc);
+                    }
+                }
+                Store.limits = limits;
+            }
+            /// Drops every budget of one event payload type, restoring
+            /// grow-only behavior. Takes effect immediately; already-sized
+            /// buffers stay as they are until normal growth resumes.
+            /// - `self` - handler of the running system.
+            /// - `E` - event payload struct type.
+            pub fn clearEventLimits(self: *const SystemHandler, comptime E: type) void {
+                _ = self;
+                validateEventType(E);
+                EventStore(E).limits = .{};
+            }
+            /// Returns the budgets currently assigned to one event payload
+            /// type, or all-`null` when none were assigned.
+            /// - `self` - handler of the running system.
+            /// - `E` - event payload struct type.
+            ///
+            /// Returns `EventLimits` - active budgets.
+            pub fn eventLimits(self: *const SystemHandler, comptime E: type) EventLimits {
+                _ = self;
+                validateEventType(E);
+                return EventStore(E).limits;
             }
             /// Returns every non-empty event page of the payload type: dense
             /// and sorted by archetype id. Read-only by contract, valid only
@@ -4886,7 +5112,7 @@ pub fn ECS(comptime sets: anytype) type {
                         try sys(&handler);
                         try Ecs.flushCommands(allocator);
                     }
-                    Ecs.clearAllEvents(allocator);
+                    try Ecs.clearAllEvents(allocator);
                 }
             };
         }
@@ -6877,6 +7103,8 @@ test "cmdDestroyEvents wipes the whole payload" {
             // A set queued before the wipe is cancelled by it...
             try h.cmdSetEvent(S.small, Damage, .{ .amount = 99 });
             try h.cmdDestroyEvents(Damage);
+            // ...a second bulk in the same system is idempotent...
+            try h.cmdDestroyEvents(Damage);
             // ...while a set queued after the wipe survives.
             try h.cmdSetEvent(S.big, Damage, .{ .amount = 7 });
         }
@@ -6895,6 +7123,18 @@ test "cmdDestroyEvents wipes the whole payload" {
     // Bulk over a payload with nothing queued is a no-op, not an error.
     const handler = Ecs.SystemHandler{ .allocator = allocator };
     try handler.cmdDestroyEvents(Damage);
+    // The wipe flag never leaks across flushes: a fresh frame flows normally.
+    const Fresh = struct {
+        fn verify_fresh(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            var total: usize = 0;
+            for (pages) |page| {
+                total += page.count();
+            }
+            try std.testing.expect(total == 2);
+        }
+    };
+    try Ecs.Schedule(.{ S.emit, Fresh.verify_fresh }).run(allocator);
 }
 test "mass per-handle destroy keeps the index consistent" {
     const Ecs = ECS(.{.{Pos}});
@@ -7268,6 +7508,54 @@ test "lifecycle Migrate keeps full history" {
     defer Ecs.deinit(allocator);
     try App.run(allocator);
 }
+test "user events follow the entity across migrate" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 1, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.target, Damage, .{ .amount = 42 });
+        }
+        fn move(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdMigrate(S.target, &[_]type{Pos}, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 42);
+            const e = pages[0].entityAt(0);
+            try std.testing.expect(e.isAlive());
+            try std.testing.expect(e.gen == S.target.gen +% 1);
+            // The stale pre-migrate handle finds nothing...
+            try std.testing.expectError(
+                Ecs.EcsError.EventNotFound,
+                h.cmdDestroyEvent(Ecs.EventHandle(Damage){
+                    .entity = S.target,
+                    .arch_id = pages[0].arch_id,
+                    .index = 0,
+                }),
+            );
+            // ...while the fresh handle destroys.
+            try h.cmdDestroyEvent(pages[0].handleAt(0));
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.move, S.verify, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
 test "lifecycle Reparent and DepthUpdate partition the move" {
     const Ecs = ECS(.{.{Pos}});
     const S = struct {
@@ -7516,4 +7804,206 @@ test "lifecycle events clear at frame end and survive deinit reuse" {
     // Reuse after deinit re-registers lifecycle payloads on first filing.
     try App.run(allocator);
     Ecs.deinit(allocator);
+}
+test "event limits warm up buffers on assignment" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Damage = struct { amount: u32 };
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try handler.setEventLimits(Damage, .{
+        .slots = 500,
+        .pending = 64,
+        .events_per_page = 32,
+        .pages = 2,
+    });
+    const got = handler.eventLimits(Damage);
+    try std.testing.expectEqual(@as(?u32, 500), got.slots);
+    try std.testing.expectEqual(@as(?u32, 64), got.pending);
+    try std.testing.expectEqual(@as(?u32, 32), got.events_per_page);
+    try std.testing.expectEqual(@as(?u32, 2), got.pages);
+    const Store = Ecs.EventStore(Damage);
+    try std.testing.expect(Store.rows.items.len >= 500);
+    try std.testing.expect(Store.pending_rows.items.len >= 500);
+    try std.testing.expect(Store.pending.capacity >= 64);
+    try std.testing.expect(Store.committed.capacity >= 2);
+    try std.testing.expect(Store.page_pool.items.len == 2);
+    for (Store.page_pool.items) |*shell| {
+        try std.testing.expect(shell.entities.capacity >= 32);
+        try std.testing.expect(shell.values.capacity >= 32);
+        try std.testing.expect(shell.next.capacity >= 32);
+    }
+    // Replace semantics: a second set overwrites wholesale.
+    try handler.setEventLimits(Damage, .{ .pending = 16 });
+    const got2 = handler.eventLimits(Damage);
+    try std.testing.expect(got2.slots == null);
+    try std.testing.expectEqual(@as(?u32, 16), got2.pending);
+    // Clearing restores grow-only defaults.
+    handler.clearEventLimits(Damage);
+    try std.testing.expect(handler.eventLimits(Damage).pending == null);
+}
+test "event limits trim buffers at frame end" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 100;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        var mid_col_cap: usize = 0;
+        var mid_pending_cap: usize = 0;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            var values: [N]Damage = undefined;
+            for (0..N) |i| {
+                values[i] = .{ .amount = @intCast(i) };
+            }
+            try h.cmdSetEventsEach(S.refs[0..], Damage, values[0..]);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+            var sum: u64 = 0;
+            for (pages[0].eventList()) |ev| {
+                sum += ev.amount;
+            }
+            try std.testing.expect(sum == N * (N - 1) / 2);
+            const Store = Ecs.EventStore(Damage);
+            S.mid_col_cap = Store.committed.items[0].entities.capacity;
+            S.mid_pending_cap = Store.pending.capacity;
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try handler.setEventLimits(Damage, .{ .events_per_page = 4, .pages = 1, .pending = 8 });
+    try App.run(allocator);
+    try std.testing.expect(S.mid_col_cap >= N);
+    try std.testing.expect(S.mid_pending_cap >= N);
+    const Store = Ecs.EventStore(Damage);
+    try std.testing.expect(Store.page_pool.items.len == 1);
+    try std.testing.expect(Store.page_pool.items[0].entities.capacity < S.mid_col_cap);
+    try std.testing.expect(Store.pending.capacity < N);
+    // The next frame still computes correctly after the trim.
+    try App.run(allocator);
+}
+test "slot limits never drop live coverage" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 50;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvents(S.refs[0..], Damage, .{ .amount = 3 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try handler.setEventLimits(Damage, .{ .slots = 5 });
+    try App.run(allocator);
+    const Store = Ecs.EventStore(Damage);
+    try std.testing.expect(Store.rows.items.len == N);
+    try std.testing.expect(Store.pending_rows.items.len == N);
+    try App.run(allocator);
+}
+test "cleared limits restore grow-only behavior" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Damage = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var small: Ecs.EntityReference = undefined;
+        var big: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.small = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.big = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 2, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvent(S.small, Damage, .{ .amount = 1 });
+            try h.cmdSetEvent(S.big, Damage, .{ .amount = 2 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allEvents(Damage).len == 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try handler.setEventLimits(Damage, .{ .pages = 1 });
+    try App.run(allocator);
+    try std.testing.expect(Ecs.EventStore(Damage).page_pool.items.len == 1);
+    handler.clearEventLimits(Damage);
+    try std.testing.expect(handler.eventLimits(Damage).pages == null);
+    try App.run(allocator);
+    try std.testing.expect(Ecs.EventStore(Damage).page_pool.items.len == 2);
+}
+test "zero limits retain nothing" {
+    const Ecs = ECS(.{.{Pos}});
+    const Damage = struct { amount: u32 };
+    const N: usize = 10;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetEvents(S.refs[0..], Damage, .{ .amount = 7 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allEvents(Damage);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try handler.setEventLimits(Damage, .{ .pending = 0, .events_per_page = 0, .pages = 0 });
+    try App.run(allocator);
+    const Store = Ecs.EventStore(Damage);
+    try std.testing.expect(Store.page_pool.items.len == 0);
+    try std.testing.expect(Store.pending.capacity == 0);
+    try std.testing.expect(Store.committed.capacity == 0);
+    // The next frame still computes correctly after full release.
+    try App.run(allocator);
 }

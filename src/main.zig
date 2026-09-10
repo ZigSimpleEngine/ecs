@@ -29,6 +29,7 @@ const CustomEvent = struct {};
 const App = ECS.Schedule(.{ setup, print, printAllVsNonempty });
 var player1: ECS.EntityReference = undefined;
 fn setup(h: *ECS.SystemHandler) anyerror!void {
+    try h.setEventLimits(CustomEvent, .{ .events_per_page = 100, .pending = 100 });
     player1 = try h.cmdCreate(Player, .{
         Position{ .x = 10, .y = -3 },
         Scale{ .w = 1, .h = 1 },

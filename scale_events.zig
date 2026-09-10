@@ -17,11 +17,15 @@ const Ecs4 = ecs_module.ECS(.{
     .{ Pos, T0, T1 },
 });
 
-// Smaller ladder in Debug: quadratic passes are ~30x slower there.
+// Smaller ladder in Debug: low per-op constants dominate there.
 const Ns: []const usize = if (builtin.mode == .Debug)
     &.{ 500, 1000, 2000 }
 else
-    &.{ 1000, 2500, 5000, 10000 };
+    &.{ 10000, 25000, 50000, 100000 };
+
+// Repetitions per scenario: first run is cold (growth, allocator caches),
+// best of the rest is the warm steady state the gate is measured against.
+const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
 
 fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
@@ -218,7 +222,7 @@ fn benchPurge(comptime E: type, allocator: std.mem.Allocator, want: usize) !stru
     return .{ .kill_ns = S.kill_ns, .total_ns = nsSince(t0) };
 }
 
-const MAXN: usize = 10000;
+const MAXN: usize = 100000;
 var bench_refs: [MAXN]Ecs1.EntityReference = undefined;
 
 fn spawn1refs(allocator: std.mem.Allocator, n: u32) !void {
@@ -294,13 +298,52 @@ fn benchBatchDestroy(allocator: std.mem.Allocator, n: usize) !struct { wipe_ns: 
     return .{ .wipe_ns = S.wipe_ns, .total_ns = nsSince(t0) };
 }
 
+/// S10: emit, then wipe everything with one bulk call. Compares against S8's
+/// per-entity destroy-for: O(pages) wipe instead of O(events) removes.
+fn benchBulkDestroy(allocator: std.mem.Allocator, n: usize) !struct { wipe_ns: u64, total_ns: u64 } {
+    const S = struct {
+        const S = @This();
+        var wipe_ns: u64 = 0;
+        var want_n: usize = 0;
+        fn emit(h: *Ecs1.SystemHandler) anyerror!void {
+            try h.cmdSetEvents(bench_refs[0..want_n], Damage, .{ .amount = 1 });
+        }
+        fn wipe(h: *Ecs1.SystemHandler) anyerror!void {
+            var total: usize = 0;
+            for (h.allEvents(Damage)) |page| {
+                total += page.count();
+            }
+            try std.testing.expect(total == S.want_n);
+            const t0 = stamp();
+            try h.cmdDestroyEvents(Damage);
+            S.wipe_ns = nsSince(t0);
+        }
+    };
+    S.want_n = n;
+    const t0 = stamp();
+    try Ecs1.Schedule(.{ S.emit, S.wipe }).run(allocator);
+    return .{ .wipe_ns = S.wipe_ns, .total_ns = nsSince(t0) };
+}
+
 test "bench S1: emit ladder (single page)" {
     const allocator = std.testing.allocator;
     defer Ecs1.deinit(allocator);
     for (Ns) |n| {
         try spawn1(allocator, @intCast(n));
-        const r = try benchEmit(Ecs1, allocator, n);
-        std.debug.print("S1 emit 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(r.emit_ns), ms(r.total_ns) });
+        var cold_emit: u64 = 0;
+        var best_emit: u64 = std.math.maxInt(u64);
+        var cold_frame: u64 = 0;
+        var best_frame: u64 = std.math.maxInt(u64);
+        for (0..REPS) |r| {
+            const m = try benchEmit(Ecs1, allocator, n);
+            if (r == 0) {
+                cold_emit = m.emit_ns;
+                cold_frame = m.total_ns;
+            }
+            best_emit = @min(best_emit, m.emit_ns);
+            best_frame = @min(best_frame, m.total_ns);
+        }
+        std.debug.print("S1 emit 1-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_emit), ms(best_emit), ms(cold_frame), ms(best_frame) });
         try std.testing.expect(countEvents(Ecs1, allocator) == 0); // frame-end clear
         try wipeWorld(Ecs1, allocator);
     }
@@ -311,10 +354,30 @@ test "bench S2/S3: read and destroy-each at max N (single page)" {
     defer Ecs1.deinit(allocator);
     const n = Ns[Ns.len - 1];
     try spawn1(allocator, @intCast(n));
-    const r = try benchRead(Ecs1, allocator, n);
-    std.debug.print("S2 read 1-page N={d}: read {d:.3} ms, frame {d:.2} ms\n", .{ n, ms(r.read_ns), ms(r.total_ns) });
-    const w = try benchDestroyEach(Ecs1, allocator, n);
-    std.debug.print("S3 destroy-each 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(w.wipe_ns), ms(w.total_ns) });
+    var cold_read: u64 = 0;
+    var best_read: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchRead(Ecs1, allocator, n);
+        if (r == 0) {
+            cold_read = m.read_ns;
+        }
+        best_read = @min(best_read, m.read_ns);
+    }
+    std.debug.print("S2 read 1-page N={d}: read cold {d:.3} / best {d:.3} ms\n", .{ n, ms(cold_read), ms(best_read) });
+    var cold_wipe: u64 = 0;
+    var best_wipe: u64 = std.math.maxInt(u64);
+    var cold_wframe: u64 = 0;
+    var best_wframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchDestroyEach(Ecs1, allocator, n);
+        if (r == 0) {
+            cold_wipe = m.wipe_ns;
+            cold_wframe = m.total_ns;
+        }
+        best_wipe = @min(best_wipe, m.wipe_ns);
+        best_wframe = @min(best_wframe, m.total_ns);
+    }
+    std.debug.print("S3 destroy-each 1-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_wipe), ms(best_wipe), ms(cold_wframe), ms(best_wframe) });
     try std.testing.expect(countEvents(Ecs1, allocator) == 0);
 }
 
@@ -323,12 +386,44 @@ test "bench S4: spread over 4 pages at max N" {
     defer Ecs4.deinit(allocator);
     const n = Ns[Ns.len - 1];
     try spawn4(allocator, @intCast(n));
-    const e = try benchEmit(Ecs4, allocator, n);
-    std.debug.print("S1 emit 4-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(e.emit_ns), ms(e.total_ns) });
-    const r = try benchRead(Ecs4, allocator, n);
-    std.debug.print("S2 read 4-page N={d}: read {d:.3} ms, frame {d:.2} ms\n", .{ n, ms(r.read_ns), ms(r.total_ns) });
-    const w = try benchDestroyEach(Ecs4, allocator, n);
-    std.debug.print("S3 destroy-each 4-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(w.wipe_ns), ms(w.total_ns) });
+    var cold_emit: u64 = 0;
+    var best_emit: u64 = std.math.maxInt(u64);
+    var cold_frame: u64 = 0;
+    var best_frame: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchEmit(Ecs4, allocator, n);
+        if (r == 0) {
+            cold_emit = m.emit_ns;
+            cold_frame = m.total_ns;
+        }
+        best_emit = @min(best_emit, m.emit_ns);
+        best_frame = @min(best_frame, m.total_ns);
+    }
+    std.debug.print("S1 emit 4-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_emit), ms(best_emit), ms(cold_frame), ms(best_frame) });
+    var cold_read: u64 = 0;
+    var best_read: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchRead(Ecs4, allocator, n);
+        if (r == 0) {
+            cold_read = m.read_ns;
+        }
+        best_read = @min(best_read, m.read_ns);
+    }
+    std.debug.print("S2 read 4-page N={d}: read cold {d:.3} / best {d:.3} ms\n", .{ n, ms(cold_read), ms(best_read) });
+    var cold_wipe: u64 = 0;
+    var best_wipe: u64 = std.math.maxInt(u64);
+    var cold_wframe: u64 = 0;
+    var best_wframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchDestroyEach(Ecs4, allocator, n);
+        if (r == 0) {
+            cold_wipe = m.wipe_ns;
+            cold_wframe = m.total_ns;
+        }
+        best_wipe = @min(best_wipe, m.wipe_ns);
+        best_wframe = @min(best_wframe, m.total_ns);
+    }
+    std.debug.print("S3 destroy-each 4-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_wipe), ms(best_wipe), ms(cold_wframe), ms(best_wframe) });
     try std.testing.expect(countEvents(Ecs4, allocator) == 0);
 }
 
@@ -359,9 +454,19 @@ test "bench S5: full frame emit+consume+destroy (single page, max N)" {
         }
     };
     S.want_n = n;
-    const t0 = stamp();
+    var cold_frame: u64 = std.math.maxInt(u64);
+    var best_frame: u64 = std.math.maxInt(u64);
+    // First rep is cold; best of all reps is the warm steady state.
+    var t0 = stamp();
     try Ecs1.Schedule(.{ S.emit, S.consume }).run(allocator);
-    std.debug.print("S5 full frame 1-page N={d}: {d:.2} ms\n", .{ n, ms(nsSince(t0)) });
+    cold_frame = nsSince(t0);
+    best_frame = @min(best_frame, cold_frame);
+    for (1..REPS) |_| {
+        t0 = stamp();
+        try Ecs1.Schedule(.{ S.emit, S.consume }).run(allocator);
+        best_frame = @min(best_frame, nsSince(t0));
+    }
+    std.debug.print("S5 full frame 1-page N={d}: cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_frame), ms(best_frame) });
     try std.testing.expect(countEvents(Ecs1, allocator) == 0);
 }
 
@@ -369,7 +474,6 @@ test "bench S6b: destroy entities WITHOUT events (baseline, max N)" {
     const allocator = std.testing.allocator;
     defer Ecs1.deinit(allocator);
     const n = Ns[Ns.len - 1];
-    try spawn1(allocator, @intCast(n));
     const S = struct {
         const S = @This();
         var kill_ns: u64 = 0;
@@ -379,19 +483,42 @@ test "bench S6b: destroy entities WITHOUT events (baseline, max N)" {
             S.kill_ns = nsSince(t0);
         }
     };
-    const t0 = stamp();
-    try Ecs1.Schedule(.{S.kill}).run(allocator);
-    std.debug.print("S6b destroy-no-events 1-page N={d}: kill-queue {d:.3} ms, frame {d:.2} ms\n", .{ n, ms(S.kill_ns), ms(nsSince(t0)) });
+    var cold_frame: u64 = 0;
+    var best_frame: u64 = std.math.maxInt(u64);
+    var best_kill: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        try spawn1(allocator, @intCast(n));
+        const t0 = stamp();
+        try Ecs1.Schedule(.{S.kill}).run(allocator);
+        const dt = nsSince(t0);
+        if (r == 0) {
+            cold_frame = dt;
+        }
+        best_frame = @min(best_frame, dt);
+        best_kill = @min(best_kill, S.kill_ns);
+    }
+    std.debug.print("S6b destroy-no-events 1-page N={d}: kill-queue best {d:.3} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(best_kill), ms(cold_frame), ms(best_frame) });
 }
 
 test "bench S6: destroy entities carrying events (purge path, max N)" {
     const allocator = std.testing.allocator;
     defer Ecs1.deinit(allocator);
     const n = Ns[Ns.len - 1];
-    try spawn1(allocator, @intCast(n));
-    const r = try benchPurge(Ecs1, allocator, n);
-    std.debug.print("S6 purge 1-page N={d}: kill-queue {d:.3} ms, frame {d:.2} ms\n", .{ n, ms(r.kill_ns), ms(r.total_ns) });
-    try std.testing.expect(countEvents(Ecs1, allocator) == 0);
+    var cold_frame: u64 = 0;
+    var best_frame: u64 = std.math.maxInt(u64);
+    var best_kill: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        try spawn1(allocator, @intCast(n));
+        const m = try benchPurge(Ecs1, allocator, n);
+        // benchPurge kills the entities it spawned for, so respawn next rep.
+        if (r == 0) {
+            cold_frame = m.total_ns;
+        }
+        best_frame = @min(best_frame, m.total_ns);
+        best_kill = @min(best_kill, m.kill_ns);
+        try std.testing.expect(countEvents(Ecs1, allocator) == 0);
+    }
+    std.debug.print("S6 purge 1-page N={d}: kill-queue best {d:.3} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(best_kill), ms(cold_frame), ms(best_frame) });
 }
 
 test "bench S9: lifecycle filing overhead (mass create/destroy)" {
@@ -423,12 +550,44 @@ test "bench S9: lifecycle filing overhead (mass create/destroy)" {
         }
     };
     S.count = @intCast(n);
-    var t0 = stamp();
-    try Ecs1.Schedule(.{ S.create_many, S.check_created }).run(allocator);
-    std.debug.print("S9a mass-create 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(S.create_ns), ms(nsSince(t0)) });
-    t0 = stamp();
-    try Ecs1.Schedule(.{S.kill}).run(allocator);
-    std.debug.print("S9b mass-destroy 1-page N={d}: queue {d:.3} ms, frame {d:.2} ms\n", .{ n, ms(S.kill_ns), ms(nsSince(t0)) });
+    var cold_create: u64 = 0;
+    var best_create: u64 = std.math.maxInt(u64);
+    var cold_cframe: u64 = 0;
+    var best_cframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        if (r > 0) {
+            try wipeWorld(Ecs1, allocator);
+        }
+        const t0 = stamp();
+        try Ecs1.Schedule(.{ S.create_many, S.check_created }).run(allocator);
+        const dt = nsSince(t0);
+        if (r == 0) {
+            cold_create = S.create_ns;
+            cold_cframe = dt;
+        }
+        best_create = @min(best_create, S.create_ns);
+        best_cframe = @min(best_cframe, dt);
+        // Cleanup for the next rep (untimed).
+        try Ecs1.Schedule(.{S.kill}).run(allocator);
+    }
+    std.debug.print("S9a mass-create 1-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_create), ms(best_create), ms(cold_cframe), ms(best_cframe) });
+    var cold_kill: u64 = 0;
+    var best_kill: u64 = std.math.maxInt(u64);
+    var cold_kframe: u64 = 0;
+    var best_kframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        try spawn1(allocator, @intCast(n));
+        const t0 = stamp();
+        try Ecs1.Schedule(.{S.kill}).run(allocator);
+        const dt = nsSince(t0);
+        if (r == 0) {
+            cold_kill = S.kill_ns;
+            cold_kframe = dt;
+        }
+        best_kill = @min(best_kill, S.kill_ns);
+        best_kframe = @min(best_kframe, dt);
+    }
+    std.debug.print("S9b mass-destroy 1-page N={d}: queue cold {d:.3} / best {d:.3} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_kill), ms(best_kill), ms(cold_kframe), ms(best_kframe) });
     try std.testing.expect(countEvents(Ecs1, allocator) == 0);
 }
 
@@ -437,10 +596,73 @@ test "bench S7/S8: batch set and destroy-for at max N (single page)" {
     defer Ecs1.deinit(allocator);
     const n = Ns[Ns.len - 1];
     try spawn1refs(allocator, @intCast(n));
-    const s = try benchBatchSet(allocator, n);
-    std.debug.print("S7 batch-set 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(s.emit_ns), ms(s.total_ns) });
+    var cold_semit: u64 = 0;
+    var best_semit: u64 = std.math.maxInt(u64);
+    var cold_sframe: u64 = 0;
+    var best_sframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchBatchSet(allocator, n);
+        if (r == 0) {
+            cold_semit = m.emit_ns;
+            cold_sframe = m.total_ns;
+        }
+        best_semit = @min(best_semit, m.emit_ns);
+        best_sframe = @min(best_sframe, m.total_ns);
+    }
+    std.debug.print("S7 batch-set 1-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_semit), ms(best_semit), ms(cold_sframe), ms(best_sframe) });
     try std.testing.expect(countEvents(Ecs1, allocator) == 0);
-    const w = try benchBatchDestroy(allocator, n);
-    std.debug.print("S8 batch-destroy-for 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(w.wipe_ns), ms(w.total_ns) });
+    var cold_wipe: u64 = 0;
+    var best_wipe: u64 = std.math.maxInt(u64);
+    var cold_wframe: u64 = 0;
+    var best_wframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchBatchDestroy(allocator, n);
+        if (r == 0) {
+            cold_wipe = m.wipe_ns;
+            cold_wframe = m.total_ns;
+        }
+        best_wipe = @min(best_wipe, m.wipe_ns);
+        best_wframe = @min(best_wframe, m.total_ns);
+    }
+    std.debug.print("S8 batch-destroy-for 1-page N={d}: queue cold {d:.2} / best {d:.2} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_wipe), ms(best_wipe), ms(cold_wframe), ms(best_wframe) });
+    try std.testing.expect(countEvents(Ecs1, allocator) == 0);
+}
+
+test "bench S10: bulk destroy-all at max N (single page)" {
+    const allocator = std.testing.allocator;
+    defer Ecs1.deinit(allocator);
+    const n = Ns[Ns.len - 1];
+    try spawn1refs(allocator, @intCast(n));
+    var cold_wipe: u64 = 0;
+    var best_wipe: u64 = std.math.maxInt(u64);
+    var cold_wframe: u64 = 0;
+    var best_wframe: u64 = std.math.maxInt(u64);
+    for (0..REPS) |r| {
+        const m = try benchBulkDestroy(allocator, n);
+        if (r == 0) {
+            cold_wipe = m.wipe_ns;
+            cold_wframe = m.total_ns;
+        }
+        best_wipe = @min(best_wipe, m.wipe_ns);
+        best_wframe = @min(best_wframe, m.total_ns);
+    }
+    std.debug.print("S10 bulk-destroy-all 1-page N={d}: queue cold {d:.3} / best {d:.3} ms, frame cold {d:.2} / best {d:.2} ms\n", .{ n, ms(cold_wipe), ms(best_wipe), ms(cold_wframe), ms(best_wframe) });
+    try std.testing.expect(countEvents(Ecs1, allocator) == 0);
+}
+
+test "bench S11: warmed first frame at max N (single page)" {
+    const allocator = std.testing.allocator;
+    defer Ecs1.deinit(allocator);
+    const n = Ns[Ns.len - 1];
+    try spawn1refs(allocator, @intCast(n));
+    const handler = Ecs1.SystemHandler{ .allocator = allocator };
+    try handler.setEventLimits(Damage, .{
+        .slots = @intCast(n),
+        .pending = @intCast(n),
+        .events_per_page = @intCast(n),
+        .pages = 2,
+    });
+    const m = try benchBatchSet(allocator, n);
+    std.debug.print("S11 warmed-first-frame 1-page N={d}: queue {d:.2} ms, frame {d:.2} ms\n", .{ n, ms(m.emit_ns), ms(m.total_ns) });
     try std.testing.expect(countEvents(Ecs1, allocator) == 0);
 }
