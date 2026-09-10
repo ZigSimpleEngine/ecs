@@ -97,6 +97,10 @@ pub fn ECS(comptime sets: anytype) type {
             EventHasPendingCommand,
             /// Parallel slices passed to a batch command have different lengths.
             CountMismatch,
+            /// No attribute of this type is stored for the entity.
+            AttributeNotFound,
+            /// A destroy command is already queued for this attribute in this batch.
+            AttributeHasPendingCommand,
         };
         /// Sentinel slot id meaning "no entity": no parent, no children, no siblings.
         /// Real entity ids are `u24`, so this never collides with a live slot.
@@ -114,6 +118,46 @@ pub fn ECS(comptime sets: anytype) type {
             /// Number of rows in the zone.
             len: u32,
         };
+        /// Locates the zone whose region contains the given row index.
+        /// Zones are contiguous, so this is the last zone with
+        /// `offset <= index`. Shared by component storages and attribute
+        /// pages: the algorithm only sees the zone descriptors.
+        /// - `zones` - depth zones sorted ascending by depth, tiling rows.
+        /// - `pos` - row position.
+        ///
+        /// Returns `usize` - index into `zones`.
+        fn zoneIndexForOffset(zones: []const DepthZone, pos: u32) usize {
+            var lo: usize = 0;
+            var hi: usize = zones.len;
+            while (lo < hi) {
+                const mid = (lo + hi) / 2;
+                if (zones[mid].offset <= pos) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return lo - 1;
+        }
+        /// Finds the sorted insertion point of a depth in a zone list.
+        /// Shared by component storages and attribute pages.
+        /// - `zones` - depth zones sorted ascending by depth.
+        /// - `depth` - hierarchy depth.
+        ///
+        /// Returns `usize` - first zone with `depth >= depth`.
+        fn zoneInsertPosition(zones: []const DepthZone, depth: u32) usize {
+            var lo: usize = 0;
+            var hi: usize = zones.len;
+            while (lo < hi) {
+                const mid = (lo + hi) / 2;
+                if (zones[mid].depth < depth) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return lo;
+        }
         /// Deferred lifecycle state of an entity slot: one boolean per kind
         /// of pending command. Stored as a 1-byte packed struct per slot, so
         /// adding a new kind only requires a new field - no repacking.
@@ -543,6 +587,8 @@ pub fn ECS(comptime sets: anytype) type {
                 for (order.items) |id| {
                     const next_depth: u32 = @intCast(@as(i64, Ecs.entity_depth.items[id]) + delta);
                     Ecs.entity_depth.items[id] = next_depth;
+                    // Attribute rows ride along into the new depth zone.
+                    try Ecs.notifyAttributeDepthChanged(id, next_depth, allocator);
                     // Every moved member files DepthUpdate, the reparented
                     // root included: one entity may carry both Reparent and
                     // DepthUpdate records.
@@ -613,7 +659,9 @@ pub fn ECS(comptime sets: anytype) type {
                 };
                 // Events follow the entity: relocate them before the storage
                 // surgery, so an allocation failure leaves the entity untouched.
+                // Attributes relocate the same way.
                 try Ecs.notifyEventEntityMigrated(entity_index, source_id, dest_id, next.gen, allocator);
+                try Ecs.notifyAttributeMigrated(entity_index, source_id, dest_id, next.gen, allocator);
                 // Hierarchy survives a migrate: the row keeps its depth and
                 // lands in the matching zone of the destination archetype.
                 const depth: u32 = Ecs.entity_depth.items[entity_index];
@@ -1485,17 +1533,7 @@ pub fn ECS(comptime sets: anytype) type {
             ///
             /// Returns `usize` - index into `depth_zones`.
             fn zoneIndexByOffset(self: *const Self, pos: u32) usize {
-                var lo: usize = 0;
-                var hi: usize = self.depth_zones.items.len;
-                while (lo < hi) {
-                    const mid = (lo + hi) / 2;
-                    if (self.depth_zones.items[mid].offset <= pos) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                return lo - 1;
+                return zoneIndexForOffset(self.depth_zones.items, pos);
             }
             /// Finds the sorted insertion point of a depth in `depth_zones`.
             /// - `self` - storage to inspect.
@@ -1503,17 +1541,7 @@ pub fn ECS(comptime sets: anytype) type {
             ///
             /// Returns `usize` - first zone with `depth >= depth`.
             fn zoneInsertionIndex(self: *const Self, depth: u32) usize {
-                var lo: usize = 0;
-                var hi: usize = self.depth_zones.items.len;
-                while (lo < hi) {
-                    const mid = (lo + hi) / 2;
-                    if (self.depth_zones.items[mid].depth < depth) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                return lo;
+                return zoneInsertPosition(self.depth_zones.items, depth);
             }
             /// Appends an empty raw row (columns plus reference) without
             /// touching depth zones. Used by bulk creation, which re-sorts
@@ -1941,6 +1969,9 @@ pub fn ECS(comptime sets: anytype) type {
         var entity_parent: std.ArrayListUnmanaged(u32) = .empty;
         /// First child slot per entity, `NO_ENTITY` when childless.
         var entity_first_child: std.ArrayListUnmanaged(u32) = .empty;
+        /// Last child slot per entity, `NO_ENTITY` when childless. Makes
+        /// child attach O(1); maintained alongside the sibling links.
+        var entity_last_child: std.ArrayListUnmanaged(u32) = .empty;
         /// Next sibling slot per entity, `NO_ENTITY` for the last child.
         var entity_next_sibling: std.ArrayListUnmanaged(u32) = .empty;
         /// Previous sibling slot per entity, `NO_ENTITY` for the first child.
@@ -2052,6 +2083,7 @@ pub fn ECS(comptime sets: anytype) type {
                 Ecs.entity_first_child.items[id] = NO_ENTITY;
                 Ecs.entity_next_sibling.items[id] = NO_ENTITY;
                 Ecs.entity_prev_sibling.items[id] = NO_ENTITY;
+                Ecs.entity_last_child.items[id] = NO_ENTITY;
                 Ecs.entity_depth.items[id] = 0;
                 Ecs.entity_pending_parent.items[id] = NO_ENTITY;
                 Ecs.setEntityState(id, .{ .pending_create = true });
@@ -2067,6 +2099,7 @@ pub fn ECS(comptime sets: anytype) type {
             try Ecs.entity_states.ensureTotalCapacity(allocator, next_len);
             try Ecs.entity_parent.ensureTotalCapacity(allocator, next_len);
             try Ecs.entity_first_child.ensureTotalCapacity(allocator, next_len);
+            try Ecs.entity_last_child.ensureTotalCapacity(allocator, next_len);
             try Ecs.entity_next_sibling.ensureTotalCapacity(allocator, next_len);
             try Ecs.entity_prev_sibling.ensureTotalCapacity(allocator, next_len);
             try Ecs.entity_depth.ensureTotalCapacity(allocator, next_len);
@@ -2078,6 +2111,7 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_states.appendAssumeCapacity(.{ .pending_create = true });
             Ecs.entity_parent.appendAssumeCapacity(NO_ENTITY);
             Ecs.entity_first_child.appendAssumeCapacity(NO_ENTITY);
+            Ecs.entity_last_child.appendAssumeCapacity(NO_ENTITY);
             Ecs.entity_next_sibling.appendAssumeCapacity(NO_ENTITY);
             Ecs.entity_prev_sibling.appendAssumeCapacity(NO_ENTITY);
             Ecs.entity_depth.appendAssumeCapacity(0);
@@ -2106,6 +2140,7 @@ pub fn ECS(comptime sets: anytype) type {
             _ = Ecs.entity_states.pop();
             _ = Ecs.entity_parent.pop();
             _ = Ecs.entity_first_child.pop();
+            _ = Ecs.entity_last_child.pop();
             _ = Ecs.entity_next_sibling.pop();
             _ = Ecs.entity_prev_sibling.pop();
             _ = Ecs.entity_depth.pop();
@@ -2170,23 +2205,21 @@ pub fn ECS(comptime sets: anytype) type {
         }
         /// Attaches a brand-new entity as the last child of a live parent:
         /// sets the parent link, the depth and appends to the sibling list.
-        /// Only used for freshly created children; reparenting of existing
-        /// entities goes through `reparentById`.
+        /// O(1) via the cached tail: no sibling walk. Only used for freshly
+        /// created children; reparenting of existing entities goes through
+        /// `reparentById`.
         /// - `id` - child slot id.
         /// - `parent_id` - parent slot id.
         fn linkChild(id: u32, parent_id: u32) void {
             Ecs.entity_parent.items[id] = parent_id;
-            const first = Ecs.entity_first_child.items[parent_id];
-            if (first == NO_ENTITY) {
+            Ecs.entity_prev_sibling.items[id] = Ecs.entity_last_child.items[parent_id];
+            Ecs.entity_next_sibling.items[id] = NO_ENTITY;
+            if (Ecs.entity_last_child.items[parent_id] == NO_ENTITY) {
                 Ecs.entity_first_child.items[parent_id] = id;
             } else {
-                var last = first;
-                while (Ecs.entity_next_sibling.items[last] != NO_ENTITY) {
-                    last = Ecs.entity_next_sibling.items[last];
-                }
-                Ecs.entity_next_sibling.items[last] = id;
-                Ecs.entity_prev_sibling.items[id] = last;
+                Ecs.entity_next_sibling.items[Ecs.entity_last_child.items[parent_id]] = id;
             }
+            Ecs.entity_last_child.items[parent_id] = id;
         }
         /// Resolves the effective parent of a slot: the queued reparent target
         /// when one exists, otherwise the committed parent. Lets command-time
@@ -2219,6 +2252,9 @@ pub fn ECS(comptime sets: anytype) type {
             }
             if (next != NO_ENTITY) {
                 Ecs.entity_prev_sibling.items[next] = prev;
+            } else {
+                // Removed the last child: the tail follows.
+                Ecs.entity_last_child.items[parent] = prev;
             }
             Ecs.entity_parent.items[entity_index] = NO_ENTITY;
             Ecs.entity_prev_sibling.items[entity_index] = NO_ENTITY;
@@ -2244,12 +2280,14 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_first_child.items[id] = NO_ENTITY;
             Ecs.entity_next_sibling.items[id] = NO_ENTITY;
             Ecs.entity_prev_sibling.items[id] = NO_ENTITY;
+            Ecs.entity_last_child.items[id] = NO_ENTITY;
             Ecs.entity_depth.items[id] = 0;
             Ecs.entity_pending_parent.items[id] = NO_ENTITY;
             // Purge live-generation entries, then file the Destroy record
             // with the pre-bump generation: ordering keeps the record while
             // history of past instances (older generations) also survives.
             try Ecs.notifyEventEntityDestroyed(id, allocator);
+            try Ecs.notifyAttributeDestroyed(id, allocator);
             try EventStore(Destroy).fileLifecycle(allocator, arch, dead, .{ .archetype = arch });
             Ecs.entity_generation.items[id] +%= 1;
             Ecs.setEntityState(id, .{});
@@ -2309,6 +2347,7 @@ pub fn ECS(comptime sets: anytype) type {
                 try Ecs.ensureEntityStates(allocator, Ecs.entity_generation.items.len);
                 try Ecs.entity_parent.append(allocator, NO_ENTITY);
                 try Ecs.entity_first_child.append(allocator, NO_ENTITY);
+                try Ecs.entity_last_child.append(allocator, NO_ENTITY);
                 try Ecs.entity_next_sibling.append(allocator, NO_ENTITY);
                 try Ecs.entity_prev_sibling.append(allocator, NO_ENTITY);
                 try Ecs.entity_depth.append(allocator, 0);
@@ -2334,6 +2373,7 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_row.items[new_id] = index;
             Ecs.entity_parent.items[new_id] = NO_ENTITY;
             Ecs.entity_first_child.items[new_id] = NO_ENTITY;
+            Ecs.entity_last_child.items[new_id] = NO_ENTITY;
             Ecs.entity_next_sibling.items[new_id] = NO_ENTITY;
             Ecs.entity_prev_sibling.items[new_id] = NO_ENTITY;
             Ecs.entity_depth.items[new_id] = 0;
@@ -2993,6 +3033,25 @@ pub fn ECS(comptime sets: anytype) type {
                 }
             };
         }
+        /// Shared target check for every set path of events and attributes:
+        /// the slot must exist and be alive or reserved by `cmdCreate` in
+        /// the same system; destroy-pending slots are rejected. Single
+        /// straight-line check without re-reading generation: exactly the
+        /// `exists` + `isAlive` + pending semantics, fused.
+        /// - `ref` - entity reference to validate.
+        fn validateSetTarget(ref: EntityReference) EcsError!void {
+            const id: u32 = ref.id;
+            if (id >= Ecs.entity_generation.items.len) {
+                return EcsError.EntityIsNotAlive;
+            }
+            const state = Ecs.getEntityState(id);
+            if (Ecs.entity_generation.items[id] != ref.gen) {
+                return EcsError.EntityIsNotAlive;
+            }
+            if (!state.pending_create and state.pending_destroy) {
+                return EcsError.EntityHasPendingCommand;
+            }
+        }
         /// Validates an event payload type. Events are plain structs living
         /// outside the archetype/component registry: any struct works, it
         /// never has to be declared in `ECS(...)`. Zero-size structs are
@@ -3176,6 +3235,243 @@ pub fn ECS(comptime sets: anytype) type {
                 /// Returns `*const ArchetypeInfo` - source archetype descriptor.
                 pub fn archetypeInfo(self: *const Self) *const ArchetypeInfo {
                     return &Ecs.archetypes[self.arch_id];
+                }
+            };
+        }
+        /// Opaque handle of one stored attribute. Issued only by
+        /// `AttributePage.handleAt`, never built by hand: `cmdDestroyAttribute`
+        /// validates the handle against committed attributes, so forged
+        /// handles fail with `AttributeNotFound`. Lookup is by entity id
+        /// plus generation; `arch_id` and `index` are placement hints only.
+        /// A handle stays usable while its entity is neither migrated nor
+        /// destroyed: both operations invalidate the stored generation.
+        /// - `E` - attribute payload type the handle refers to.
+        ///
+        /// Returns `type` - handle type bound to the payload.
+        pub fn AttributeHandle(comptime E: type) type {
+            validateEventType(E);
+            return struct {
+                /// Payload tag. Lets `cmdDestroyAttribute` infer `E` from the
+                /// handle type and reject handles of foreign payloads.
+                pub const AttributePayload = E;
+                /// Entity carrying the attribute, with the generation
+                /// observed when the handle was issued.
+                entity: EntityReference,
+                /// Archetype page holding the attribute when the handle was
+                /// issued. Placement hint only.
+                arch_id: u32,
+                /// Row inside that page when the handle was issued.
+                /// Placement hint only.
+                index: u32,
+            };
+        }
+        /// Dense page of attributes of one payload type over one archetype:
+        /// `entities[i]` carries `values[i]`. Pages of one payload are sorted
+        /// ascending by `arch_id` and only non-empty pages are stored. Rows
+        /// are grouped into depth zones exactly like component storages, so
+        /// hierarchy depth can be iterated without touching entity columns.
+        /// Read-only by contract, except through `getAttribute` and zone
+        /// views which expose mutable values like component columns do.
+        /// Treat any view as valid only until the current system returns.
+        /// - `E` - attribute payload type stored in the page.
+        ///
+        /// Returns `type` - page type holding one archetype id.
+        pub fn AttributePage(comptime E: type) type {
+            validateEventType(E);
+            return struct {
+                const Self = @This();
+                /// Archetype the page attributes were filed under: the live
+                /// archetype of every listed entity.
+                arch_id: u32,
+                /// Entities carrying the attribute, parallel to `values`.
+                entities: std.ArrayListUnmanaged(EntityReference) = .empty,
+                /// Attribute payloads, parallel to `entities`.
+                values: std.ArrayListUnmanaged(E) = .empty,
+                /// Contiguous depth zones tiling the row array, maintained
+                /// exactly like component storage zones.
+                depth_zones: std.ArrayListUnmanaged(DepthZone) = .empty,
+                /// Counts attributes on the page.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `usize` - number of stored attributes.
+                pub fn count(self: *const Self) usize {
+                    return self.entities.items.len;
+                }
+                /// Checks whether the page holds no attributes.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `bool` - true when the page is empty.
+                pub fn isEmpty(self: *const Self) bool {
+                    return self.entities.items.len == 0;
+                }
+                /// Fetches the entity carrying the attribute at the given position.
+                /// - `self` - page to inspect.
+                /// - `index` - attribute position.
+                ///
+                /// Returns `EntityReference` - handle stored in the row.
+                pub fn entityAt(self: *const Self, index: usize) EntityReference {
+                    return self.entities.items[index];
+                }
+                /// Fetches the payload stored at the given position.
+                /// - `self` - page to inspect.
+                /// - `index` - attribute position.
+                ///
+                /// Returns `*const E` - pointer into the payload column.
+                pub fn valueAt(self: *const Self, index: usize) *const E {
+                    return &self.values.items[index];
+                }
+                /// Issues the destroy handle of the attribute at the given
+                /// position. The only legal source of `cmdDestroyAttribute`
+                /// input.
+                /// - `self` - page to inspect.
+                /// - `index` - attribute position.
+                ///
+                /// Returns `AttributeHandle(E)` - handle of the attribute.
+                pub fn handleAt(self: *const Self, index: usize) AttributeHandle(E) {
+                    return .{
+                        .entity = self.entities.items[index],
+                        .arch_id = self.arch_id,
+                        .index = @intCast(index),
+                    };
+                }
+                /// Exposes the entity column, read-only.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const EntityReference` - entities carrying attributes.
+                pub fn entityList(self: *const Self) []const EntityReference {
+                    return self.entities.items;
+                }
+                /// Exposes the payload column, read-only.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const E` - stored payloads.
+                pub fn attributeList(self: *const Self) []const E {
+                    return self.values.items;
+                }
+                /// Returns an immutable reference to the source archetype info.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `*const ArchetypeInfo` - source archetype descriptor.
+                pub fn archetypeInfo(self: *const Self) *const ArchetypeInfo {
+                    return &Ecs.archetypes[self.arch_id];
+                }
+                /// Read-only view of one depth zone: a contiguous run of rows
+                /// sharing one hierarchy depth. Obtained from
+                /// `AttributePage.zone(depth)` or `AttributePage.zoneAt(index)`.
+                pub const ZoneView = struct {
+                    /// Owning page (archetype handle) of the zone.
+                    page: Self,
+                    /// The zone descriptor: depth plus row range.
+                    zone: DepthZone,
+                    /// Number of rows in the zone.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `u32` - zone row count.
+                    pub fn len(self: *const ZoneView) u32 {
+                        return self.zone.len;
+                    }
+                    /// Returns the zone's depth.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `u32` - hierarchy depth of the zone.
+                    pub fn depth(self: *const ZoneView) u32 {
+                        return self.zone.depth;
+                    }
+                    /// Returns the zone's payload slice, mutable like
+                    /// component columns: attributes are mid-term state that
+                    /// systems read and write in place.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `[]E` - mutable slice over the zone rows.
+                    pub fn values(self: *const ZoneView) []E {
+                        return self.page.values.items[self.zone.offset..][0..self.zone.len];
+                    }
+                    /// Returns the zone's entity reference slice.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `[]const EntityReference` - zone row references.
+                    pub fn entities(self: *const ZoneView) []const EntityReference {
+                        return self.page.entities.items[self.zone.offset..][0..self.zone.len];
+                    }
+                };
+                /// Returns every depth zone of the page, sorted ascending by
+                /// depth.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const DepthZone` - zone list of the page.
+                pub fn depthZones(self: *const Self) []const DepthZone {
+                    return self.depth_zones.items;
+                }
+                /// Returns the zone of one depth, or null when the page holds
+                /// no attribute at that depth.
+                /// - `self` - page to inspect.
+                /// - `depth` - hierarchy depth to look up.
+                ///
+                /// Returns `?DepthZone` - zone descriptor, or null.
+                pub fn depthZone(self: *const Self, depth: u32) ?DepthZone {
+                    const zones = self.depth_zones.items;
+                    var lo: usize = 0;
+                    var hi: usize = zones.len;
+                    while (lo < hi) {
+                        const mid = (lo + hi) / 2;
+                        if (zones[mid].depth < depth) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if (lo < zones.len and zones[lo].depth == depth) {
+                        return zones[lo];
+                    }
+                    return null;
+                }
+                /// Number of distinct depths currently present in the page.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `usize` - depth zone count.
+                pub fn depthCount(self: *const Self) usize {
+                    return self.depth_zones.items.len;
+                }
+                /// Deepest depth present in the page, or null when empty.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `?u32` - deepest depth, or null.
+                pub fn maxDepth(self: *const Self) ?u32 {
+                    const zones = self.depth_zones.items;
+                    if (zones.len == 0) {
+                        return null;
+                    }
+                    return zones[zones.len - 1].depth;
+                }
+                /// Returns a zone view for one depth. A missing depth yields
+                /// an empty view with the same depth, so callers can iterate
+                /// unconditionally.
+                /// - `self` - page to inspect.
+                /// - `depth` - hierarchy depth.
+                ///
+                /// Returns `ZoneView` - view over the zone rows.
+                pub fn zone(self: *const Self, depth: u32) ZoneView {
+                    const z = self.depthZone(depth) orelse return ZoneView{
+                        .page = self.*,
+                        .zone = .{ .depth = depth, .offset = 0, .len = 0 },
+                    };
+                    return ZoneView{
+                        .page = self.*,
+                        .zone = z,
+                    };
+                }
+                /// Returns a zone view for one row position, resolved through
+                /// the zone offsets. Useful to iterate zones sequentially.
+                /// - `self` - page to inspect.
+                /// - `index` - zone list index (`0 <= index < depthCount()`).
+                ///
+                /// Returns `ZoneView` - view over the indexed zone rows.
+                pub fn zoneAt(self: *const Self, index: usize) ZoneView {
+                    const z = self.depth_zones.items[index];
+                    return ZoneView{
+                        .page = self.*,
+                        .zone = z,
+                    };
                 }
             };
         }
@@ -3536,25 +3832,6 @@ pub fn ECS(comptime sets: anytype) type {
                         try removeAt(allocator, loc.page, loc.index);
                     }
                 }
-                /// Shared target check for every set path: the slot must exist
-                /// and be alive or reserved by `cmdCreate` in the same system;
-                /// destroy-pending slots are rejected. Single straight-line
-                /// check without re-reading generation: exactly the
-                /// `exists` + `isAlive` + pending semantics, fused.
-                /// - `ref` - entity reference to validate.
-                fn validateSetTarget(ref: EntityReference) EcsError!void {
-                    const id: u32 = ref.id;
-                    if (id >= Ecs.entity_generation.items.len) {
-                        return EcsError.EntityIsNotAlive;
-                    }
-                    const state = Ecs.getEntityState(id);
-                    if (Ecs.entity_generation.items[id] != ref.gen) {
-                        return EcsError.EntityIsNotAlive;
-                    }
-                    if (!state.pending_create and state.pending_destroy) {
-                        return EcsError.EntityHasPendingCommand;
-                    }
-                }
                 /// Queues a set command in O(1) amortized, rewriting a pending
                 /// op for the same slot in place: a pending destroy becomes a
                 /// set (the destroy is cancelled and the payload updated).
@@ -3611,7 +3888,7 @@ pub fn ECS(comptime sets: anytype) type {
                     value: E,
                 ) EcsError!void {
                     for (entities) |ref| {
-                        try validateSetTarget(ref);
+                        try Ecs.validateSetTarget(ref);
                     }
                     for (entities) |ref| {
                         try ensureSlot(allocator, ref.id);
@@ -3642,7 +3919,7 @@ pub fn ECS(comptime sets: anytype) type {
                         return EcsError.CountMismatch;
                     }
                     for (entities) |ref| {
-                        try validateSetTarget(ref);
+                        try Ecs.validateSetTarget(ref);
                     }
                     for (entities) |ref| {
                         try ensureSlot(allocator, ref.id);
@@ -3963,6 +4240,942 @@ pub fn ECS(comptime sets: anytype) type {
                     return null;
                 }
             };
+        }
+        /// Committed pages plus the pending queue of one attribute payload
+        /// type. Mirrors `EventStore`, plus depth zones per page and minus
+        /// frame-end clearing: attributes persist until destroyed or the ECS
+        /// deinitializes. Upsert semantics keep one row per slot, so no
+        /// history chains are needed: the slot map always points at the row.
+        /// - `E` - attribute payload type.
+        ///
+        /// Returns `type` - store namespace with per-payload static state.
+        /// Private: stores are only reached through `SystemHandler` and the
+        /// flush/discard/trim plumbing.
+        fn AttributeStore(comptime E: type) type {
+            return struct {
+                const Store = @This();
+                /// One pending command of the running system.
+                const Pending = struct {
+                    entity: EntityReference,
+                    op: union(enum) {
+                        set: E,
+                        destroy: void,
+                    },
+                };
+                /// Position of one committed attribute.
+                const Location = struct {
+                    page: usize,
+                    index: usize,
+                };
+                /// Committed pages, sorted ascending by `arch_id`, non-empty only.
+                var committed: std.ArrayListUnmanaged(AttributePage(E)) = .empty;
+                /// Collapsed net commands of the running system.
+                var pending: std.ArrayListUnmanaged(Pending) = .empty;
+                /// Empty page shells with retained buffers, reused across frames.
+                var page_pool: std.ArrayListUnmanaged(AttributePage(E)) = .empty;
+                /// Entity slot id to its committed row, packed as
+                /// `(arch_id << 32) | row`; `NO_PACK` means no attribute.
+                /// Single pack per slot: upsert keeps one row per slot.
+                var rows: std.ArrayListUnmanaged(u64) = .empty;
+                /// Entity slot id to position in `pending`, or `NO_PENDING`.
+                var pending_rows: std.ArrayListUnmanaged(u32) = .empty;
+                /// Optional budgets, same shape as events (see `EventLimits`).
+                var limits: EventLimits = .{};
+                /// Bulk-wipe armed by `queueDestroyAll`: the flush drops every
+                /// committed page instead of removing rows one by one. Reset
+                /// by every flush and every discard, so it never leaks across.
+                var wiped: bool = false;
+                /// Pending length at bulk time: ops below it die with the
+                /// wipe, ops at and above it (queued after) apply normally.
+                var wipe_mark: usize = 0;
+                /// Whether the payload registered its type-erased callbacks.
+                var registered: bool = false;
+                /// Empty slot link value.
+                const NO_PACK: u64 = std.math.maxInt(u64);
+                /// Empty pending slot value.
+                const NO_PENDING: u32 = std.math.maxInt(u32);
+                /// Zero-size payload slot: returned (aliased) by reads of
+                /// ZST attributes, which carry no observable state.
+                var zst_slot: E = undefined;
+                /// Lazily appends the payload callbacks to the attribute
+                /// registry on first queued command or filing.
+                /// - `allocator` - funds the registry append.
+                fn ensureRegistered(allocator: std.mem.Allocator) EcsError!void {
+                    if (registered) {
+                        return;
+                    }
+                    try Ecs.attribute_registry.append(allocator, .{
+                        .name = @typeName(E),
+                        .flush = flushPending,
+                        .discardPending = discardPending,
+                        .trimToLimits = trimToLimits,
+                        .deinitStore = deinitStore,
+                        .onEntityDestroyed = onEntityDestroyed,
+                        .onEntityMigrated = onEntityMigrated,
+                        .onDepthChanged = onDepthChanged,
+                        .rebasePending = rebasePending,
+                        .resetRegistered = resetRegistered,
+                    });
+                    registered = true;
+                }
+                /// Rewrites the entity generation on queued ops of one slot.
+                /// Called when the entity migrates mid-flush, before the
+                /// attribute flush runs: pending sets and destroys keep
+                /// tracking the same logical entity under its new generation.
+                /// Infallible: pure in-memory rewrite, no allocation.
+                /// - `id` - migrated entity slot id.
+                /// - `old_gen` - generation before the migrate.
+                /// - `new_gen` - generation after the migrate.
+                fn rebasePending(id: u32, old_gen: u8, new_gen: u8) void {
+                    if (pending.items.len == 0) {
+                        return;
+                    }
+                    for (pending.items) |*op| {
+                        if (op.entity.id == id and op.entity.gen == old_gen) {
+                            op.entity.gen = new_gen;
+                        }
+                    }
+                }
+                /// Marks the payload as unregistered, so a reused ECS after
+                /// `deinit` registers it again on next use.
+                fn resetRegistered() void {
+                    registered = false;
+                }
+                /// Locates the committed page of one archetype.
+                /// - `arch` - archetype id to look up.
+                ///
+                /// Returns `?usize` - position in `committed`, or null.
+                fn findPageIndex(arch: u32) ?usize {
+                    var low: usize = 0;
+                    var high: usize = committed.items.len;
+                    while (low < high) {
+                        const mid: usize = low + (high - low) / 2;
+                        const a: u32 = committed.items[mid].arch_id;
+                        if (a < arch) {
+                            low = mid + 1;
+                        } else if (a > arch) {
+                            high = mid;
+                        } else {
+                            return mid;
+                        }
+                    }
+                    return null;
+                }
+                /// Finds the sorted insertion point of an archetype id.
+                /// - `arch` - archetype id to insert.
+                ///
+                /// Returns `usize` - first page with `arch_id >= arch`.
+                fn pageInsertIndex(arch: u32) usize {
+                    var low: usize = 0;
+                    var high: usize = committed.items.len;
+                    while (low < high) {
+                        const mid: usize = low + (high - low) / 2;
+                        if (committed.items[mid].arch_id < arch) {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    return low;
+                }
+                /// Packs an archetype id plus a row into one slot-map link.
+                /// - `arch` - archetype id (high 32 bits).
+                /// - `row` - row position (low 32 bits).
+                ///
+                /// Returns `u64` - packed link.
+                fn packRow(arch: u32, row: u32) u64 {
+                    return (@as(u64, arch) << 32) | @as(u64, row);
+                }
+                /// Resolves a packed link to a live location. Packs store the
+                /// immutable archetype id, so resolution re-searches by
+                /// archetype and stays exact across page insert/drop;
+                /// bounds-checked against row moves.
+                /// - `link` - packed `(arch_id, row)` link.
+                ///
+                /// Returns `?Location` - live page and row, or null.
+                fn resolvePacked(link: u64) ?Location {
+                    const arch: u32 = @intCast(link >> 32);
+                    const pi = findPageIndex(arch) orelse return null;
+                    const row: u32 = @intCast(link & 0xFFFF_FFFF);
+                    if (row >= committed.items[pi].entities.items.len) {
+                        return null;
+                    }
+                    return .{ .page = pi, .index = row };
+                }
+                /// Grows the slot maps to cover one slot id, filling with
+                /// empty sentinels. Each side grows independently, so a
+                /// partial failure can never desynchronize them.
+                /// - `allocator` - funds the growth.
+                /// - `slot` - entity slot id that must be addressable.
+                fn ensureSlot(allocator: std.mem.Allocator, slot: u32) EcsError!void {
+                    const need: usize = @as(usize, slot) + 1;
+                    if (need > rows.items.len) {
+                        try rows.appendNTimes(allocator, NO_PACK, need - rows.items.len);
+                    }
+                    if (need > pending_rows.items.len) {
+                        try pending_rows.appendNTimes(allocator, NO_PENDING, need - pending_rows.items.len);
+                    }
+                }
+                /// Locates the committed row of one slot id plus generation.
+                /// Single probe: upsert keeps one row per slot.
+                /// - `id` - entity slot id.
+                /// - `gen` - entity generation.
+                ///
+                /// Returns `?Location` - page and row, or null when absent.
+                fn findSlotRow(id: u32, gen: u8) ?Location {
+                    if (id >= rows.items.len) {
+                        return null;
+                    }
+                    const link = rows.items[id];
+                    if (link == NO_PACK) {
+                        return null;
+                    }
+                    const loc = resolvePacked(link) orelse return null;
+                    const e = committed.items[loc.page].entities.items[loc.index];
+                    if (e.id == id and e.gen == gen) {
+                        return loc;
+                    }
+                    return null;
+                }
+                /// Locates a committed attribute by entity reference.
+                /// - `ref` - entity reference to look up.
+                ///
+                /// Returns `?Location` - page and row, or null when absent.
+                fn findByEntity(ref: EntityReference) ?Location {
+                    return findSlotRow(ref.id, ref.gen);
+                }
+                /// Returns the page index for one archetype, reusing a pooled
+                /// shell when the page is new.
+                /// - `allocator` - funds the page slot.
+                /// - `arch` - archetype id to look up.
+                ///
+                /// Returns `usize` - position in `committed`.
+                fn pageIndexFor(allocator: std.mem.Allocator, arch: u32) EcsError!usize {
+                    if (findPageIndex(arch)) |pi| {
+                        return pi;
+                    }
+                    const pos = pageInsertIndex(arch);
+                    if (page_pool.pop()) |shell| {
+                        try committed.insert(allocator, pos, shell);
+                        committed.items[pos].arch_id = arch;
+                    } else {
+                        try committed.insert(allocator, pos, .{ .arch_id = arch });
+                    }
+                    return pos;
+                }
+                /// Appends a row and places it into the zone matching
+                /// `depth`, keeping every zone contiguous and ordered.
+                /// Typed adaptation of the component rotation: order inside a
+                /// zone is irrelevant, so exactly one row per deeper zone
+                /// moves via direct element swaps. Slot map entries of
+                /// relocated rows are repaired; no entity columns are touched.
+                /// - `allocator` - funds row and zone-list allocation.
+                /// - `pi` - position of the page in `committed`.
+                /// - `ref` - handle stored alongside the payload.
+                /// - `value` - payload to store.
+                /// - `depth` - hierarchy depth of the row.
+                ///
+                /// Returns `u32` - final position of the inserted row.
+                fn insertRowAtDepth(
+                    allocator: std.mem.Allocator,
+                    pi: usize,
+                    ref: EntityReference,
+                    value: E,
+                    depth: u32,
+                ) EcsError!u32 {
+                    const page = &committed.items[pi];
+                    const arch = page.arch_id;
+                    const at: u32 = @intCast(page.entities.items.len);
+                    try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + 1);
+                    try page.values.ensureTotalCapacity(allocator, page.values.items.len + 1);
+                    page.entities.appendAssumeCapacity(ref);
+                    page.values.appendAssumeCapacity(value);
+                    const idx = zoneInsertPosition(page.depth_zones.items, depth);
+                    const zones = &page.depth_zones;
+                    const has_zone = idx < zones.items.len and zones.items[idx].depth == depth;
+                    const target: u32 = if (has_zone)
+                        zones.items[idx].offset + zones.items[idx].len
+                    else if (idx == 0)
+                        0
+                    else
+                        zones.items[idx - 1].offset + zones.items[idx - 1].len;
+                    const m: usize = if (has_zone)
+                        zones.items.len - 1 - idx
+                    else
+                        zones.items.len - idx;
+                    if (m > 0) {
+                        const start = if (has_zone) idx + 1 else idx;
+                        const tmp_e = page.entities.items[at];
+                        const tmp_v = page.values.items[at];
+                        const last_off: usize = zones.items[start + m - 1].offset;
+                        page.entities.items[at] = page.entities.items[last_off];
+                        page.values.items[at] = page.values.items[last_off];
+                        var k: usize = m;
+                        while (k > 1) : (k -= 1) {
+                            const dst: usize = zones.items[start + k - 1].offset;
+                            const src: usize = zones.items[start + k - 2].offset;
+                            page.entities.items[dst] = page.entities.items[src];
+                            page.values.items[dst] = page.values.items[src];
+                        }
+                        page.entities.items[zones.items[start].offset] = tmp_e;
+                        page.values.items[zones.items[start].offset] = tmp_v;
+                        rows.items[tmp_e.id] = packRow(arch, target);
+                        rows.items[page.entities.items[at].id] = packRow(arch, at);
+                        var j: usize = 1;
+                        while (j <= m) : (j += 1) {
+                            const pos: u32 = zones.items[start + j - 1].offset;
+                            rows.items[page.entities.items[pos].id] = packRow(arch, pos);
+                        }
+                    } else {
+                        rows.items[ref.id] = packRow(arch, at);
+                    }
+                    if (has_zone) {
+                        zones.items[idx].len += 1;
+                        for (idx + 1..zones.items.len) |z| {
+                            zones.items[z].offset += 1;
+                        }
+                    } else {
+                        try zones.insert(allocator, idx, .{
+                            .depth = depth,
+                            .offset = target,
+                            .len = 1,
+                        });
+                        for (idx + 1..zones.items.len) |z| {
+                            zones.items[z].offset += 1;
+                        }
+                    }
+                    return target;
+                }
+                /// Removes the row at the given position from its depth zone.
+                /// The zone tail swaps into the gap, then every deeper zone
+                /// hands its tail upward, so exactly one row per deeper zone
+                /// moves and the last overall row always holds the duplicate
+                /// that `pop` drops. Slot map entries of every relocated row
+                /// are repaired. Drops the page to the pool when empty.
+                /// - `allocator` - funds the pool push of a dropped page.
+                /// - `pi` - position of the page in `committed`.
+                /// - `k` - row position inside the page.
+                fn removeAt(allocator: std.mem.Allocator, pi: usize, k: usize) EcsError!void {
+                    const page = &committed.items[pi];
+                    const arch = page.arch_id;
+                    const gone_id: u32 = page.entities.items[k].id;
+                    const zi = zoneIndexForOffset(page.depth_zones.items, @intCast(k));
+                    const zone = page.depth_zones.items[zi];
+                    const e_d: usize = zone.offset + zone.len - 1;
+                    if (k != e_d) {
+                        page.entities.items[k] = page.entities.items[e_d];
+                        page.values.items[k] = page.values.items[e_d];
+                        rows.items[page.entities.items[k].id] = packRow(arch, @intCast(k));
+                    }
+                    const m: usize = page.depth_zones.items.len - 1 - zi;
+                    if (m > 0) {
+                        var dst: usize = e_d;
+                        var i: usize = 1;
+                        while (i <= m) : (i += 1) {
+                            const src: usize = page.depth_zones.items[zi + i].offset +
+                                page.depth_zones.items[zi + i].len - 1;
+                            page.entities.items[dst] = page.entities.items[src];
+                            page.values.items[dst] = page.values.items[src];
+                            rows.items[page.entities.items[dst].id] = packRow(arch, @intCast(dst));
+                            dst = src;
+                        }
+                    }
+                    _ = page.entities.pop();
+                    _ = page.values.pop();
+                    page.depth_zones.items[zi].len -= 1;
+                    for (zi + 1..page.depth_zones.items.len) |z| {
+                        page.depth_zones.items[z].offset -= 1;
+                    }
+                    if (page.depth_zones.items[zi].len == 0) {
+                        _ = page.depth_zones.orderedRemove(zi);
+                    }
+                    rows.items[gone_id] = NO_PACK;
+                    if (page.entities.items.len == 0) {
+                        const shell = committed.orderedRemove(pi);
+                        try page_pool.append(allocator, shell);
+                    }
+                }
+                /// Moves one row to another depth zone of the same page.
+                /// - `allocator` - funds row allocation.
+                /// - `pi` - position of the page in `committed`.
+                /// - `k` - row position inside the page.
+                /// - `new_depth` - hierarchy depth to move to.
+                fn moveRowToDepth(
+                    allocator: std.mem.Allocator,
+                    pi: usize,
+                    k: usize,
+                    new_depth: u32,
+                ) EcsError!void {
+                    const arch = committed.items[pi].arch_id;
+                    const ref = committed.items[pi].entities.items[k];
+                    const v = committed.items[pi].values.items[k];
+                    try removeAt(allocator, pi, k);
+                    const npi = try pageIndexFor(allocator, arch);
+                    _ = try insertRowAtDepth(allocator, npi, ref, v, new_depth);
+                }
+                /// Inserts or rewrites one committed entry in O(1) amortized:
+                /// the slot map resolves to at most one row, updated in
+                /// place, otherwise the row appends into the depth zone.
+                /// - `allocator` - funds page and row allocation.
+                /// - `arch` - archetype page to file under.
+                /// - `ref` - entity carrying the attribute.
+                /// - `value` - payload to store.
+                /// - `depth` - hierarchy depth of the row.
+                fn upsertBySlot(
+                    allocator: std.mem.Allocator,
+                    arch: u32,
+                    ref: EntityReference,
+                    value: E,
+                    depth: u32,
+                ) EcsError!void {
+                    try ensureSlot(allocator, ref.id);
+                    if (rows.items[ref.id] != NO_PACK) {
+                        if (findSlotRow(ref.id, ref.gen)) |loc| {
+                            committed.items[loc.page].entities.items[loc.index] = ref;
+                            committed.items[loc.page].values.items[loc.index] = value;
+                            return;
+                        }
+                    }
+                    const pi = try pageIndexFor(allocator, arch);
+                    _ = try insertRowAtDepth(allocator, pi, ref, value, depth);
+                }
+                /// Removes the committed entry of an entity reference.
+                /// Silent when absent.
+                /// - `allocator` - funds the pool push of a dropped page.
+                /// - `ref` - entity reference to remove.
+                fn removeBySlot(allocator: std.mem.Allocator, ref: EntityReference) EcsError!void {
+                    const loc = findSlotRow(ref.id, ref.gen) orelse return;
+                    try removeAt(allocator, loc.page, loc.index);
+                }
+                /// Queues a set command in O(1) amortized, rewriting a pending
+                /// op for the same slot in place: a pending destroy becomes a
+                /// set (the destroy is cancelled and the payload updated).
+                /// The append is atomic: queue capacity is ensured first, so
+                /// a failed grow cannot leave an unindexed entry behind.
+                /// - `allocator` - funds the queue append.
+                /// - `ref` - entity carrying the attribute.
+                /// - `value` - payload to store.
+                fn queueSet(allocator: std.mem.Allocator, ref: EntityReference, value: E) EcsError!void {
+                    try ensureSlot(allocator, ref.id);
+                    const slot = pending_rows.items[ref.id];
+                    if (slot != NO_PENDING) {
+                        pending.items[slot].entity = ref;
+                        pending.items[slot].op = .{ .set = value };
+                        return;
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
+                    pending_rows.items[ref.id] = @intCast(pending.items.len);
+                    pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
+                }
+                /// Queues a destroy command for a validated handle in O(1)
+                /// amortized. A pending set for the same slot becomes a
+                /// destroy (the set is cancelled); a pending destroy is a
+                /// double destroy.
+                /// - `allocator` - funds the queue append.
+                /// - `handle` - handle issued by `AttributePage.handleAt`.
+                fn queueDestroy(allocator: std.mem.Allocator, handle: AttributeHandle(E)) EcsError!void {
+                    if (findByEntity(handle.entity) == null) {
+                        return EcsError.AttributeNotFound;
+                    }
+                    try ensureSlot(allocator, handle.entity.id);
+                    const slot = pending_rows.items[handle.entity.id];
+                    if (slot != NO_PENDING) {
+                        if (pending.items[slot].op == .destroy) {
+                            return EcsError.AttributeHasPendingCommand;
+                        }
+                        pending.items[slot].op = .{ .destroy = {} };
+                        return;
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + 1);
+                    pending_rows.items[handle.entity.id] = @intCast(pending.items.len);
+                    pending.appendAssumeCapacity(.{ .entity = handle.entity, .op = .{ .destroy = {} } });
+                }
+                /// Queues one payload for a whole slice of entities in O(n):
+                /// every target is validated first, so a bad reference fails
+                /// the batch before anything is queued. Capacity for the whole
+                /// batch is reserved up front, then the loop itself cannot fail.
+                /// - `allocator` - funds the queued ops.
+                /// - `entities` - entities carrying the attribute.
+                /// - `value` - payload stored with every attribute.
+                fn queueSetMany(
+                    allocator: std.mem.Allocator,
+                    entities: []const EntityReference,
+                    value: E,
+                ) EcsError!void {
+                    for (entities) |ref| {
+                        try Ecs.validateSetTarget(ref);
+                    }
+                    for (entities) |ref| {
+                        try ensureSlot(allocator, ref.id);
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    for (entities) |ref| {
+                        const slot = pending_rows.items[ref.id];
+                        if (slot != NO_PENDING) {
+                            pending.items[slot].entity = ref;
+                            pending.items[slot].op = .{ .set = value };
+                        } else {
+                            pending_rows.items[ref.id] = @intCast(pending.items.len);
+                            pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
+                        }
+                    }
+                }
+                /// Queues one payload per entity, pairwise, in O(n). Same
+                /// validate-first, reserve-up-front discipline as `queueSetMany`.
+                /// - `allocator` - funds the queued ops.
+                /// - `entities` - entities carrying the attributes.
+                /// - `values` - payload per entity, same length as `entities`.
+                fn queueSetEach(
+                    allocator: std.mem.Allocator,
+                    entities: []const EntityReference,
+                    values: []const E,
+                ) EcsError!void {
+                    if (entities.len != values.len) {
+                        return EcsError.CountMismatch;
+                    }
+                    for (entities) |ref| {
+                        try Ecs.validateSetTarget(ref);
+                    }
+                    for (entities) |ref| {
+                        try ensureSlot(allocator, ref.id);
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    for (entities, values) |ref, value| {
+                        const slot = pending_rows.items[ref.id];
+                        if (slot != NO_PENDING) {
+                            pending.items[slot].entity = ref;
+                            pending.items[slot].op = .{ .set = value };
+                        } else {
+                            pending_rows.items[ref.id] = @intCast(pending.items.len);
+                            pending.appendAssumeCapacity(.{ .entity = ref, .op = .{ .set = value } });
+                        }
+                    }
+                }
+                /// Queues destroys for a slice of entities in O(n): every
+                /// entry is validated first (present, not destroy-pending),
+                /// so a bad entry fails the batch before anything is queued.
+                /// A duplicated entity inside one call collapses silently;
+                /// a repeated call reports `AttributeHasPendingCommand`.
+                /// - `allocator` - funds the queued ops.
+                /// - `entities` - entity references holding the attributes.
+                fn queueDestroyMany(
+                    allocator: std.mem.Allocator,
+                    entities: []const EntityReference,
+                ) EcsError!void {
+                    for (entities) |e| {
+                        if (findByEntity(e) == null) {
+                            return EcsError.AttributeNotFound;
+                        }
+                        try ensureSlot(allocator, e.id);
+                        const slot = pending_rows.items[e.id];
+                        if (slot != NO_PENDING and pending.items[slot].op == .destroy) {
+                            return EcsError.AttributeHasPendingCommand;
+                        }
+                    }
+                    try pending.ensureTotalCapacity(allocator, pending.items.len + entities.len);
+                    for (entities) |e| {
+                        const slot = pending_rows.items[e.id];
+                        if (slot != NO_PENDING) {
+                            if (pending.items[slot].op == .destroy) {
+                                continue;
+                            }
+                            pending.items[slot].op = .{ .destroy = {} };
+                        } else {
+                            pending_rows.items[e.id] = @intCast(pending.items.len);
+                            pending.appendAssumeCapacity(.{ .entity = e, .op = .{ .destroy = {} } });
+                        }
+                    }
+                }
+                /// Arms a bulk wipe: O(1), no queue traffic. The flush drops
+                /// every committed page to the pool instead of removing rows
+                /// one by one; only ops queued after this call survive it.
+                /// Idempotent within one system.
+                fn queueDestroyAll() void {
+                    wipe_mark = pending.items.len;
+                    wiped = true;
+                }
+                /// Moves the pending queue into committed pages, resolving
+                /// every set under the entity live archetype and depth.
+                /// Stale sets (dead or recycled slots) and stale destroys are
+                /// skipped silently, mirroring entity flush semantics. The
+                /// pending slot map resets inline, so no second pass is needed.
+                /// - `allocator` - funds page and row allocation.
+                fn flushPending(allocator: std.mem.Allocator) EcsError!void {
+                    defer {
+                        pending.clearRetainingCapacity();
+                        wiped = false;
+                    }
+                    var start: usize = 0;
+                    if (wiped) {
+                        for (rows.items) |*r| {
+                            r.* = NO_PACK;
+                        }
+                        try page_pool.ensureTotalCapacity(allocator, page_pool.items.len + committed.items.len);
+                        for (committed.items) |*page| {
+                            page.entities.items.len = 0;
+                            page.values.items.len = 0;
+                            page.depth_zones.items.len = 0;
+                            page_pool.appendAssumeCapacity(page.*);
+                        }
+                        committed.clearRetainingCapacity();
+                        for (pending.items[0..wipe_mark]) |op| {
+                            pending_rows.items[op.entity.id] = NO_PENDING;
+                        }
+                        start = wipe_mark;
+                    }
+                    for (pending.items[start..]) |op| {
+                        pending_rows.items[op.entity.id] = NO_PENDING;
+                        switch (op.op) {
+                            .set => |v| {
+                                const id: u32 = op.entity.id;
+                                if (id >= Ecs.entity_generation.items.len) {
+                                    continue;
+                                }
+                                // Generations match or the op was rebased by a
+                                // same-flush migrate; anything else is stale
+                                // (the entity died and its slot can't have been
+                                // recycled yet: recycling needs a create, and
+                                // creates reserve fresh ids or ids freed by
+                                // earlier flushes, never this one).
+                                if (Ecs.entity_generation.items[id] != op.entity.gen) {
+                                    continue;
+                                }
+                                if (!op.entity.isAlive()) {
+                                    continue;
+                                }
+                                const arch: u32 = Ecs.entity_archetype.items[id];
+                                const depth: u32 = Ecs.entity_depth.items[id];
+                                try upsertBySlot(allocator, arch, op.entity, v, depth);
+                            },
+                            .destroy => {
+                                try removeBySlot(allocator, op.entity);
+                            },
+                        }
+                    }
+                }
+                /// Drops the pending queue without applying it. Also disarms
+                /// a bulk wipe queued by the failing system.
+                fn discardPending() void {
+                    for (pending.items) |op| {
+                        pending_rows.items[op.entity.id] = NO_PENDING;
+                    }
+                    pending.clearRetainingCapacity();
+                    wiped = false;
+                    wipe_mark = 0;
+                }
+                /// Trims assigned budgets back toward their targets. Runs at
+                /// frame end (there is no auto-clear for attributes); skips
+                /// clean stores. Same 2x-tolerance rule as events.
+                /// - `allocator` - funds pool reservations on trim.
+                fn trimToLimits(allocator: std.mem.Allocator) EcsError!void {
+                    if (limits.pages) |pg| {
+                        const max_shells: usize = pg;
+                        while (page_pool.items.len > max_shells) {
+                            var shell = page_pool.pop().?;
+                            shell.entities.deinit(allocator);
+                            shell.values.deinit(allocator);
+                            shell.depth_zones.deinit(allocator);
+                        }
+                        // Only when empty: live pages must never lose their shell.
+                        if (committed.items.len == 0 and committed.capacity > 2 * max_shells) {
+                            committed.deinit(allocator);
+                            committed = .empty;
+                            try committed.ensureTotalCapacity(allocator, max_shells);
+                        }
+                    }
+                    if (limits.events_per_page) |ec| {
+                        const cap: usize = ec;
+                        for (page_pool.items) |*shell| {
+                            if (shell.entities.capacity > 2 * cap) {
+                                shell.entities.deinit(allocator);
+                                shell.entities = .empty;
+                                try shell.entities.ensureTotalCapacity(allocator, cap);
+                            }
+                            if (shell.values.capacity > 2 * cap) {
+                                shell.values.deinit(allocator);
+                                shell.values = .empty;
+                                try shell.values.ensureTotalCapacity(allocator, cap);
+                            }
+                        }
+                    }
+                    if (limits.pending) |pcap| {
+                        const cap: usize = pcap;
+                        if (pending.capacity > 2 * cap) {
+                            pending.deinit(allocator);
+                            pending = .empty;
+                            try pending.ensureTotalCapacity(allocator, cap);
+                        }
+                    }
+                    if (limits.slots) |sc| {
+                        // Live length is the floor: slot coverage never drops,
+                        // and live packs are preserved by shrinking in place.
+                        const floor: usize = @max(rows.items.len, sc);
+                        if (rows.capacity > 2 * floor) {
+                            rows.shrinkAndFree(allocator, rows.items.len);
+                        }
+                        const pfloor: usize = @max(pending_rows.items.len, sc);
+                        if (pending_rows.capacity > 2 * pfloor) {
+                            pending_rows.shrinkAndFree(allocator, pending_rows.items.len);
+                        }
+                    }
+                }
+                /// Frees committed pages, pooled shells, queues and slot maps.
+                /// - `allocator` - allocator that funded the store.
+                fn deinitStore(allocator: std.mem.Allocator) void {
+                    for (committed.items) |*page| {
+                        page.entities.deinit(allocator);
+                        page.values.deinit(allocator);
+                        page.depth_zones.deinit(allocator);
+                    }
+                    committed.deinit(allocator);
+                    committed = .empty;
+                    for (page_pool.items) |*page| {
+                        page.entities.deinit(allocator);
+                        page.values.deinit(allocator);
+                        page.depth_zones.deinit(allocator);
+                    }
+                    page_pool.deinit(allocator);
+                    page_pool = .empty;
+                    pending.deinit(allocator);
+                    pending = .empty;
+                    rows.deinit(allocator);
+                    rows = .empty;
+                    pending_rows.deinit(allocator);
+                    pending_rows = .empty;
+                }
+                /// Purges the committed row of one destroyed slot in O(1).
+                /// Single probe: upsert keeps one row per slot.
+                /// - `id` - destroyed entity slot id.
+                /// - `allocator` - funds the pool push of a dropped page.
+                fn onEntityDestroyed(id: u32, allocator: std.mem.Allocator) EcsError!void {
+                    if (id >= rows.items.len) {
+                        return;
+                    }
+                    const live: u8 = Ecs.entity_generation.items[id];
+                    const link = rows.items[id];
+                    if (link == NO_PACK) {
+                        return;
+                    }
+                    const loc = resolvePacked(link) orelse return;
+                    const e = committed.items[loc.page].entities.items[loc.index];
+                    if (e.id == id and e.gen == live) {
+                        try removeAt(allocator, loc.page, loc.index);
+                    }
+                }
+                /// Relocates one entity row to the destination archetype page
+                /// at the unchanged depth, refreshing its generation.
+                /// - `id` - migrated entity slot id.
+                /// - `old_arch` - archetype id the entity leaves.
+                /// - `new_arch` - archetype id the entity enters.
+                /// - `new_gen` - generation after the migrate.
+                /// - `allocator` - funds the destination page slot.
+                fn onEntityMigrated(
+                    id: u32,
+                    old_arch: u32,
+                    new_arch: u32,
+                    new_gen: u8,
+                    allocator: std.mem.Allocator,
+                ) EcsError!void {
+                    if (id >= rows.items.len) {
+                        return;
+                    }
+                    _ = old_arch;
+                    const old_gen: u8 = new_gen -% 1;
+                    const loc = findSlotRow(id, old_gen) orelse return;
+                    const page = &committed.items[loc.page];
+                    const v = page.values.items[loc.index];
+                    const zi = zoneIndexForOffset(page.depth_zones.items, @intCast(loc.index));
+                    const depth = page.depth_zones.items[zi].depth;
+                    try removeAt(allocator, loc.page, loc.index);
+                    const fresh = EntityReference{ .id = @intCast(id), .gen = new_gen };
+                    const npi = try pageIndexFor(allocator, new_arch);
+                    _ = try insertRowAtDepth(allocator, npi, fresh, v, depth);
+                }
+                /// Moves one entity row to the zone of its new depth after a
+                /// reparent. Silent when the entity carries no attribute.
+                /// - `id` - reparented entity slot id.
+                /// - `new_depth` - hierarchy depth after the move.
+                /// - `allocator` - funds row allocation.
+                fn onDepthChanged(id: u32, new_depth: u32, allocator: std.mem.Allocator) EcsError!void {
+                    if (id >= rows.items.len) {
+                        return;
+                    }
+                    const link = rows.items[id];
+                    if (link == NO_PACK) {
+                        return;
+                    }
+                    const loc = resolvePacked(link) orelse return;
+                    try moveRowToDepth(allocator, loc.page, loc.index, new_depth);
+                }
+            };
+        }
+        /// Filtered view over one attribute payload committed pages: the
+        /// comptime `pages()` match intersected with the sparse page list in
+        /// one merge pass. Both sides are ascending by archetype id, so the
+        /// result is dense and sorted without any search.
+        /// - `E` - attribute payload type.
+        /// - `include` - component bundle that must be present.
+        /// - `exclude` - component bundle that must be absent.
+        ///
+        /// Returns `type` - filter namespace with a single `filter` function.
+        /// Private: filters are only issued by `SystemHandler`.
+        fn AttributeFilter(comptime E: type, comptime include: anytype, comptime exclude: anytype) type {
+            const Container = PagesContainer(include, exclude);
+            const container: Container = .{};
+            const matched_pages = container.allPages();
+            return struct {
+                /// Per-filter static scratch for the dense prefix. Same
+                /// lifetime rule as `nonEmptyPages`: valid until the next
+                /// `filterAttributes` call for the same payload and query.
+                var buf: [matched_pages.len]AttributePage(E) = undefined;
+                /// Intersects the query match with committed pages.
+                ///
+                /// Returns `[]const AttributePage(E)` - matching pages, dense.
+                fn filter() []const AttributePage(E) {
+                    const pages = AttributeStore(E).committed.items;
+                    var total: usize = 0;
+                    var i: usize = 0;
+                    var j: usize = 0;
+                    while (i < matched_pages.len and j < pages.len) {
+                        const a: u32 = matched_pages[i].arch_id;
+                        const b: u32 = pages[j].arch_id;
+                        if (a == b) {
+                            buf[total] = pages[j];
+                            total += 1;
+                            i += 1;
+                            j += 1;
+                        } else if (a < b) {
+                            i += 1;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    return buf[0..total];
+                }
+            };
+        }
+        /// Type-erased per-payload callbacks of the attribute subsystem.
+        /// Separate registry from events: attributes persist (no frame-end
+        /// clear), so they carry a trim hook instead, plus a depth hook
+        /// that events have no use for.
+        const AttributeRegistryEntry = struct {
+            /// Payload type name, for debuggers only.
+            name: []const u8,
+            /// Moves the payload pending queue into committed pages.
+            flush: *const fn (std.mem.Allocator) EcsError!void,
+            /// Drops the payload pending queue without applying it.
+            discardPending: *const fn () void,
+            /// Trims assigned budgets back toward their targets.
+            trimToLimits: *const fn (std.mem.Allocator) EcsError!void,
+            /// Frees committed pages and the pending queue.
+            deinitStore: *const fn (std.mem.Allocator) void,
+            /// Purges the committed row of one destroyed entity slot.
+            onEntityDestroyed: *const fn (u32, std.mem.Allocator) EcsError!void,
+            /// Moves one entity row to the destination archetype page.
+            onEntityMigrated: *const fn (u32, u32, u32, u8, std.mem.Allocator) EcsError!void,
+            /// Moves one entity row to the zone of its new depth.
+            onDepthChanged: *const fn (u32, u32, std.mem.Allocator) EcsError!void,
+            /// Rewrites the entity generation on queued ops of one slot.
+            /// Runs when the entity migrates mid-flush, before the attribute
+            /// flush: pending ops keep tracking the same logical entity.
+            rebasePending: *const fn (u32, u8, u8) void,
+            /// Marks the payload store as unregistered, so a reused ECS
+            /// registers it again after `deinit`.
+            resetRegistered: *const fn () void,
+        };
+        /// Every attribute payload type with queued commands in any frame so far.
+        var attribute_registry: std.ArrayListUnmanaged(AttributeRegistryEntry) = .empty;
+        /// Applies every queued attribute command, payload by payload. Runs
+        /// after the entity commands of the same flush: reserved slots are
+        /// materialized by then, so sets file under the live archetype and
+        /// depth straight away, with no relocation step.
+        /// - `allocator` - funds page and row allocation.
+        fn flushAttributePending(allocator: std.mem.Allocator) EcsError!void {
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.flush(allocator);
+            }
+        }
+        /// Drops every queued attribute command without applying it.
+        /// Committed attributes of earlier systems stay untouched.
+        fn discardAttributePending() void {
+            for (Ecs.attribute_registry.items) |entry| {
+                entry.discardPending();
+            }
+        }
+        /// Trims assigned budgets of every attribute payload, payload by
+        /// payload. Runs once after the last system of a successful schedule
+        /// (attributes have no auto-clear to piggyback on). Skipped entirely
+        /// when no attribute type was ever registered.
+        /// - `allocator` - funds pool reservations on trim.
+        fn trimAttributes(allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.attribute_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.trimToLimits(allocator);
+            }
+        }
+        /// Purges committed attributes of one destroyed slot, payload by
+        /// payload. Skipped entirely when no attribute type was ever registered.
+        /// - `id` - destroyed entity slot id.
+        /// - `allocator` - funds the pool push of a dropped page.
+        fn notifyAttributeDestroyed(id: u32, allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.attribute_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.onEntityDestroyed(id, allocator);
+            }
+        }
+        /// Relocates committed attributes of one migrated entity, payload by
+        /// payload. Skipped entirely when no attribute type was ever registered.
+        /// - `id` - migrated entity slot id.
+        /// - `old_arch` - archetype id the entity leaves.
+        /// - `new_arch` - archetype id the entity enters.
+        /// - `new_gen` - generation after the migrate.
+        /// - `allocator` - funds the destination page slot.
+        fn notifyAttributeMigrated(
+            id: u32,
+            old_arch: u32,
+            new_arch: u32,
+            new_gen: u8,
+            allocator: std.mem.Allocator,
+        ) EcsError!void {
+            if (Ecs.attribute_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.onEntityMigrated(id, old_arch, new_arch, new_gen, allocator);
+            }
+        }
+        /// Rewrites the entity generation on queued attribute ops of one
+        /// slot, payload by payload. Called when the entity migrates
+        /// mid-flush, before the attribute flush runs. Skipped entirely when
+        /// no attribute type was ever registered.
+        /// - `id` - migrated entity slot id.
+        /// - `old_gen` - generation before the migrate.
+        /// - `new_gen` - generation after the migrate.
+        fn rebaseAttributePending(id: u32, old_gen: u8, new_gen: u8) void {
+            if (Ecs.attribute_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                entry.rebasePending(id, old_gen, new_gen);
+            }
+        }
+        /// Moves committed attributes of one reparented entity to the zone
+        /// of its new depth, payload by payload. Skipped entirely when no
+        /// attribute type was ever registered.
+        /// - `id` - reparented entity slot id.
+        /// - `new_depth` - hierarchy depth after the move.
+        /// - `allocator` - funds row allocation.
+        fn notifyAttributeDepthChanged(id: u32, new_depth: u32, allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.attribute_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.onDepthChanged(id, new_depth, allocator);
+            }
         }
         /// Filtered view over one payload committed pages: the comptime
         /// `pages()` match intersected with the sparse page list in one merge
@@ -4495,7 +5708,7 @@ pub fn ECS(comptime sets: anytype) type {
                 validateEventType(E);
                 const Store = EventStore(E);
                 try Store.ensureRegistered(self.allocator);
-                try Store.validateSetTarget(ref);
+                try Ecs.validateSetTarget(ref);
                 try Store.queueSet(self.allocator, ref, value);
             }
             /// Queues destruction of the event behind the handle. Handles come
@@ -4705,6 +5918,256 @@ pub fn ECS(comptime sets: anytype) type {
                 validateEventType(E);
                 _ = self;
                 return EventFilter(E, include, exclude).filter();
+            }
+            /// Returns a pointer to the attribute stored for the referenced
+            /// entity, like `getComponent` for components. Mutable: attributes
+            /// are mid-term state that systems read and write in place. Sees
+            /// committed data only; commands queued in the running system
+            /// apply at the next flush.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `E` - attribute payload type.
+            ///
+            /// Returns `*E` - pointer into the owning attribute column.
+            pub fn getAttribute(
+                self: *const SystemHandler,
+                ref: EntityReference,
+                comptime E: type,
+            ) EcsError!*E {
+                _ = self;
+                validateEventType(E);
+                if (!ref.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                const Store = AttributeStore(E);
+                const loc = Store.findByEntity(ref) orelse return EcsError.AttributeNotFound;
+                if (@sizeOf(E) == 0) {
+                    return &Store.zst_slot;
+                }
+                const pg = &Store.committed.items[loc.page];
+                const col: [*]E = @ptrCast(@alignCast(pg.values.items.ptr));
+                return &col[loc.index];
+            }
+            /// Queues an attribute for the entity, creating it when absent and
+            /// overwriting the payload when present (upsert). Applied at the
+            /// next flush and visible to the following system. Like
+            /// `cmdCreate`, the returned handle of a queued create can be
+            /// used right away: reserved slots materialize during the same
+            /// flush, so the attribute files under the live archetype and
+            /// depth. Returns no handle: handles come only from
+            /// `allAttributes` pages.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity carrying the attribute. Must be alive or
+            ///   reserved by a queued create in the same system.
+            /// - `E` - attribute payload struct type. Needs no `ECS(...)` declaration.
+            /// - `value` - payload stored with the attribute.
+            pub fn cmdSetAttribute(
+                self: *const SystemHandler,
+                ref: EntityReference,
+                comptime E: type,
+                value: E,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Ecs.validateSetTarget(ref);
+                try Store.queueSet(self.allocator, ref, value);
+            }
+            /// Queues destruction of the attribute behind the handle. Handles
+            /// come only from `AttributePage.handleAt`: unknown or already
+            /// gone attributes fail with `AttributeNotFound`, a second
+            /// destroy queued in the same system fails with
+            /// `AttributeHasPendingCommand`.
+            /// - `self` - handler of the running system.
+            /// - `handle` - handle issued by `allAttributes` pages.
+            pub fn cmdDestroyAttribute(self: *const SystemHandler, handle: anytype) EcsError!void {
+                const HT = @TypeOf(handle);
+                if (!@hasDecl(HT, "AttributePayload")) {
+                    @compileError("cmdDestroyAttribute expects an AttributeHandle(E) from AttributePage.handleAt().");
+                }
+                const E = HT.AttributePayload;
+                if (HT != AttributeHandle(E)) {
+                    @compileError("cmdDestroyAttribute expects an AttributeHandle(E) from AttributePage.handleAt().");
+                }
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueDestroy(self.allocator, handle);
+            }
+            /// Queues one payload for a whole slice of entities in O(n):
+            /// one shared validation pass, one capacity reservation, then an
+            /// infallible loop. Reserved handles are accepted, like the
+            /// single command. An empty slice is a no-op.
+            /// - `self` - handler of the running system.
+            /// - `entities` - entities carrying the attribute.
+            /// - `E` - attribute payload struct type.
+            /// - `value` - payload stored with every attribute.
+            pub fn cmdSetAttributes(
+                self: *const SystemHandler,
+                entities: []const EntityReference,
+                comptime E: type,
+                value: E,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueSetMany(self.allocator, entities, value);
+            }
+            /// Queues one payload per entity, pairwise, in O(n). Lengths must
+            /// match, otherwise the batch fails with `CountMismatch` before
+            /// anything is queued. An empty pair of slices is a no-op.
+            /// - `self` - handler of the running system.
+            /// - `entities` - entities carrying the attributes.
+            /// - `E` - attribute payload struct type.
+            /// - `values` - payload per entity, same length as `entities`.
+            pub fn cmdSetAttributesEach(
+                self: *const SystemHandler,
+                entities: []const EntityReference,
+                comptime E: type,
+                values: []const E,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueSetEach(self.allocator, entities, values);
+            }
+            /// Queues destroys for a slice of entity references in O(n),
+            /// without handles: each entry is matched by id plus generation,
+            /// so stale references fail with `AttributeNotFound` and a
+            /// repeated entry fails with `AttributeHasPendingCommand`. The
+            /// batch is validated before anything is queued. An empty slice
+            /// is a no-op.
+            /// - `self` - handler of the running system.
+            /// - `entities` - entity references holding the attributes.
+            /// - `E` - attribute payload struct type.
+            pub fn cmdDestroyAttributesFor(
+                self: *const SystemHandler,
+                entities: []const EntityReference,
+                comptime E: type,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                try Store.ensureRegistered(self.allocator);
+                try Store.queueDestroyMany(self.allocator, entities);
+            }
+            /// Queues destruction of every attribute of the payload type in
+            /// O(1): arms a bulk wipe that the flush applies in O(pages).
+            /// No-op when nothing was ever queued for the payload.
+            /// - `self` - handler of the running system.
+            /// - `E` - attribute payload struct type.
+            pub fn cmdDestroyAttributes(self: *const SystemHandler, comptime E: type) EcsError!void {
+                _ = self;
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                if (!Store.registered) {
+                    return;
+                }
+                Store.queueDestroyAll();
+            }
+            /// Returns every non-empty attribute page of the payload type:
+            /// dense and sorted by archetype id. Read-only by contract, valid
+            /// only until the current system returns. Unlike events, pages
+            /// persist across frames until destroyed.
+            /// - `self` - handler of the running system.
+            /// - `E` - attribute payload struct type.
+            ///
+            /// Returns `[]const AttributePage(E)` - live committed pages.
+            pub fn allAttributes(self: *const SystemHandler, comptime E: type) []const AttributePage(E) {
+                validateEventType(E);
+                _ = self;
+                return AttributeStore(E).committed.items;
+            }
+            /// Returns the dense subset of attribute pages whose archetype
+            /// holds all `include` components and none of the `exclude`
+            /// components. Same merge pass and buffer lifetime as
+            /// `filterEvents`.
+            /// - `self` - handler of the running system.
+            /// - `E` - attribute payload struct type.
+            /// - `include` - component bundle that must be present.
+            /// - `exclude` - component bundle that must be absent. `null` and empty
+            ///   bundles are equivalent to no exclusion.
+            ///
+            /// Returns `[]const AttributePage(E)` - matching pages, dense.
+            pub fn filterAttributes(
+                self: *const SystemHandler,
+                comptime E: type,
+                comptime include: anytype,
+                comptime exclude: anytype,
+            ) []const AttributePage(E) {
+                validateEventType(E);
+                _ = self;
+                return AttributeFilter(E, include, exclude).filter();
+            }
+            /// Assigns buffer budgets for one attribute payload type. Same
+            /// shape and replace-semantics as event limits; trims apply at
+            /// frame end via the attribute trim pass.
+            /// - `self` - handler of the running system.
+            /// - `E` - attribute payload struct type.
+            /// - `limits` - budgets to assign.
+            pub fn setAttributeLimits(
+                self: *const SystemHandler,
+                comptime E: type,
+                limits: EventLimits,
+            ) EcsError!void {
+                validateEventType(E);
+                const Store = AttributeStore(E);
+                try Store.ensureRegistered(self.allocator);
+                if (limits.slots) |s| {
+                    if (s > 0) {
+                        try Store.ensureSlot(self.allocator, s - 1);
+                    }
+                }
+                if (limits.pending) |p| {
+                    try Store.pending.ensureTotalCapacity(self.allocator, p);
+                }
+                const col_cap: usize = limits.events_per_page orelse 0;
+                if (limits.pages) |pg| {
+                    const want: usize = pg;
+                    try Store.committed.ensureTotalCapacity(self.allocator, want);
+                    for (Store.page_pool.items) |*shell| {
+                        try shell.entities.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.values.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.depth_zones.ensureTotalCapacity(self.allocator, col_cap);
+                    }
+                    while (Store.page_pool.items.len < want) {
+                        var shell = AttributePage(E){ .arch_id = 0 };
+                        errdefer shell.entities.deinit(self.allocator);
+                        errdefer shell.values.deinit(self.allocator);
+                        errdefer shell.depth_zones.deinit(self.allocator);
+                        try shell.entities.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.values.ensureTotalCapacity(self.allocator, col_cap);
+                        try shell.depth_zones.ensureTotalCapacity(self.allocator, col_cap);
+                        try Store.page_pool.append(self.allocator, shell);
+                    }
+                } else if (limits.events_per_page) |ec| {
+                    const cc: usize = ec;
+                    for (Store.page_pool.items) |*shell| {
+                        try shell.entities.ensureTotalCapacity(self.allocator, cc);
+                        try shell.values.ensureTotalCapacity(self.allocator, cc);
+                        try shell.depth_zones.ensureTotalCapacity(self.allocator, cc);
+                    }
+                }
+                Store.limits = limits;
+            }
+            /// Drops every budget of one attribute payload type, restoring
+            /// grow-only behavior.
+            /// - `self` - handler of the running system.
+            /// - `E` - attribute payload struct type.
+            pub fn clearAttributeLimits(self: *const SystemHandler, comptime E: type) void {
+                _ = self;
+                validateEventType(E);
+                AttributeStore(E).limits = .{};
+            }
+            /// Returns the budgets currently assigned to one attribute
+            /// payload type, or all-`null` when none were assigned.
+            /// - `self` - handler of the running system.
+            /// - `E` - attribute payload struct type.
+            ///
+            /// Returns `EventLimits` - active budgets.
+            pub fn attributeLimits(self: *const SystemHandler, comptime E: type) EventLimits {
+                _ = self;
+                validateEventType(E);
+                return AttributeStore(E).limits;
             }
         };
         /// Deferred structural change, applied between systems in FIFO order.
@@ -4947,6 +6410,11 @@ pub fn ECS(comptime sets: anytype) type {
                     .migrate => |m| {
                         if (m.ref.isAlive()) {
                             _ = try m.ref.migrateById(allocator, m.dest, m.copy);
+                            // Attribute sets queued earlier in this system
+                            // still carry the old generation: rebase them so
+                            // the attribute flush below files under the live
+                            // archetype instead of dropping them as stale.
+                            Ecs.rebaseAttributePending(m.ref.id, m.ref.gen, Ecs.entity_generation.items[m.ref.id]);
                         } else if (Ecs.entity_generation.items[m.ref.id] == m.ref.gen) {
                             Ecs.clearPending(m.ref.id);
                         }
@@ -4984,6 +6452,12 @@ pub fn ECS(comptime sets: anytype) type {
                     },
                 }
             }
+            // Attributes flush after the entity commands: reserved slots are
+            // materialized by now, so sets file under the live archetype and
+            // depth (including reserved children). Migrates/destroys queued
+            // in the same system already applied; the set path resolves
+            // against live state below.
+            try Ecs.flushAttributePending(allocator);
         }
         /// Drops every queued command without applying it, freeing create
         /// blobs, releasing the pending flags set at queue time and rolling
@@ -4997,8 +6471,9 @@ pub fn ECS(comptime sets: anytype) type {
         fn discardCommands(allocator: std.mem.Allocator) void {
             @setEvalBranchQuota(10_000_000);
             // Event pendings of the failing system are dropped; committed
-            // events of earlier systems stay untouched.
+            // events of earlier systems stay untouched. Same for attributes.
             Ecs.discardEventPending();
+            Ecs.discardAttributePending();
             var i: usize = Ecs.commands.items.len;
             while (i > 0) {
                 i -= 1;
@@ -5113,6 +6588,8 @@ pub fn ECS(comptime sets: anytype) type {
                         try Ecs.flushCommands(allocator);
                     }
                     try Ecs.clearAllEvents(allocator);
+                    // Attributes persist; only their assigned budgets trim here.
+                    try Ecs.trimAttributes(allocator);
                 }
             };
         }
@@ -5135,6 +6612,12 @@ pub fn ECS(comptime sets: anytype) type {
             }
             Ecs.event_registry.deinit(allocator);
             Ecs.event_registry = .empty;
+            for (Ecs.attribute_registry.items) |entry| {
+                entry.deinitStore(allocator);
+                entry.resetRegistered();
+            }
+            Ecs.attribute_registry.deinit(allocator);
+            Ecs.attribute_registry = .empty;
             Ecs.entity_generation.deinit(allocator);
             Ecs.entity_generation = .empty;
             Ecs.entity_archetype.deinit(allocator);
@@ -5147,6 +6630,8 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.entity_parent = .empty;
             Ecs.entity_first_child.deinit(allocator);
             Ecs.entity_first_child = .empty;
+            Ecs.entity_last_child.deinit(allocator);
+            Ecs.entity_last_child = .empty;
             Ecs.entity_next_sibling.deinit(allocator);
             Ecs.entity_next_sibling = .empty;
             Ecs.entity_prev_sibling.deinit(allocator);
@@ -8005,5 +9490,903 @@ test "zero limits retain nothing" {
     try std.testing.expect(Store.pending.capacity == 0);
     try std.testing.expect(Store.committed.capacity == 0);
     // The next frame still computes correctly after full release.
+    try App.run(allocator);
+}
+test "attributes set, get, update and destroy" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn set(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 10 });
+            // Committed-only reads: invisible until flush.
+            try std.testing.expectError(
+                Ecs.EcsError.AttributeNotFound,
+                h.getAttribute(S.target, Buff),
+            );
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].entityAt(0).id == S.target.id);
+            const p = try h.getAttribute(S.target, Buff);
+            try std.testing.expect(p.amount == 10);
+            // Mutable in place, then overwritten by upsert.
+            p.amount = 25;
+            try std.testing.expect((try h.getAttribute(S.target, Buff)).amount == 25);
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 40 });
+        }
+        fn verify_updated(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 40);
+            const handle = pages[0].handleAt(0);
+            try h.cmdDestroyAttribute(handle);
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allAttributes(Buff).len == 0);
+            try std.testing.expectError(
+                Ecs.EcsError.AttributeNotFound,
+                h.getAttribute(S.target, Buff),
+            );
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.set, S.verify, S.verify_updated, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attributes validate handles and accept reserved slots" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        var other: Ecs.EntityReference = undefined;
+        fn spawn_and_reserve(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            const reserved = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            // Like events, reserved handles are accepted: the slot
+            // materializes during the same flush, so the attribute files
+            // under the live archetype and depth.
+            try h.cmdSetAttribute(reserved, Buff, .{ .amount = 1 });
+            S.other = reserved;
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(S.other.isAlive());
+            // The reserved set from the previous system is visible now.
+            try std.testing.expect((try h.getAttribute(S.other, Buff)).amount == 1);
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 5 });
+            try h.cmdSetAttribute(S.other, Buff, .{ .amount = 6 });
+        }
+        fn destroy_twice(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 2);
+            const handle = pages[0].handleAt(0);
+            try h.cmdDestroyAttribute(handle);
+            try std.testing.expectError(
+                Ecs.EcsError.AttributeHasPendingCommand,
+                h.cmdDestroyAttribute(handle),
+            );
+            const forged = Ecs.AttributeHandle(Buff){
+                .entity = .{ .id = S.target.id, .gen = S.target.gen +% 1 },
+                .arch_id = pages[0].arch_id,
+                .index = 0,
+            };
+            try std.testing.expectError(
+                Ecs.EcsError.AttributeNotFound,
+                h.cmdDestroyAttribute(forged),
+            );
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            // One of the two attributes was destroyed.
+            var total: usize = 0;
+            for (h.allAttributes(Buff)) |page| {
+                total += page.count();
+            }
+            try std.testing.expect(total == 1);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn_and_reserve, S.emit, S.destroy_twice, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attributes on reserved children land in the right depth zone" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var parent: Ecs.EntityReference = undefined;
+        var child: Ecs.EntityReference = undefined;
+        var grandchild: Ecs.EntityReference = undefined;
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            S.parent = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 0,
+                .vertical_coordinate = 0,
+            }});
+            S.child = try h.cmdCreateChild(S.parent, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.grandchild = try h.cmdCreateChild(S.child, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            // Reserved handles work like events: the slots materialize
+            // during the same flush, filed under live depth.
+            try h.cmdSetAttribute(S.child, Buff, .{ .amount = 10 });
+            try h.cmdSetAttribute(S.grandchild, Buff, .{ .amount = 20 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 2);
+            try std.testing.expect(pages[0].depthZone(0) == null);
+            const z1 = pages[0].depthZone(1).?;
+            try std.testing.expect(z1.len == 1);
+            try std.testing.expect((try h.getAttribute(S.child, Buff)).amount == 10);
+            const z2 = pages[0].depthZone(2).?;
+            try std.testing.expect(z2.len == 1);
+            try std.testing.expect((try h.getAttribute(S.grandchild, Buff)).amount == 20);
+            try std.testing.expect(try S.child.depthOf() == 1);
+            try std.testing.expect(try S.grandchild.depthOf() == 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.build, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attribute set survives same-system migrate" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 1, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 1 });
+        }
+        fn set_and_move(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 2 });
+            try h.cmdMigrate(S.target, &[_]type{Pos}, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            // Filed under the live (destination) archetype, not dropped.
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 2);
+            const live = pages[0].entityAt(0);
+            try std.testing.expect(live.isAlive());
+            try std.testing.expect(live.gen == S.target.gen +% 1);
+            try std.testing.expect((try h.getAttribute(live, Buff)).amount == 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.set_and_move, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attribute set with same-system destroy is dropped" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 1 });
+        }
+        fn set_and_kill(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 2 });
+            try h.cmdDestroy(S.target);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(!S.target.isAlive());
+            try std.testing.expect(h.allAttributes(Buff).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.set_and_kill, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attributes persist across frames" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 11 });
+        }
+        fn read1(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect((try h.getAttribute(S.target, Buff)).amount == 11);
+        }
+        fn read2(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 11);
+        }
+        fn read3(h: *Ecs.SystemHandler) anyerror!void {
+            // Mutations persist too.
+            (try h.getAttribute(S.target, Buff)).amount = 12;
+            try std.testing.expect((try h.getAttribute(S.target, Buff)).amount == 12);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.read1, S.read2, S.read3 });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+    // Still there after the frame: no auto-clear.
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    try std.testing.expect(handler.allAttributes(Buff).len == 1);
+}
+test "attributes filter by archetype" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var small: Ecs.EntityReference = undefined;
+        var big: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.small = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.big = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 2, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.big, Buff, .{ .amount = 2 });
+            try h.cmdSetAttribute(S.small, Buff, .{ .amount = 1 });
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const all = h.allAttributes(Buff);
+            try std.testing.expect(all.len == 2);
+            try std.testing.expect(all[0].arch_id < all[1].arch_id);
+            const no_vel = h.filterAttributes(Buff, &[_]type{Pos}, &[_]type{Vel});
+            try std.testing.expect(no_vel.len == 1);
+            try std.testing.expect(no_vel[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(no_vel[0].valueAt(0).amount == 1);
+            const with_vel = h.filterAttributes(Buff, &[_]type{ Pos, Vel }, null);
+            try std.testing.expect(with_vel.len == 1);
+            try std.testing.expect(with_vel[0].valueAt(0).amount == 2);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attribute batch commands mirror events" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const N: usize = 200;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            var values: [N]Buff = undefined;
+            for (0..N) |i| {
+                values[i] = .{ .amount = @intCast(i) };
+            }
+            try h.cmdSetAttributesEach(S.refs[0..], Buff, values[0..]);
+            try std.testing.expectError(
+                Ecs.EcsError.CountMismatch,
+                h.cmdSetAttributesEach(S.refs[0..10], Buff, values[0..9]),
+            );
+        }
+        fn wipe_even(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+            var evens: [N / 2]Ecs.EntityReference = undefined;
+            var en: usize = 0;
+            for (S.refs, 0..) |ref, i| {
+                if (i % 2 == 0) {
+                    evens[en] = ref;
+                    en += 1;
+                }
+            }
+            try h.cmdDestroyAttributesFor(evens[0..], Buff);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N / 2);
+            var sum: u64 = 0;
+            for (pages[0].attributeList()) |a| {
+                try std.testing.expect(a.amount % 2 == 1);
+                sum += a.amount;
+            }
+            try std.testing.expect(sum == N * N / 4);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.wipe_even, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "user attributes follow the entity across migrate" {
+    const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{ Pos, Vel }, .{
+                Pos{ .horizontal_coordinate = 1, .vertical_coordinate = 0 },
+                Vel{ .horizontal_speed = 0, .vertical_speed = 0 },
+            });
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Buff, .{ .amount = 42 });
+        }
+        fn move(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdMigrate(S.target, &[_]type{Pos}, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].arch_id == Ecs.archetypeId(&[_]type{Pos}));
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].valueAt(0).amount == 42);
+            // Depth is preserved by migrate: still a depth-0 zone.
+            try std.testing.expect(pages[0].depthCount() == 1);
+            try std.testing.expect(pages[0].depthZone(0).?.len == 1);
+            const e = pages[0].entityAt(0);
+            try std.testing.expect(e.isAlive());
+            try std.testing.expect(e.gen == S.target.gen +% 1);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.move, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attribute rows ride depth zones across reparent" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        var r2: Ecs.EntityReference = undefined;
+        var r3: Ecs.EntityReference = undefined;
+        var c: Ecs.EntityReference = undefined;
+        var g: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.r = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.r2 = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            S.r3 = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+            S.c = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 4,
+                .vertical_coordinate = 0,
+            }});
+            S.g = try h.cmdCreateChild(S.c, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.c, Buff, .{ .amount = 10 });
+            try h.cmdSetAttribute(S.g, Buff, .{ .amount = 20 });
+        }
+        fn move1(h: *Ecs.SystemHandler) anyerror!void {
+            // Same depth (1 -> 1): rows stay in the depth-1 zone.
+            try h.cmdReparent(S.c, S.r2);
+        }
+        fn move2(h: *Ecs.SystemHandler) anyerror!void {
+            // The R2 subtree sinks one level.
+            try h.cmdReparent(S.r2, S.r3);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            const page = &pages[0];
+            try std.testing.expect(page.count() == 2);
+            try std.testing.expect(page.depthCount() == 2);
+            try std.testing.expect(page.depthZone(1) == null);
+            try std.testing.expect(page.depthZone(2).?.len == 1);
+            try std.testing.expect(page.depthZone(3).?.len == 1);
+            // Zone views expose matching entities and mutable values.
+            const z2 = page.zone(2);
+            try std.testing.expect(z2.len() == 1);
+            try std.testing.expect(z2.entities()[0].id == S.c.id);
+            z2.values()[0].amount = 11;
+            const z3 = page.zoneAt(1);
+            try std.testing.expect(z3.depth() == 3);
+            try std.testing.expect(z3.entities()[0].id == S.g.id);
+            try std.testing.expect(z3.values()[0].amount == 20);
+            try std.testing.expect((try h.getAttribute(S.c, Buff)).amount == 11);
+        }
+        fn detach(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdReparent(S.c, null);
+        }
+        fn verify_detached(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            const page = &pages[0];
+            // C is a root again, G follows at depth 1.
+            try std.testing.expect(page.depthZone(0).?.len == 1);
+            try std.testing.expect(page.depthZone(1).?.len == 1);
+            try std.testing.expect(page.depthZone(2) == null);
+            try std.testing.expect((try h.getAttribute(S.g, Buff)).amount == 20);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.move1, S.move2, S.verify, S.detach, S.verify_detached });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "destroyed entities lose attributes, recycled slots start clean" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var first: Ecs.EntityReference = undefined;
+        var second: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.first = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.first, Buff, .{ .amount = 7 });
+        }
+        fn kill1(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroy(S.first);
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allAttributes(Buff).len == 0);
+            try std.testing.expectError(
+                Ecs.EcsError.EntityIsNotAlive,
+                h.getAttribute(S.first, Buff),
+            );
+        }
+        fn respawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.second = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            try std.testing.expect(S.second.id == S.first.id);
+        }
+        fn verify_clean(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allAttributes(Buff).len == 0);
+            try h.cmdSetAttribute(S.second, Buff, .{ .amount = 8 });
+        }
+        fn verify_set(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect((try h.getAttribute(S.second, Buff)).amount == 8);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.kill1, S.verify_gone, S.respawn, S.verify_clean, S.verify_set });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "zero-size attributes work end to end" {
+    const Ecs = ECS(.{.{Pos}});
+    const Tag = struct {};
+    const S = struct {
+        const S = @This();
+        var target: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.target = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.target, Tag, .{});
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Tag);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == 1);
+            try std.testing.expect(pages[0].depthZone(0).?.len == 1);
+            _ = try h.getAttribute(S.target, Tag);
+            try h.cmdDestroyAttribute(pages[0].handleAt(0));
+        }
+        fn verify_gone(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allAttributes(Tag).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify, S.verify_gone });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "attribute limits warm up and trim" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const N: usize = 100;
+    const S = struct {
+        const S = @This();
+        var refs: [N]Ecs.EntityReference = undefined;
+        var mid_col_cap: usize = 0;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn emit(h: *Ecs.SystemHandler) anyerror!void {
+            var values: [N]Buff = undefined;
+            for (0..N) |i| {
+                values[i] = .{ .amount = @intCast(i) };
+            }
+            try h.cmdSetAttributesEach(S.refs[0..], Buff, values[0..]);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].count() == N);
+            var sum: u64 = 0;
+            for (pages[0].attributeList()) |a| {
+                sum += a.amount;
+            }
+            try std.testing.expect(sum == N * (N - 1) / 2);
+            const Store = Ecs.AttributeStore(Buff);
+            S.mid_col_cap = Store.committed.items[0].entities.capacity;
+        }
+        fn wipe(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroyAttributes(Buff);
+        }
+        fn verify_wiped(h: *Ecs.SystemHandler) anyerror!void {
+            try std.testing.expect(h.allAttributes(Buff).len == 0);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.emit, S.verify });
+    const WipeApp = Ecs.Schedule(.{S.wipe});
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    const handler = Ecs.SystemHandler{ .allocator = allocator };
+    // Warmup pre-grows the slot maps.
+    try handler.setAttributeLimits(Buff, .{ .slots = 500, .pending = 64, .events_per_page = 32, .pages = 2 });
+    const Store = Ecs.AttributeStore(Buff);
+    try std.testing.expect(Store.rows.items.len >= 500);
+    try std.testing.expect(Store.page_pool.items.len == 2);
+    // Tighter budgets trim at frame end; replace semantics apply.
+    // Attributes persist, so the live page stays committed: only the pool
+    // shells (once rows are destroyed) and the pending queue trim here.
+    try handler.setAttributeLimits(Buff, .{ .events_per_page = 4, .pages = 1, .pending = 8 });
+    try std.testing.expect(handler.attributeLimits(Buff).slots == null);
+    try App.run(allocator);
+    try std.testing.expect(S.mid_col_cap >= N);
+    try std.testing.expect(Store.pending.capacity < N);
+    // Wiping the attributes drops the page to the pool; the same frame end
+    // trims the shell down to the budgets.
+    try WipeApp.run(allocator);
+    try std.testing.expect(Store.page_pool.items.len == 1);
+    try std.testing.expect(Store.page_pool.items[0].entities.capacity < S.mid_col_cap);
+    // Clearing restores grow-only behavior; re-emitting reuses the pool
+    // shell, so it sits back in committed with a full page.
+    handler.clearAttributeLimits(Buff);
+    try App.run(allocator);
+    try std.testing.expect(Store.committed.items.len == 1);
+    try std.testing.expect(Store.committed.items[0].count() == N);
+    try std.testing.expect(Store.page_pool.items.len == 0);
+}
+test "attribute zone rotation keeps rows and mappings exact" {
+    const Ecs = ECS(.{.{Pos}});
+    const Buff = struct { amount: u32 };
+    const S = struct {
+        const S = @This();
+        var r: Ecs.EntityReference = undefined;
+        var c1: Ecs.EntityReference = undefined;
+        var c2: Ecs.EntityReference = undefined;
+        var g: Ecs.EntityReference = undefined;
+        var x: Ecs.EntityReference = undefined;
+        var y: Ecs.EntityReference = undefined;
+        var z: Ecs.EntityReference = undefined;
+        var w: Ecs.EntityReference = undefined;
+        fn spawn0(h: *Ecs.SystemHandler) anyerror!void {
+            S.r = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.c1 = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            S.c2 = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }});
+            S.g = try h.cmdCreateChild(S.c1, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 4,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn emit0(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.r, Buff, .{ .amount = 1 });
+            try h.cmdSetAttribute(S.c1, Buff, .{ .amount = 2 });
+            try h.cmdSetAttribute(S.c2, Buff, .{ .amount = 3 });
+            try h.cmdSetAttribute(S.g, Buff, .{ .amount = 4 });
+        }
+        fn vbase(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            try std.testing.expect(pages.len == 1);
+            try std.testing.expect(pages[0].depthCount() == 3);
+            try std.testing.expect(pages[0].depthZone(0).?.len == 1);
+            try std.testing.expect(pages[0].depthZone(1).?.len == 2);
+            try std.testing.expect(pages[0].depthZone(2).?.len == 1);
+        }
+        fn rm_g(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroyAttributesFor(&[_]Ecs.EntityReference{S.g}, Buff);
+        }
+        fn spawn_x(h: *Ecs.SystemHandler) anyerror!void {
+            S.x = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 5,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn set_x(h: *Ecs.SystemHandler) anyerror!void {
+            // Inserts into zone 0 with a deeper zone present: rotation.
+            try h.cmdSetAttribute(S.x, Buff, .{ .amount = 5 });
+        }
+        fn v1(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            const ents = pages[0].entityList();
+            try std.testing.expect(ents.len == 4);
+            // Rotation result: the fresh row lands at the zone tail while
+            // untouched rows keep their positions.
+            try std.testing.expect(ents[0].id == S.r.id);
+            try std.testing.expect(ents[1].id == S.x.id);
+            try std.testing.expect(ents[2].id == S.c2.id);
+            try std.testing.expect(ents[3].id == S.c1.id);
+            const z0 = pages[0].depthZone(0).?;
+            const z1 = pages[0].depthZone(1).?;
+            try std.testing.expect(z0.offset == 0 and z0.len == 2);
+            try std.testing.expect(z1.offset == 2 and z1.len == 2);
+            try std.testing.expect((try h.getAttribute(S.r, Buff)).amount == 1);
+            try std.testing.expect((try h.getAttribute(S.x, Buff)).amount == 5);
+            try std.testing.expect((try h.getAttribute(S.c1, Buff)).amount == 2);
+            try std.testing.expect((try h.getAttribute(S.c2, Buff)).amount == 3);
+        }
+        fn rm_c1(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroyAttributesFor(&[_]Ecs.EntityReference{S.c1}, Buff);
+        }
+        fn v2(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            const ents = pages[0].entityList();
+            try std.testing.expect(ents.len == 3);
+            try std.testing.expect(ents[0].id == S.r.id);
+            try std.testing.expect(ents[1].id == S.x.id);
+            try std.testing.expect(ents[2].id == S.c2.id);
+            var sum: u64 = 0;
+            for (pages[0].attributeList()) |a| {
+                sum += a.amount;
+            }
+            try std.testing.expect(sum == 9);
+            try std.testing.expectError(
+                Ecs.EcsError.AttributeNotFound,
+                h.getAttribute(S.c1, Buff),
+            );
+        }
+        fn rm_x(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdDestroyAttributesFor(&[_]Ecs.EntityReference{S.x}, Buff);
+        }
+        fn v3(h: *Ecs.SystemHandler) anyerror!void {
+            // Cascade: deeper zone boundary rotated down.
+            const pages = h.allAttributes(Buff);
+            const ents = pages[0].entityList();
+            try std.testing.expect(ents.len == 2);
+            try std.testing.expect(ents[0].id == S.r.id);
+            try std.testing.expect(ents[1].id == S.c2.id);
+            try std.testing.expect(pages[0].depthZone(0).?.len == 1);
+            try std.testing.expect(pages[0].depthZone(1).?.len == 1);
+            var sum: u64 = 0;
+            for (pages[0].attributeList()) |a| {
+                sum += a.amount;
+            }
+            try std.testing.expect(sum == 4);
+        }
+        fn spawn_yz(h: *Ecs.SystemHandler) anyerror!void {
+            S.y = try h.cmdCreateChild(S.r, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 6,
+                .vertical_coordinate = 0,
+            }});
+            S.z = try h.cmdCreateChild(S.y, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 7,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn set_yz(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdSetAttribute(S.y, Buff, .{ .amount = 6 });
+            try h.cmdSetAttribute(S.z, Buff, .{ .amount = 7 });
+        }
+        fn spawn_w(h: *Ecs.SystemHandler) anyerror!void {
+            S.w = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 8,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn set_w(h: *Ecs.SystemHandler) anyerror!void {
+            // Inserts into zone 0 with two deeper zones: full rotation.
+            try h.cmdSetAttribute(S.w, Buff, .{ .amount = 8 });
+        }
+        fn v5(h: *Ecs.SystemHandler) anyerror!void {
+            const pages = h.allAttributes(Buff);
+            const ents = pages[0].entityList();
+            try std.testing.expect(ents.len == 5);
+            try std.testing.expect(ents[0].id == S.r.id);
+            try std.testing.expect(ents[1].id == S.w.id);
+            try std.testing.expect(ents[2].id == S.y.id);
+            try std.testing.expect(ents[3].id == S.c2.id);
+            try std.testing.expect(ents[4].id == S.z.id);
+            const z0 = pages[0].depthZone(0).?;
+            const z1 = pages[0].depthZone(1).?;
+            const z2 = pages[0].depthZone(2).?;
+            try std.testing.expect(z0.offset == 0 and z0.len == 2);
+            // Zone 1 holds both depth-1 members: Y and the earlier C2.
+            try std.testing.expect(z1.offset == 2 and z1.len == 2);
+            try std.testing.expect(z2.offset == 4 and z2.len == 1);
+            try std.testing.expect((try h.getAttribute(S.r, Buff)).amount == 1);
+            try std.testing.expect((try h.getAttribute(S.w, Buff)).amount == 8);
+            try std.testing.expect((try h.getAttribute(S.y, Buff)).amount == 6);
+            try std.testing.expect((try h.getAttribute(S.c2, Buff)).amount == 3);
+            try std.testing.expect((try h.getAttribute(S.z, Buff)).amount == 7);
+        }
+    };
+    const App = Ecs.Schedule(.{
+        S.spawn0,
+        S.emit0,
+        S.vbase,
+        S.rm_g,
+        S.spawn_x,
+        S.set_x,
+        S.v1,
+        S.rm_c1,
+        S.v2,
+        S.rm_x,
+        S.v3,
+        S.spawn_yz,
+        S.set_yz,
+        S.spawn_w,
+        S.set_w,
+        S.v5,
+    });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "mass children keep creation order and consistent links" {
+    const Ecs = ECS(.{.{Pos}});
+    const N: u32 = 10000;
+    const S = struct {
+        const S = @This();
+        var parent: Ecs.EntityReference = undefined;
+        var kids: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.parent = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 0,
+                .vertical_coordinate = 0,
+            }});
+            const created = try h.cmdCreateChildren(S.parent, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.kids[i] = ref;
+            }
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.parent.childCount() == N);
+            // Forward walk matches creation order exactly.
+            var it = S.parent.children();
+            var i: usize = 0;
+            while (it.next()) |c| {
+                try std.testing.expect(c.id == S.kids[i].id);
+                try std.testing.expect(c.gen == S.kids[i].gen);
+                try std.testing.expect((try c.depthOf()) == 1);
+                try std.testing.expect(c.parent().?.id == S.parent.id);
+                i += 1;
+            }
+            try std.testing.expect(i == N);
+            // Backward walk from the tail reaches every child once.
+            var back = S.kids[N - 1];
+            var j: usize = N;
+            while (true) {
+                try std.testing.expect(back.id == S.kids[j - 1].id);
+                j -= 1;
+                if (j == 0) {
+                    break;
+                }
+                back = back.prevSibling().?;
+            }
+            try std.testing.expect(back.prevSibling() == null);
+        }
+        fn detach_last_and_reattach(h: *Ecs.SystemHandler) anyerror!void {
+            // Detaching the tail must move the tail pointer back.
+            try h.cmdReparent(S.kids[N - 1], null);
+        }
+        fn attach_new(h: *Ecs.SystemHandler) anyerror!void {
+            // A fresh child must land exactly at the end, after the
+            // previously second-to-last kid.
+            const fresh = try h.cmdCreateChild(S.parent, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            S.kids[N - 1] = fresh;
+        }
+        fn verify_tail(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.parent.childCount() == N);
+            var it = S.parent.children();
+            var last: ?Ecs.EntityReference = null;
+            var total: usize = 0;
+            while (it.next()) |c| {
+                last = c;
+                total += 1;
+            }
+            try std.testing.expect(total == N);
+            try std.testing.expect(last.?.id == S.kids[N - 1].id);
+            try std.testing.expect(last.?.nextSibling() == null);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.verify, S.detach_last_and_reattach, S.attach_new, S.verify_tail });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
     try App.run(allocator);
 }

@@ -25,6 +25,31 @@ const Empty3 = struct {};
 const Empty4 = struct {};
 const Empty5 = struct {};
 const CustomEvent = struct {};
+const HealEffect = struct { heal_force: f32 = 0 };
+
+fn sumEvents(comptime T: type, pages: []const ECS.EventPage(T)) usize {
+    var events_sum: usize = 0;
+    for (pages) |ep| {
+        for (ep.entityList()) |e| {
+            if (e.isAlive()) {
+                events_sum += 1;
+            }
+        }
+    }
+    return events_sum;
+}
+
+fn sumAttributes(comptime T: type, pages: []const ECS.AttributePage(T)) usize {
+    var events_sum: usize = 0;
+    for (pages) |ep| {
+        for (ep.entityList()) |e| {
+            if (e.isAlive()) {
+                events_sum += 1;
+            }
+        }
+    }
+    return events_sum;
+}
 
 const App = ECS.Schedule(.{ setup, print, printAllVsNonempty });
 var player1: ECS.EntityReference = undefined;
@@ -35,6 +60,7 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
         Scale{ .w = 1, .h = 1 },
         Health{ .value = 100 },
     });
+    try h.cmdSetAttribute(player1, HealEffect, .{});
     try h.cmdSetEvent(player1, CustomEvent, .{});
     std.log.debug("Is player 1 alive: {}", .{player1.isAlive()});
     const player2 = try h.cmdCreateChild(player1, .{ Player, Enemy }, .{
@@ -49,24 +75,7 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
     try h.cmdSetEvent(player2, CustomEvent, .{});
 }
 
-fn sumEvents(comptime T: type, pages: []const ECS.EventPage(T)) usize {
-    var events_sum: usize = 0;
-    for (pages) |ep| {
-        for (ep.entityList()) |e| {
-            if (e.isAlive()) {
-                events_sum += 1;
-            }
-        }
-    }
-    return events_sum;
-}
-
 fn print(h: *ECS.SystemHandler) anyerror!void {
-    // for (h.filterEvents(CustomEvent, .{Enemy}, .{})) |e| {
-    //     try h.cmdDestroy(e.entityAt(0));
-    //     std.debug.print("Destroying CustomEvent, Enemy: {any}\n", .{e.entityAt(0)});
-    //     break;
-    // }
     std.debug.print("Is player 1 alive: {}\n", .{player1.isAlive()});
     for (h.pages(.{Position}, null).nonEmptyPages()) |p| {
         for (p.depthZones()) |d| {
@@ -90,6 +99,7 @@ fn print(h: *ECS.SystemHandler) anyerror!void {
     }
 
     std.debug.print("Custom events sum before: {}\n", .{sumEvents(CustomEvent, h.allEvents(CustomEvent))});
+    std.debug.print("Heal effect: {}\n", .{sumAttributes(HealEffect, h.allAttributes(HealEffect))});
 }
 
 fn printAllVsNonempty(h: *ECS.SystemHandler) !void {
