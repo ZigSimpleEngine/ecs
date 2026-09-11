@@ -69,6 +69,7 @@ fn setup(h: *ECS.SystemHandler) anyerror!void {
         Health{ .value = 50 },
         Enemy{},
     });
+
     const enemy1 = try h.cmdCreateChild(player1, Enemy, .{Enemy{}});
     try h.cmdSetEvent(enemy1, CustomEvent, .{});
 

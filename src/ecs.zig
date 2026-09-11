@@ -118,6 +118,25 @@ pub fn ECS(comptime sets: anytype) type {
             /// Number of rows in the zone.
             len: u32,
         };
+        /// Filter for enabled-bitmap iteration. Selects which rows
+        /// `nextEntityId`/`nextComponentId` yield.
+        /// - `enabled` - only rows whose bit is set.
+        /// - `disabled` - only rows whose bit is clear.
+        pub const EnableFilter = enum {
+            enabled,
+            disabled,
+        };
+        /// Summary of one enabled column (entity list or one component).
+        /// Computed from `(row count, enabled count)`, never stored.
+        /// - `all_enabled` - every row is enabled (also used for empty pages,
+        ///   so `next*` with `.disabled` returns null immediately).
+        /// - `all_disabled` - no row is enabled.
+        /// - `mixed` - both states are present, a bit scan is required.
+        pub const EnableState = enum {
+            all_enabled,
+            all_disabled,
+            mixed,
+        };
         /// Locates the zone whose region contains the given row index.
         /// Zones are contiguous, so this is the last zone with
         /// `offset <= index`. Shared by component storages and attribute
@@ -325,6 +344,129 @@ pub fn ECS(comptime sets: anytype) type {
                 }
                 const entity_index: u32 = self.id;
                 return Ecs.entity_row.items[entity_index];
+            }
+            /// Checks the entity enabled flag (Unity `activeSelf` without
+            /// hierarchy: disabling the entity never touches components).
+            /// Dead references report disabled.
+            /// - `self` - reference to inspect.
+            ///
+            /// Returns `bool` - true when alive and enabled.
+            pub fn isEntityEnabled(self: *const EntityReference) bool {
+                if (!self.isAlive()) {
+                    return false;
+                }
+                const entity_index: u32 = self.id;
+                const arch: u32 = Ecs.entity_archetype.items[entity_index];
+                const row: u32 = Ecs.entity_row.items[entity_index];
+                const s = &Ecs.storages[arch];
+                if (row >= s.refs.items.len) {
+                    return false;
+                }
+                return ArchetypeStorage.enabledBitGet(s.entity_enabled.items, row);
+            }
+            /// Writes the entity enabled flag. Immediate: no command queue,
+            /// safe to call inside iteration over `nextEntityId`.
+            /// - `self` - reference to mutate. Must be alive.
+            /// - `value` - true to enable, false to disable.
+            pub fn setEntityEnabled(self: *const EntityReference, value: bool) EcsError!void {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                const entity_index: u32 = self.id;
+                const arch: u32 = Ecs.entity_archetype.items[entity_index];
+                const row: u32 = Ecs.entity_row.items[entity_index];
+                const s = &Ecs.storages[arch];
+                if (row >= s.refs.items.len) {
+                    return EcsError.IndexOutOfBounds;
+                }
+                const old = ArchetypeStorage.enabledBitGet(s.entity_enabled.items, row);
+                if (old == value) {
+                    return;
+                }
+                ArchetypeStorage.enabledBitSetRaw(s.entity_enabled.items, row, value);
+                if (value) {
+                    s.entity_enabled_count += 1;
+                } else {
+                    s.entity_enabled_count -= 1;
+                }
+            }
+            /// Enables the entity.
+            /// - `self` - reference to mutate. Must be alive.
+            pub fn enableEntity(self: *const EntityReference) EcsError!void {
+                return self.setEntityEnabled(true);
+            }
+            /// Disables the entity (components keep their own flags).
+            /// - `self` - reference to mutate. Must be alive.
+            pub fn disableEntity(self: *const EntityReference) EcsError!void {
+                return self.setEntityEnabled(false);
+            }
+            /// Checks one component enabled flag (Unity `Behaviour.enabled`).
+            /// - `self` - reference to inspect. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            ///
+            /// Returns `bool` - true when the component row is enabled.
+            pub fn isComponentEnabled(self: *const EntityReference, comptime T: type) EcsError!bool {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                if (comptime Ecs.componentIndex(T) == null) {
+                    return EcsError.ComponentNotFoundInArchetype;
+                }
+                const entity_index: u32 = self.id;
+                const arch: u32 = Ecs.entity_archetype.items[entity_index];
+                const comp_id: u32 = @intCast(comptime Ecs.componentIndex(T).?);
+                const col = Ecs.binarySearchIds(Ecs.archetypes[arch].component_ids, comp_id) orelse
+                    return EcsError.ComponentNotFoundInArchetype;
+                const row: u32 = Ecs.entity_row.items[entity_index];
+                const s = &Ecs.storages[arch];
+                if (row >= s.refs.items.len) {
+                    return EcsError.IndexOutOfBounds;
+                }
+                return ArchetypeStorage.enabledBitGet(s.comp_enabled[col].items, row);
+            }
+            /// Writes one component enabled flag. Immediate.
+            /// - `self` - reference to mutate. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            /// - `value` - true to enable, false to disable.
+            pub fn setComponentEnabled(self: *const EntityReference, comptime T: type, value: bool) EcsError!void {
+                if (!self.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                if (comptime Ecs.componentIndex(T) == null) {
+                    return EcsError.ComponentNotFoundInArchetype;
+                }
+                const entity_index: u32 = self.id;
+                const arch: u32 = Ecs.entity_archetype.items[entity_index];
+                const comp_id: u32 = @intCast(comptime Ecs.componentIndex(T).?);
+                const col = Ecs.binarySearchIds(Ecs.archetypes[arch].component_ids, comp_id) orelse
+                    return EcsError.ComponentNotFoundInArchetype;
+                const row: u32 = Ecs.entity_row.items[entity_index];
+                const s = &Ecs.storages[arch];
+                if (row >= s.refs.items.len) {
+                    return EcsError.IndexOutOfBounds;
+                }
+                const old = ArchetypeStorage.enabledBitGet(s.comp_enabled[col].items, row);
+                if (old == value) {
+                    return;
+                }
+                ArchetypeStorage.enabledBitSetRaw(s.comp_enabled[col].items, row, value);
+                if (value) {
+                    s.comp_enabled_counts[col] += 1;
+                } else {
+                    s.comp_enabled_counts[col] -= 1;
+                }
+            }
+            /// Enables one component.
+            /// - `self` - reference to mutate. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            pub fn enableComponent(self: *const EntityReference, comptime T: type) EcsError!void {
+                return self.setComponentEnabled(T, true);
+            }
+            /// Disables one component.
+            /// - `self` - reference to mutate. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            pub fn disableComponent(self: *const EntityReference, comptime T: type) EcsError!void {
+                return self.setComponentEnabled(T, false);
             }
             /// Returns the parent of the entity, or null when it is detached
             /// (a root). Read-only: parents change only through deferred
@@ -611,8 +753,34 @@ pub fn ECS(comptime sets: anytype) type {
                         .id = @intCast(id),
                         .gen = Ecs.entity_generation.items[id],
                     };
-                    Ecs.storages[arch].removeRow(row);
-                    _ = try Ecs.storages[arch].insertRowAtDepth(allocator, &ref, next_depth);
+                    // Enabled bits ride along: remove drops them, insert
+                    // rebirths them as enabled, so snapshot and restore.
+                    const st = &Ecs.storages[arch];
+                    const saved_entity = ArchetypeStorage.enabledBitGet(st.entity_enabled.items, row);
+                    var saved_comps: [MAX_COLS]bool = [_]bool{true} ** MAX_COLS;
+                    for (0..st.len) |ci| {
+                        saved_comps[ci] = ArchetypeStorage.enabledBitGet(st.comp_enabled[ci].items, row);
+                    }
+                    st.removeRow(row);
+                    const new_row = try st.insertRowAtDepth(allocator, &ref, next_depth);
+                    if (ArchetypeStorage.enabledBitGet(st.entity_enabled.items, new_row) != saved_entity) {
+                        ArchetypeStorage.enabledBitSetRaw(st.entity_enabled.items, new_row, saved_entity);
+                        if (saved_entity) {
+                            st.entity_enabled_count += 1;
+                        } else {
+                            st.entity_enabled_count -= 1;
+                        }
+                    }
+                    for (0..st.len) |ci| {
+                        if (ArchetypeStorage.enabledBitGet(st.comp_enabled[ci].items, new_row) != saved_comps[ci]) {
+                            ArchetypeStorage.enabledBitSetRaw(st.comp_enabled[ci].items, new_row, saved_comps[ci]);
+                            if (saved_comps[ci]) {
+                                st.comp_enabled_counts[ci] += 1;
+                            } else {
+                                st.comp_enabled_counts[ci] -= 1;
+                            }
+                        }
+                    }
                 }
             }
             /// Moves the entity into another archetype, optionally copying shared data.
@@ -665,6 +833,15 @@ pub fn ECS(comptime sets: anytype) type {
                 // Hierarchy survives a migrate: the row keeps its depth and
                 // lands in the matching zone of the destination archetype.
                 const depth: u32 = Ecs.entity_depth.items[entity_index];
+                // Snapshot enabled bits before surgery: the entity flag always
+                // travels; shared component flags travel only when `copy` is
+                // set (mirroring `copyShared`), fresh components stay enabled.
+                const src_storage = &Ecs.storages[source_id];
+                const saved_entity_bit = ArchetypeStorage.enabledBitGet(src_storage.entity_enabled.items, source_index);
+                var saved_src_comp: [MAX_COLS]bool = [_]bool{true} ** MAX_COLS;
+                for (0..src_storage.len) |ci| {
+                    saved_src_comp[ci] = ArchetypeStorage.enabledBitGet(src_storage.comp_enabled[ci].items, source_index);
+                }
                 const dest_index: u32 = blk: {
                     const idx = try Ecs.storages[dest_id].insertRowAtDepth(allocator, &next, depth);
                     if (Ecs.storages[dest_id].count() == 1) {
@@ -672,6 +849,45 @@ pub fn ECS(comptime sets: anytype) type {
                     }
                     break :blk idx;
                 };
+                {
+                    const dst = &Ecs.storages[dest_id];
+                    if (ArchetypeStorage.enabledBitGet(dst.entity_enabled.items, dest_index) != saved_entity_bit) {
+                        ArchetypeStorage.enabledBitSetRaw(dst.entity_enabled.items, dest_index, saved_entity_bit);
+                        if (saved_entity_bit) {
+                            dst.entity_enabled_count += 1;
+                        } else {
+                            dst.entity_enabled_count -= 1;
+                        }
+                    }
+                    if (copy and source_id != dest_id) {
+                        const src_ids = Ecs.archetypes[source_id].component_ids;
+                        for (dst.cols(), 0..) |*dcol, di| {
+                            const scol_idx = Ecs.binarySearchIds(src_ids, dcol.comp_id) orelse continue;
+                            const want = saved_src_comp[scol_idx];
+                            if (ArchetypeStorage.enabledBitGet(dst.comp_enabled[di].items, dest_index) != want) {
+                                ArchetypeStorage.enabledBitSetRaw(dst.comp_enabled[di].items, dest_index, want);
+                                if (want) {
+                                    dst.comp_enabled_counts[di] += 1;
+                                } else {
+                                    dst.comp_enabled_counts[di] -= 1;
+                                }
+                            }
+                        }
+                    } else if (copy and source_id == dest_id) {
+                        // Same-storage migrate: columns align 1:1, carry flags.
+                        for (0..dst.len) |ci| {
+                            const want = saved_src_comp[ci];
+                            if (ArchetypeStorage.enabledBitGet(dst.comp_enabled[ci].items, dest_index) != want) {
+                                ArchetypeStorage.enabledBitSetRaw(dst.comp_enabled[ci].items, dest_index, want);
+                                if (want) {
+                                    dst.comp_enabled_counts[ci] += 1;
+                                } else {
+                                    dst.comp_enabled_counts[ci] -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (copy) {
                     Ecs.copyShared(
                         source_id,
@@ -697,6 +913,221 @@ pub fn ECS(comptime sets: anytype) type {
                 return next;
             }
         };
+        /// Reparents many entities under one parent in bulk (`null`
+        /// detaches). Semantically identical to executing compatible
+        /// `reparent` commands in slice order (same stale/skip rules, same
+        /// sibling order, same `Reparent`/`DepthUpdate` records), but depth
+        /// changes ride without per-row storage cascades: member depths are
+        /// updated directly and each touched storage is consolidated once.
+        /// Roots are processed in slice order; a root listed after its own
+        /// ancestor sees the ancestor's move first, exactly as with
+        /// sequentially queued singles.
+        /// - `allocator` - funds traversal buffers and growth.
+        /// - `refs` - batch members in caller order.
+        /// - `parent` - new parent for every member, or null to detach.
+        fn reparentBatch(
+            allocator: std.mem.Allocator,
+            refs: []const EntityReference,
+            parent: ?EntityReference,
+        ) EcsError!void {
+            @setEvalBranchQuota(10_000_000);
+            if (refs.len == 0) {
+                return;
+            }
+            if (refs.len == 1) {
+                // Fast path only when there is no subtree to move: a lone
+                // root with children still wins big from the bulk path
+                // (one consolidate instead of per-row cascades).
+                const ref = refs[0];
+                if (ref.isAlive()) {
+                    if (Ecs.entity_first_child.items[ref.id] == NO_ENTITY) {
+                        if (parent) |p| {
+                            if (p.isAlive()) {
+                                try ref.reparentById(allocator, p.id);
+                            }
+                        } else {
+                            try ref.reparentById(allocator, NO_ENTITY);
+                        }
+                        Ecs.entity_pending_parent.items[ref.id] = NO_ENTITY;
+                        Ecs.setEntityState(ref.id, .{});
+                        return;
+                    }
+                } else if (ref.id < Ecs.entity_generation.items.len and
+                    Ecs.entity_generation.items[ref.id] == ref.gen)
+                {
+                    Ecs.entity_pending_parent.items[ref.id] = NO_ENTITY;
+                    Ecs.clearPending(ref.id);
+                    return;
+                } else {
+                    return;
+                }
+            }
+            const touched = &Ecs.batch_archs;
+            touched.clearRetainingCapacity();
+            Ecs.batch_stamp_epoch +%= 1;
+            if (Ecs.batch_stamp_epoch == 0) {
+                @memset(Ecs.batch_stamps.items, 0);
+                Ecs.batch_stamp_epoch = 1;
+            }
+            const epoch = Ecs.batch_stamp_epoch;
+            const need: usize = @max(Ecs.entity_generation.items.len, Ecs.archetype_count);
+            if (Ecs.batch_stamps.items.len < need) {
+                try Ecs.batch_stamps.appendNTimes(allocator, 0, need - Ecs.batch_stamps.items.len);
+            }
+            const stamps = Ecs.batch_stamps.items;
+            const order = &Ecs.batch_ids;
+            order.clearRetainingCapacity();
+            const moves = &Ecs.batch_moves;
+            moves.clearRetainingCapacity();
+            const depth_counts = &Ecs.batch_counts;
+            depth_counts.clearRetainingCapacity();
+            try depth_counts.appendNTimes(allocator, 0, Ecs.archetype_count);
+            const depth_count_items = depth_counts.items;
+            // Lifecycle filing for the whole batch: register once, resolve
+            // each page once via cursors (see `FileCursor`), append per row.
+            const ReparentStore = Ecs.EventStore(Reparent);
+            const DepthStore = Ecs.EventStore(DepthUpdate);
+            try ReparentStore.ensureRegistered(allocator);
+            try DepthStore.ensureRegistered(allocator);
+            var reparent_cursor = ReparentStore.FileCursor{};
+            var depth_cursor = DepthStore.FileCursor{};
+            // Upper bound for cursor reservations; excess is trimmed later.
+            const reserve_n: usize = refs.len;
+            for (refs) |ref| {
+                if (!ref.isAlive()) {
+                    if (ref.id < Ecs.entity_generation.items.len and
+                        Ecs.entity_generation.items[ref.id] == ref.gen)
+                    {
+                        Ecs.entity_pending_parent.items[ref.id] = NO_ENTITY;
+                        Ecs.clearPending(ref.id);
+                    }
+                    continue;
+                }
+                const entity_index: u32 = ref.id;
+                var new_parent_id: u32 = NO_ENTITY;
+                if (parent) |p| {
+                    if (!p.isAlive()) {
+                        continue;
+                    }
+                    new_parent_id = p.id;
+                }
+                if (new_parent_id != NO_ENTITY) {
+                    if (new_parent_id == entity_index) {
+                        return EcsError.HierarchyCycle;
+                    }
+                    var cur = new_parent_id;
+                    while (cur != NO_ENTITY) {
+                        if (cur == entity_index) {
+                            return EcsError.HierarchyCycle;
+                        }
+                        cur = Ecs.entity_parent.items[cur];
+                    }
+                }
+                const old_parent_id: u32 = Ecs.entity_parent.items[entity_index];
+                const old_depth: u32 = Ecs.entity_depth.items[entity_index];
+                const new_depth: u32 = if (new_parent_id == NO_ENTITY)
+                    0
+                else
+                    Ecs.entity_depth.items[new_parent_id] + 1;
+                const delta: i64 = @as(i64, new_depth) - @as(i64, old_depth);
+                Ecs.unlinkFromParent(entity_index);
+                if (new_parent_id != NO_ENTITY) {
+                    Ecs.linkChild(entity_index, new_parent_id);
+                }
+                if (old_parent_id != new_parent_id) {
+                    const old_parent: ?EntityReference = if (old_parent_id == NO_ENTITY)
+                        null
+                    else
+                        EntityReference{
+                            .id = @intCast(old_parent_id),
+                            .gen = Ecs.entity_generation.items[old_parent_id],
+                        };
+                    const new_parent: ?EntityReference = if (new_parent_id == NO_ENTITY)
+                        null
+                    else
+                        EntityReference{
+                            .id = @intCast(new_parent_id),
+                            .gen = Ecs.entity_generation.items[new_parent_id],
+                        };
+                    if (reparent_cursor.arch != Ecs.entity_archetype.items[entity_index]) {
+                        reparent_cursor.arch = Ecs.entity_archetype.items[entity_index];
+                        reparent_cursor.pi = try ReparentStore.reserveFile(
+                            allocator,
+                            reparent_cursor.arch,
+                            reserve_n,
+                        );
+                    }
+                    try ReparentStore.appendAssumed(
+                        allocator,
+                        reparent_cursor.pi,
+                        ref,
+                        .{ .old_parent = old_parent, .new_parent = new_parent },
+                    );
+                }
+                Ecs.entity_pending_parent.items[entity_index] = NO_ENTITY;
+                Ecs.setEntityState(entity_index, .{});
+                if (delta == 0) {
+                    continue;
+                }
+                const segment: usize = order.items.len;
+                try order.append(allocator, entity_index);
+                var head: usize = segment;
+                while (head < order.items.len) : (head += 1) {
+                    var child = Ecs.entity_first_child.items[order.items[head]];
+                    while (child != NO_ENTITY) : (child = Ecs.entity_next_sibling.items[child]) {
+                        try order.append(allocator, child);
+                    }
+                }
+                for (order.items[segment..]) |id| {
+                    const prev: u32 = Ecs.entity_depth.items[id];
+                    const next_depth: u32 = @intCast(@as(i64, prev) + delta);
+                    Ecs.entity_depth.items[id] = next_depth;
+                    try moves.append(allocator, .{ .id = id, .old_depth = prev });
+                    const arch: u32 = Ecs.entity_archetype.items[id];
+                    depth_count_items[arch] += 1;
+                    if (stamps[arch] != epoch) {
+                        stamps[arch] = epoch;
+                        try touched.append(allocator, arch);
+                    }
+                }
+            }
+            // Attribute rows ride along in bulk (new depths are live by
+            // now); component filing below only reads depths, so order
+            // between the two passes is unobservable.
+            try Ecs.notifyAttributeDepthChangedMany(moves.items, allocator);
+            // Filing pass over deferred moves, in member order (identical to
+            // per-root filing). Per-arch reservations are exact now.
+            for (moves.items) |mv| {
+                const member = EntityReference{
+                    .id = @intCast(mv.id),
+                    .gen = Ecs.entity_generation.items[mv.id],
+                };
+                const member_arch: u32 = Ecs.entity_archetype.items[mv.id];
+                if (depth_cursor.arch != member_arch) {
+                    depth_cursor.arch = member_arch;
+                    depth_cursor.pi = try DepthStore.reserveFile(
+                        allocator,
+                        member_arch,
+                        depth_count_items[member_arch],
+                    );
+                }
+                try DepthStore.appendAssumed(allocator, depth_cursor.pi, member, .{
+                    .old_depth = mv.old_depth,
+                    .new_depth = Ecs.entity_depth.items[mv.id],
+                });
+            }
+            for (touched.items) |arch| {
+                if (Ecs.storages[arch].count() == 0) {
+                    Ecs.storages[arch].depth_zones.clearRetainingCapacity();
+                    continue;
+                }
+                try Ecs.storages[arch].consolidateZones(
+                    allocator,
+                    &Ecs.zone_scratch_perm,
+                    &Ecs.zone_scratch_visited,
+                );
+            }
+        }
         /// Static descriptor of a single component type. Immutable, built once in comptime.
         pub const ComponentInfo = struct {
             /// Dense component id. Always equals the index into `components`.
@@ -1309,6 +1740,24 @@ pub fn ECS(comptime sets: anytype) type {
         /// `columns` array so every storage has one homogeneous type; the
         /// comptime generation only sets `len` and per-column metadata.
         const MAX_COLS: usize = max_len;
+        /// One shared-column pair for bulk migrate copies: source column,
+        /// destination column and element size. Precomputed once per
+        /// `(src, dest)` pair instead of one binary search per column per row.
+        const SharedColumns = struct {
+            scol: u32,
+            dcol: u32,
+            es: usize,
+        };
+        /// Memoized shared-column map of one source archetype, with stack
+        /// buffers sized by `MAX_COLS`: no per-row search, no allocation.
+        const SharedMemo = struct {
+            src: u32,
+            shared: [MAX_COLS]SharedColumns = undefined,
+            len: usize = 0,
+        };
+        /// Reusable scratch for `migrateBatch` shared-column memos, one per
+        /// distinct source archetype in the batch.
+        var batch_memos: std.ArrayListUnmanaged(SharedMemo) = .empty;
         /// One raw component column: manually managed byte buffer holding
         /// `rows * elem_size` live bytes. The buffer is allocated with the
         /// component alignment via `rawAlloc`/`rawFree`, so `@alignCast` on
@@ -1433,6 +1882,17 @@ pub fn ECS(comptime sets: anytype) type {
             len: usize = 0,
             /// Owning archetype id. Used for debug checks and typed lookup.
             arch: u32 = 0,
+            /// Enabled bit per row for the entity itself (`1` = enabled).
+            /// Parallel to `refs`: bit `i` describes row `i`. Words beyond
+            /// the live row count are always zero. New rows are born enabled.
+            entity_enabled: std.ArrayListUnmanaged(u64) = .empty,
+            /// Cached popcount of `entity_enabled` over live rows.
+            entity_enabled_count: u32 = 0,
+            /// Enabled bit per row per component column. Only
+            /// `comp_enabled[0..len]` is valid, aligned with `columns`.
+            comp_enabled: [MAX_COLS]std.ArrayListUnmanaged(u64) = [_]std.ArrayListUnmanaged(u64){.empty} ** MAX_COLS,
+            /// Cached popcounts, one per valid component column.
+            comp_enabled_counts: [MAX_COLS]u32 = [_]u32{0} ** MAX_COLS,
             /// Live component columns.
             fn cols(self: *Self) []Column {
                 return self.columns[0..self.len];
@@ -1440,6 +1900,368 @@ pub fn ECS(comptime sets: anytype) type {
             /// Live component columns, read-only view.
             fn colsConst(self: *const Self) []const Column {
                 return self.columns[0..self.len];
+            }
+            /// Number of 64-bit words covering `need_rows` rows.
+            /// - `need_rows` - rows that must fit afterwards.
+            ///
+            /// Returns `usize` - word count.
+            inline fn enabledWordsNeeded(need_rows: usize) usize {
+                return (need_rows + 63) / 64;
+            }
+            /// Reads one enabled bit. Caller must ensure `idx` is in range
+            /// and the word list covers it.
+            /// - `words` - bitmap words.
+            /// - `idx` - row position.
+            ///
+            /// Returns `bool` - true when the bit is set (enabled).
+            inline fn enabledBitGet(words: []const u64, idx: u32) bool {
+                const bit: u6 = @intCast(idx & 63);
+                return ((words[idx >> 6] >> bit) & 1) == 1;
+            }
+            /// Writes one enabled bit without touching cached counts.
+            /// - `words` - bitmap words.
+            /// - `idx` - row position.
+            /// - `value` - bit value to store.
+            inline fn enabledBitSetRaw(words: []u64, idx: u32, value: bool) void {
+                const bit: u6 = @intCast(idx & 63);
+                const mask: u64 = @as(u64, 1) << bit;
+                const wi: usize = idx >> 6;
+                if (value) {
+                    words[wi] |= mask;
+                } else {
+                    words[wi] &= ~mask;
+                }
+            }
+            /// Bit mask with bits `[lo, hi)` set inside one word.
+            /// - `lo` - first bit (inclusive, `0 <= lo <= 64`).
+            /// - `hi` - end bit (exclusive, `lo <= hi <= 64`).
+            ///
+            /// Returns `u64` - mask.
+            inline fn enabledMaskRange(lo: u32, hi: u32) u64 {
+                if (hi - lo == 64) {
+                    return std.math.maxInt(u64);
+                }
+                if (hi == lo) {
+                    return 0;
+                }
+                const width: u6 = @intCast(hi - lo);
+                const shift: u6 = @intCast(lo);
+                return ((@as(u64, 1) << width) - 1) << shift;
+            }
+            /// Ensures the entity bitmap and every live component bitmap cover
+            /// `need_rows` rows. New words arrive zeroed; the caller sets the
+            /// fresh row bits afterwards.
+            /// - `self` - storage to grow.
+            /// - `allocator` - funds the growth.
+            /// - `need_rows` - rows that must fit afterwards.
+            fn ensureEnabledCapacity(self: *Self, allocator: std.mem.Allocator, need_rows: usize) EcsError!void {
+                const need_words = enabledWordsNeeded(need_rows);
+                if (self.entity_enabled.items.len < need_words) {
+                    try self.entity_enabled.appendNTimes(allocator, 0, need_words - self.entity_enabled.items.len);
+                } else {
+                    try self.entity_enabled.ensureTotalCapacity(allocator, need_words);
+                }
+                for (0..self.len) |ci| {
+                    if (self.comp_enabled[ci].items.len < need_words) {
+                        try self.comp_enabled[ci].appendNTimes(allocator, 0, need_words - self.comp_enabled[ci].items.len);
+                    } else {
+                        try self.comp_enabled[ci].ensureTotalCapacity(allocator, need_words);
+                    }
+                }
+            }
+            /// Appends one enabled (`1`) bit for the entity row and every live
+            /// component row. Caller must have ensured capacity.
+            /// - `self` - storage to extend.
+            /// - `new_idx` - index of the appended row.
+            fn appendEnabledBits(self: *Self, new_idx: u32) void {
+                enabledBitSetRaw(self.entity_enabled.items, new_idx, true);
+                self.entity_enabled_count += 1;
+                for (0..self.len) |ci| {
+                    enabledBitSetRaw(self.comp_enabled[ci].items, new_idx, true);
+                    self.comp_enabled_counts[ci] += 1;
+                }
+            }
+            /// Drops the last row from every enabled bitmap, shrinking word
+            /// lists when a whole word becomes unused.
+            /// - `self` - storage to shrink.
+            /// - `old_count` - row count before popping.
+            fn popEnabledBits(self: *Self, old_count: usize) void {
+                if (old_count == 0) {
+                    return;
+                }
+                const last: u32 = @intCast(old_count - 1);
+                const new_words = enabledWordsNeeded(old_count - 1);
+                if (enabledBitGet(self.entity_enabled.items, last)) {
+                    self.entity_enabled_count -= 1;
+                }
+                if (self.entity_enabled.items.len > new_words) {
+                    self.entity_enabled.items.len = new_words;
+                } else if (self.entity_enabled.items.len > 0) {
+                    // Same word survives: clear the stale bit.
+                    enabledBitSetRaw(self.entity_enabled.items, last, false);
+                }
+                for (0..self.len) |ci| {
+                    if (enabledBitGet(self.comp_enabled[ci].items, last)) {
+                        self.comp_enabled_counts[ci] -= 1;
+                    }
+                    if (self.comp_enabled[ci].items.len > new_words) {
+                        self.comp_enabled[ci].items.len = new_words;
+                    } else if (self.comp_enabled[ci].items.len > 0) {
+                        enabledBitSetRaw(self.comp_enabled[ci].items, last, false);
+                    }
+                }
+            }
+            /// Copies one enabled bit with cached-count maintenance.
+            /// - `words` - bitmap words.
+            /// - `counter` - cached popcount for the bitmap.
+            /// - `src` - row to read.
+            /// - `dst` - row to overwrite.
+            fn moveEnabledBit(words: []u64, counter: *u32, src: u32, dst: u32) void {
+                if (src == dst) {
+                    return;
+                }
+                const src_v = enabledBitGet(words, src);
+                const dst_v = enabledBitGet(words, dst);
+                if (src_v == dst_v) {
+                    return;
+                }
+                enabledBitSetRaw(words, dst, src_v);
+                if (src_v) {
+                    counter.* += 1;
+                } else {
+                    counter.* -= 1;
+                }
+            }
+            /// Summary of the entity column.
+            /// - `self` - storage to inspect.
+            ///
+            /// Returns `EnableState` - aggregate over live rows.
+            fn entityEnableState(self: *const Self) EnableState {
+                const n: u32 = @intCast(self.refs.items.len);
+                if (n == 0 or self.entity_enabled_count == 0) {
+                    return .all_disabled;
+                }
+                if (self.entity_enabled_count == n) {
+                    return .all_enabled;
+                }
+                return .mixed;
+            }
+            /// Summary of one component column.
+            /// - `self` - storage to inspect.
+            /// - `col` - canonical column index.
+            ///
+            /// Returns `EnableState` - aggregate over live rows.
+            fn compEnableState(self: *const Self, col: usize) EnableState {
+                const n: u32 = @intCast(self.refs.items.len);
+                if (n == 0 or self.comp_enabled_counts[col] == 0) {
+                    return .all_disabled;
+                }
+                if (self.comp_enabled_counts[col] == n) {
+                    return .all_enabled;
+                }
+                return .mixed;
+            }
+            /// Scans `[from, to)` for the next row matching the filter.
+            /// Pure word-level scan with `ctz`; no cached-state shortcut.
+            /// - `words` - bitmap words.
+            /// - `from` - first row (inclusive).
+            /// - `to` - end row (exclusive, already clamped to the row count).
+            /// - `want_enabled` - true for enabled rows, false for disabled.
+            ///
+            /// Returns `?u32` - matching row, or null when absent.
+            fn scanEnabledBits(words: []const u64, from: u32, to: u32, want_enabled: bool) ?u32 {
+                if (from >= to) {
+                    return null;
+                }
+                const first_word: usize = from >> 6;
+                const last_word: usize = (to - 1) >> 6;
+                var wi: usize = first_word;
+                while (wi <= last_word) : (wi += 1) {
+                    const base: u32 = @intCast(wi * 64);
+                    const lo: u32 = if (from > base) from - base else 0;
+                    const hi_limit: u32 = base + 64;
+                    const hi: u32 = if (to < hi_limit) to - base else 64;
+                    const mask = enabledMaskRange(lo, hi);
+                    if (mask == 0) {
+                        continue;
+                    }
+                    const w: u64 = if (wi < words.len) words[wi] else 0;
+                    const cand: u64 = if (want_enabled) w & mask else (~w) & mask;
+                    if (cand != 0) {
+                        return base + @as(u32, @intCast(@ctz(cand)));
+                    }
+                }
+                return null;
+            }
+            /// Scans `[from, to)` for the next row where every listed column
+            /// (plus optionally the entity column) matches the filter.
+            /// Conjunctive word-level scan: per word the masked words are
+            /// AND-combined (`w` for enabled, `~w` for disabled) and the first
+            /// set bit wins via `ctz`. Cached `EnableState` values shortcut
+            /// uniform columns without touching bits.
+            /// - `self` - storage to inspect.
+            /// - `col_ids` - canonical component column indices, deduplicated.
+            /// - `include_entity` - when true, the entity bit must match too.
+            ///   Comptime, so the unused branch vanishes without runtime cost.
+            /// - `from` - first row (inclusive).
+            /// - `to` - end row (exclusive, already clamped to the row count).
+            /// - `want_enabled` - true for enabled rows, false for disabled.
+            ///
+            /// Returns `?u32` - matching row, or null when absent. An empty
+            /// column set (no components and `include_entity == false`)
+            /// matches every row, so `from` is returned.
+            fn scanEnabledBitsJoint(
+                self: *const Self,
+                col_ids: []const usize,
+                comptime include_entity: bool,
+                from: u32,
+                to: u32,
+                want_enabled: bool,
+            ) ?u32 {
+                if (from >= to) {
+                    return null;
+                }
+                const involved: usize = col_ids.len + @as(usize, if (include_entity) 1 else 0);
+                if (involved == 0) {
+                    return from;
+                }
+                var all_on = true;
+                var all_off = true;
+                if (include_entity) {
+                    switch (self.entityEnableState()) {
+                        .all_enabled => all_off = false,
+                        .all_disabled => all_on = false,
+                        .mixed => {
+                            all_on = false;
+                            all_off = false;
+                        },
+                    }
+                }
+                    for (col_ids) |col| {
+                    switch (self.compEnableState(col)) {
+                        .all_enabled => all_off = false,
+                        .all_disabled => all_on = false,
+                        .mixed => {
+                            all_on = false;
+                            all_off = false;
+                        },
+                    }
+                }
+                if (want_enabled) {
+                    if (all_off) {
+                        return null;
+                    }
+                    if (all_on) {
+                        return from;
+                    }
+                } else {
+                    if (all_on) {
+                        return null;
+                    }
+                    if (all_off) {
+                        return from;
+                    }
+                }
+                const first_word: usize = from >> 6;
+                const last_word: usize = (to - 1) >> 6;
+                var wi: usize = first_word;
+                while (wi <= last_word) : (wi += 1) {
+                    const base: u32 = @intCast(wi * 64);
+                    const lo: u32 = if (from > base) from - base else 0;
+                    const hi_limit: u32 = base + 64;
+                    const hi: u32 = if (to < hi_limit) to - base else 64;
+                    const mask = enabledMaskRange(lo, hi);
+                    if (mask == 0) {
+                        continue;
+                    }
+                    var cand: u64 = mask;
+                    if (include_entity) {
+                        const w: u64 = if (wi < self.entity_enabled.items.len)
+                            self.entity_enabled.items[wi]
+                        else
+                            0;
+                        cand &= if (want_enabled) w else ~w;
+                        if (cand == 0) {
+                            continue;
+                        }
+                    }
+                for (col_ids) |col| {
+                        const words = self.comp_enabled[col].items;
+                        const w: u64 = if (wi < words.len) words[wi] else 0;
+                        cand &= if (want_enabled) w else ~w;
+                        if (cand == 0) {
+                            break;
+                        }
+                    }
+                    if (cand != 0) {
+                        return base + @as(u32, @intCast(@ctz(cand)));
+                    }
+                }
+                return null;
+            }
+            /// Counts enabled rows in `[from, to)` via masked popcounts.
+            /// - `words` - bitmap words.
+            /// - `from` - first row (inclusive).
+            /// - `to` - end row (exclusive, already clamped).
+            ///
+            /// Returns `u32` - enabled count in range.
+            fn countEnabledInRange(words: []const u64, from: u32, to: u32) u32 {
+                if (from >= to) {
+                    return 0;
+                }
+                var total: u32 = 0;
+                const first_word: usize = from >> 6;
+                const last_word: usize = (to - 1) >> 6;
+                var wi: usize = first_word;
+                while (wi <= last_word) : (wi += 1) {
+                    const base: u32 = @intCast(wi * 64);
+                    const lo: u32 = if (from > base) from - base else 0;
+                    const hi_limit: u32 = base + 64;
+                    const hi: u32 = if (to < hi_limit) to - base else 64;
+                    const mask = enabledMaskRange(lo, hi);
+                    if (mask == 0) {
+                        continue;
+                    }
+                    const w: u64 = if (wi < words.len) words[wi] else 0;
+                    total += @popCount(w & mask);
+                }
+                return total;
+            }
+            /// Sets every bit in `[from, to)` and maintains the cached count.
+            /// - `self` - storage to mutate.
+            /// - `is_entity` - true for the entity column, false for `col`.
+            /// - `col` - component column index when `is_entity` is false.
+            /// - `from` - first row (inclusive).
+            /// - `to` - end row (exclusive, already clamped).
+            /// - `value` - bit value to store.
+            fn setEnabledRange(self: *Self, is_entity: bool, col: usize, from: u32, to: u32, value: bool) void {
+                if (from >= to) {
+                    return;
+                }
+                const words: []u64 = if (is_entity) self.entity_enabled.items else self.comp_enabled[col].items;
+                const counter: *u32 = if (is_entity) &self.entity_enabled_count else &self.comp_enabled_counts[col];
+                const first_word: usize = from >> 6;
+                const last_word: usize = (to - 1) >> 6;
+                var wi: usize = first_word;
+                while (wi <= last_word) : (wi += 1) {
+                    const base: u32 = @intCast(wi * 64);
+                    const lo: u32 = if (from > base) from - base else 0;
+                    const hi_limit: u32 = base + 64;
+                    const hi: u32 = if (to < hi_limit) to - base else 64;
+                    const mask = enabledMaskRange(lo, hi);
+                    if (mask == 0) {
+                        continue;
+                    }
+                    const old: u64 = words[wi];
+                    const next: u64 = if (value) old | mask else old & ~mask;
+                    if (next == old) {
+                        continue;
+                    }
+                    const old_c: u32 = @popCount(old & mask);
+                    const new_c: u32 = @popCount(next & mask);
+                    counter.* = counter.* - old_c + new_c;
+                    words[wi] = next;
+                }
             }
             /// Counts stored rows.
             /// - `self` - storage to inspect.
@@ -1562,7 +2384,184 @@ pub fn ECS(comptime sets: anytype) type {
                     try col.appendUndefined(allocator, row_count);
                 }
                 try self.refs.append(allocator, reference.*);
-                return @intCast(self.refs.items.len - 1);
+                const new_idx: u32 = @intCast(self.refs.items.len - 1);
+                try self.ensureEnabledCapacity(allocator, self.refs.items.len);
+                self.appendEnabledBits(new_idx);
+                return new_idx;
+            }
+            /// Appends one row without touching depth zones and records its
+            /// position in `entity_row`. The caller owns zone maintenance:
+            /// bulk paths rebuild zones once via `consolidateZones` after
+            /// moving every row.
+            fn appendRaw(
+                self: *Self,
+                allocator: std.mem.Allocator,
+                reference: *const EntityReference,
+            ) EcsError!u32 {
+                const row_count: usize = self.refs.items.len;
+                for (self.cols()) |*col| {
+                    try col.appendUndefined(allocator, row_count);
+                }
+                try self.refs.append(allocator, reference.*);
+                const idx: u32 = @intCast(self.refs.items.len - 1);
+                try self.ensureEnabledCapacity(allocator, self.refs.items.len);
+                self.appendEnabledBits(idx);
+                Ecs.entity_row.items[reference.id] = idx;
+                return idx;
+            }
+            /// Removes rows marked dead in the batch stamp set, preserving
+            /// relative order (depth tiling survives removal, so zones need
+            /// only a linear retiling instead of a full consolidate sort),
+            /// then retiles the zones. Skipped rows cost one stamp load each;
+            /// moved rows cost one row memcpy per column.
+            /// - `self` - storage to compact.
+            /// - `allocator` - funds zone-list growth.
+            /// - `epoch` - mark epoch in `Ecs.batch_stamps`; rows whose entity
+            ///   id carries it are dropped.
+            fn compactRemoveDead(
+                self: *Self,
+                allocator: std.mem.Allocator,
+                epoch: u32,
+            ) EcsError!void {
+                const stamps = Ecs.batch_stamps.items;
+                // Snapshot enabled bits: rows are compacted below, so the
+                // bitmap travels with the references into a dense prefix.
+                const old_entity = try allocator.dupe(u64, self.entity_enabled.items);
+                defer allocator.free(old_entity);
+                var old_comps: [MAX_COLS][]u64 = undefined;
+                for (0..self.len) |ci| {
+                    old_comps[ci] = try allocator.dupe(u64, self.comp_enabled[ci].items);
+                }
+                defer for (0..self.len) |ci| allocator.free(old_comps[ci]);
+                var w: usize = 0;
+                const n = self.refs.items.len;
+                var i: usize = 0;
+                var new_entity_count: u32 = 0;
+                var new_comp_counts: [MAX_COLS]u32 = [_]u32{0} ** MAX_COLS;
+                while (i < n) : (i += 1) {
+                    if (stamps[self.refs.items[i].id] == epoch) {
+                        continue;
+                    }
+                    if (w != i) {
+                        for (self.cols()) |*col| {
+                            if (col.elem_size == 0) {
+                                continue;
+                            }
+                            const es = col.elem_size;
+                            @memcpy(
+                                col.bytes.ptr[w * es ..][0..es],
+                                col.bytes.ptr[i * es ..][0..es],
+                            );
+                        }
+                        self.refs.items[w] = self.refs.items[i];
+                    }
+                    const wi: u32 = @intCast(w);
+                    const ii: u32 = @intCast(i);
+                    const ev = enabledBitGet(old_entity, ii);
+                    enabledBitSetRaw(self.entity_enabled.items, wi, ev);
+                    if (ev) {
+                        new_entity_count += 1;
+                    }
+                    for (0..self.len) |ci| {
+                        const cv = enabledBitGet(old_comps[ci], ii);
+                        enabledBitSetRaw(self.comp_enabled[ci].items, wi, cv);
+                        if (cv) {
+                            new_comp_counts[ci] += 1;
+                        }
+                    }
+                    Ecs.entity_row.items[self.refs.items[w].id] = @intCast(w);
+                    w += 1;
+                }
+                self.entity_enabled_count = new_entity_count;
+                for (0..self.len) |ci| {
+                    self.comp_enabled_counts[ci] = new_comp_counts[ci];
+                }
+                // Clear stale tail bits, then shrink word lists to the dense size.
+                const need_words = enabledWordsNeeded(w);
+                if (self.entity_enabled.items.len > need_words) {
+                    self.entity_enabled.items.len = need_words;
+                } else {
+                    var t: usize = w;
+                    while (t < n) : (t += 1) {
+                        enabledBitSetRaw(self.entity_enabled.items, @intCast(t), false);
+                    }
+                }
+                for (0..self.len) |ci| {
+                    if (self.comp_enabled[ci].items.len > need_words) {
+                        self.comp_enabled[ci].items.len = need_words;
+                    } else {
+                        var t: usize = w;
+                        while (t < n) : (t += 1) {
+                            enabledBitSetRaw(self.comp_enabled[ci].items, @intCast(t), false);
+                        }
+                    }
+                }
+                for (self.cols()) |*col| {
+                    if (col.elem_size == 0) {
+                        continue;
+                    }
+                    col.bytes = col.bytes.ptr[0 .. w * col.elem_size];
+                }
+                self.refs.items.len = w;
+                try self.retileZones(allocator);
+            }
+            /// Rebuilds `depth_zones` and `entity_row` with a single linear
+            /// scan. Valid only when rows are already grouped by depth
+            /// (order-preserving removal on tiled input, bulk appends of one
+            /// depth): unlike `consolidateZones` no sorting is needed.
+            /// - `self` - storage to retile.
+            /// - `allocator` - funds zone-list growth.
+            fn retileZones(self: *Self, allocator: std.mem.Allocator) EcsError!void {
+                self.depth_zones.clearRetainingCapacity();
+                const n = self.refs.items.len;
+                var i: usize = 0;
+                while (i < n) {
+                    const depth = Ecs.entity_depth.items[self.refs.items[i].id];
+                    var j: usize = i + 1;
+                    while (j < n and Ecs.entity_depth.items[self.refs.items[j].id] == depth) : (j += 1) {}
+                    try self.depth_zones.append(allocator, .{
+                        .depth = depth,
+                        .offset = @intCast(i),
+                        .len = @intCast(j - i),
+                    });
+                    for (i..j) |pos| {
+                        Ecs.entity_row.items[self.refs.items[pos].id] = @intCast(pos);
+                    }
+                    i = j;
+                }
+            }
+            /// Removes one row without touching depth zones: the last row
+            /// travels into the gap and only the moved row's `entity_row` is
+            /// repaired. The caller owns zone maintenance.
+            /// - `self` - storage to mutate.
+            /// - `index` - row position to remove.
+            fn swapRemoveRaw(self: *Self, index: u32) void {
+                const last: usize = self.refs.items.len - 1;
+                if (index != last) {
+                    for (self.cols()) |*col| {
+                        if (col.elem_size == 0) {
+                            continue;
+                        }
+                        const es = col.elem_size;
+                        @memcpy(
+                            col.bytes.ptr[index * es ..][0..es],
+                            col.bytes.ptr[last * es ..][0..es],
+                        );
+                    }
+                    self.refs.items[index] = self.refs.items[last];
+                    Ecs.entity_row.items[self.refs.items[index].id] = index;
+                    const last_u32: u32 = @intCast(last);
+                    moveEnabledBit(self.entity_enabled.items, &self.entity_enabled_count, last_u32, index);
+                    for (0..self.len) |ci| {
+                        moveEnabledBit(self.comp_enabled[ci].items, &self.comp_enabled_counts[ci], last_u32, index);
+                    }
+                }
+                const row_count: usize = self.refs.items.len;
+                for (self.cols()) |*col| {
+                    col.popRow(row_count);
+                }
+                self.popEnabledBits(row_count);
+                _ = self.refs.pop();
             }
             /// Appends a row and places it into the zone matching
             /// `depth`, keeping every zone contiguous and ordered.
@@ -1588,7 +2587,9 @@ pub fn ECS(comptime sets: anytype) type {
                     try col.appendUndefined(allocator, row_count);
                 }
                 try self.refs.append(allocator, reference.*);
+                try self.ensureEnabledCapacity(allocator, self.refs.items.len);
                 const n: u32 = @intCast(self.refs.items.len - 1);
+                self.appendEnabledBits(n);
                 const idx = self.zoneInsertionIndex(depth);
                 const has_zone = idx < self.depth_zones.items.len and
                     self.depth_zones.items[idx].depth == depth;
@@ -1654,6 +2655,34 @@ pub fn ECS(comptime sets: anytype) type {
                         }
                         refs[self.depth_zones.items[start].offset] = tmp_ref;
                     }
+                    {
+                        // Same rotation for every enabled bitmap: the fresh
+                        // (enabled) bit travels to the zone tail, boundary
+                        // bits shift down. Pure permutation, counts unchanged.
+                        const last_off: u32 = self.depth_zones.items[start + m - 1].offset;
+                        const first_off: u32 = self.depth_zones.items[start].offset;
+                        const tmp_e = enabledBitGet(self.entity_enabled.items, n);
+                        enabledBitSetRaw(self.entity_enabled.items, n, enabledBitGet(self.entity_enabled.items, last_off));
+                        var k: usize = m;
+                        while (k > 1) : (k -= 1) {
+                            const dst: u32 = self.depth_zones.items[start + k - 1].offset;
+                            const src: u32 = self.depth_zones.items[start + k - 2].offset;
+                            enabledBitSetRaw(self.entity_enabled.items, dst, enabledBitGet(self.entity_enabled.items, src));
+                        }
+                        enabledBitSetRaw(self.entity_enabled.items, first_off, tmp_e);
+                        for (0..self.len) |ci| {
+                            const words = self.comp_enabled[ci].items;
+                            const tmp_c = enabledBitGet(words, n);
+                            enabledBitSetRaw(words, n, enabledBitGet(words, last_off));
+                            var kk: usize = m;
+                            while (kk > 1) : (kk -= 1) {
+                                const dst: u32 = self.depth_zones.items[start + kk - 1].offset;
+                                const src: u32 = self.depth_zones.items[start + kk - 2].offset;
+                                enabledBitSetRaw(words, dst, enabledBitGet(words, src));
+                            }
+                            enabledBitSetRaw(words, first_off, tmp_c);
+                        }
+                    }
                     for (0..m + 1) |i| {
                         const pos: u32 = if (i == 0)
                             n
@@ -1693,6 +2722,13 @@ pub fn ECS(comptime sets: anytype) type {
                 const zone = self.depth_zones.items[zi];
                 const e_d: u32 = zone.offset + zone.len - 1;
                 const m: usize = self.depth_zones.items.len - 1 - zi;
+                const old_n: usize = self.refs.items.len;
+                const old_last: u32 = @intCast(old_n - 1);
+                const last_entity_bit = enabledBitGet(self.entity_enabled.items, old_last);
+                var last_comp_bits: [MAX_COLS]bool = [_]bool{false} ** MAX_COLS;
+                for (0..self.len) |ci| {
+                    last_comp_bits[ci] = enabledBitGet(self.comp_enabled[ci].items, old_last);
+                }
                 for (self.cols()) |*col| {
                     if (col.elem_size == 0) {
                         continue;
@@ -1707,6 +2743,12 @@ pub fn ECS(comptime sets: anytype) type {
                     );
                 }
                 self.refs.items[index] = self.refs.items[e_d];
+                if (index != e_d) {
+                    moveEnabledBit(self.entity_enabled.items, &self.entity_enabled_count, e_d, index);
+                    for (0..self.len) |ci| {
+                        moveEnabledBit(self.comp_enabled[ci].items, &self.comp_enabled_counts[ci], e_d, index);
+                    }
+                }
                 Ecs.entity_row.items[self.refs.items[index].id] = index;
                 if (m > 0) {
                     var i: usize = 1;
@@ -1729,6 +2771,10 @@ pub fn ECS(comptime sets: anytype) type {
                             );
                         }
                         self.refs.items[dst] = self.refs.items[src];
+                        moveEnabledBit(self.entity_enabled.items, &self.entity_enabled_count, src, dst);
+                        for (0..self.len) |ci| {
+                            moveEnabledBit(self.comp_enabled[ci].items, &self.comp_enabled_counts[ci], src, dst);
+                        }
                     }
                     var j: usize = 0;
                     while (j < m) : (j += 1) {
@@ -1740,9 +2786,32 @@ pub fn ECS(comptime sets: anytype) type {
                         Ecs.entity_row.items[self.refs.items[pos].id] = pos;
                     }
                 }
+                // Truncation drops the old tail bit (already duplicated down
+                // the cascade when deeper zones exist).
+                if (last_entity_bit) {
+                    self.entity_enabled_count -= 1;
+                }
+                for (0..self.len) |ci| {
+                    if (last_comp_bits[ci]) {
+                        self.comp_enabled_counts[ci] -= 1;
+                    }
+                }
                 const row_count: usize = self.refs.items.len;
                 for (self.cols()) |*col| {
                     col.popRow(row_count);
+                }
+                const need_words = enabledWordsNeeded(row_count - 1);
+                if (self.entity_enabled.items.len > need_words) {
+                    self.entity_enabled.items.len = need_words;
+                } else if (self.entity_enabled.items.len > 0) {
+                    enabledBitSetRaw(self.entity_enabled.items, old_last, false);
+                }
+                for (0..self.len) |ci| {
+                    if (self.comp_enabled[ci].items.len > need_words) {
+                        self.comp_enabled[ci].items.len = need_words;
+                    } else if (self.comp_enabled[ci].items.len > 0) {
+                        enabledBitSetRaw(self.comp_enabled[ci].items, old_last, false);
+                    }
                 }
                 _ = self.refs.pop();
                 self.depth_zones.items[zi].len -= 1;
@@ -1778,23 +2847,74 @@ pub fn ECS(comptime sets: anytype) type {
                     self.depth_zones.clearRetainingCapacity();
                     return;
                 }
-                try perm_scratch.resize(allocator, n);
-                for (0..n) |i| {
-                    perm_scratch.items[i] = @intCast(i);
-                }
-                const Ctx = struct {
-                    depths: []const u32,
-                    refs: []const EntityReference,
-                    fn lessThan(ctx: @This(), a: u32, b: u32) bool {
-                        const da = ctx.depths[ctx.refs[a].id];
-                        const db = ctx.depths[ctx.refs[b].id];
-                        return da < db or (da == db and a < b);
+                // One scan for the depth range. Uniform input needs no data
+                // movement at all: a single zone covers every row (entity_row
+                // is maintained by the raw bulk moves of every caller).
+                var min_d: u32 = Ecs.entity_depth.items[self.refs.items[0].id];
+                var max_d: u32 = min_d;
+                for (self.refs.items[1..]) |ref| {
+                    const d: u32 = Ecs.entity_depth.items[ref.id];
+                    if (d < min_d) {
+                        min_d = d;
+                    } else if (d > max_d) {
+                        max_d = d;
                     }
-                };
-                std.mem.sort(u32, perm_scratch.items, Ctx{
-                    .depths = Ecs.entity_depth.items,
-                    .refs = self.refs.items,
-                }, Ctx.lessThan);
+                }
+                if (min_d == max_d) {
+                    self.depth_zones.clearRetainingCapacity();
+                    try self.depth_zones.append(allocator, .{
+                        .depth = min_d,
+                        .offset = 0,
+                        .len = @intCast(n),
+                    });
+                    for (0..n) |pos| {
+                        Ecs.entity_row.items[self.refs.items[pos].id] = @intCast(pos);
+                    }
+                    return;
+                }
+                try perm_scratch.resize(allocator, n);
+                const span: usize = @as(usize, max_d) - @as(usize, min_d) + 1;
+                if (span > 4 * n) {
+                    // Sparse depths: comparison sort wins over a giant table.
+                    for (0..n) |i| {
+                        perm_scratch.items[i] = @intCast(i);
+                    }
+                    const Ctx = struct {
+                        depths: []const u32,
+                        refs: []const EntityReference,
+                        fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                            const da = ctx.depths[ctx.refs[a].id];
+                            const db = ctx.depths[ctx.refs[b].id];
+                            return da < db or (da == db and a < b);
+                        }
+                    };
+                    std.mem.sort(u32, perm_scratch.items, Ctx{
+                        .depths = Ecs.entity_depth.items,
+                        .refs = self.refs.items,
+                    }, Ctx.lessThan);
+                } else {
+                    // Dense depths: stable counting sort, O(n + span), with
+                    // the identical output permutation (ascending depth,
+                    // ascending old index) the comparator above produces.
+                    const counts = &Ecs.zone_scratch_counts;
+                    counts.clearRetainingCapacity();
+                    try counts.appendNTimes(allocator, 0, span);
+                    const slots = counts.items;
+                    for (self.refs.items) |ref| {
+                        slots[Ecs.entity_depth.items[ref.id] - min_d] += 1;
+                    }
+                    var acc: u32 = 0;
+                    for (slots) |*s| {
+                        const c: u32 = s.*;
+                        s.* = acc;
+                        acc += c;
+                    }
+                    for (self.refs.items, 0..) |ref, i| {
+                        const d: usize = Ecs.entity_depth.items[ref.id] - min_d;
+                        perm_scratch.items[slots[d]] = @intCast(i);
+                        slots[d] += 1;
+                    }
+                }
                 try visited_scratch.resize(allocator, n);
                 @memset(visited_scratch.items[0..n], 0);
                 const perm = perm_scratch.items;
@@ -1866,6 +2986,68 @@ pub fn ECS(comptime sets: anytype) type {
                         }
                     }
                 }
+                {
+                    // Same permutation for every enabled bitmap:
+                    // new_bits[j] = old_bits[perm[j]]. Cycle rotation keeps
+                    // cached counts valid (pure permutation).
+                    const words_needed = enabledWordsNeeded(n);
+                    const bit_tmp = try allocator.alloc(u64, words_needed);
+                    defer allocator.free(bit_tmp);
+                    @memcpy(bit_tmp, self.entity_enabled.items[0..words_needed]);
+                    @memset(visited[0..n], 0);
+                    for (0..n) |start| {
+                        if (visited[start] != 0) {
+                            continue;
+                        }
+                        const tmp_b = enabledBitGet(bit_tmp, @intCast(start));
+                        var j: usize = start;
+                        while (true) {
+                            const next: usize = perm[j];
+                            if (next == start) {
+                                enabledBitSetRaw(self.entity_enabled.items, @intCast(j), tmp_b);
+                                break;
+                            }
+                            enabledBitSetRaw(self.entity_enabled.items, @intCast(j), enabledBitGet(bit_tmp, @intCast(next)));
+                            j = next;
+                        }
+                        var mark: usize = start;
+                        while (true) {
+                            visited[mark] = 1;
+                            mark = perm[mark];
+                            if (mark == start) {
+                                break;
+                            }
+                        }
+                    }
+                    for (0..self.len) |ci| {
+                        @memcpy(bit_tmp, self.comp_enabled[ci].items[0..words_needed]);
+                        @memset(visited[0..n], 0);
+                        for (0..n) |start| {
+                            if (visited[start] != 0) {
+                                continue;
+                            }
+                            const tmp_b = enabledBitGet(bit_tmp, @intCast(start));
+                            var j: usize = start;
+                            while (true) {
+                                const next: usize = perm[j];
+                                if (next == start) {
+                                    enabledBitSetRaw(self.comp_enabled[ci].items, @intCast(j), tmp_b);
+                                    break;
+                                }
+                                enabledBitSetRaw(self.comp_enabled[ci].items, @intCast(j), enabledBitGet(bit_tmp, @intCast(next)));
+                                j = next;
+                            }
+                            var mark: usize = start;
+                            while (true) {
+                                visited[mark] = 1;
+                                mark = perm[mark];
+                                if (mark == start) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 self.depth_zones.clearRetainingCapacity();
                 var i: usize = 0;
                 while (i < n) {
@@ -1898,6 +3080,14 @@ pub fn ECS(comptime sets: anytype) type {
                 self.refs = .empty;
                 self.depth_zones.deinit(allocator);
                 self.depth_zones = .empty;
+                self.entity_enabled.deinit(allocator);
+                self.entity_enabled = .empty;
+                self.entity_enabled_count = 0;
+                for (0..MAX_COLS) |ci| {
+                    self.comp_enabled[ci].deinit(allocator);
+                    self.comp_enabled[ci] = .empty;
+                    self.comp_enabled_counts[ci] = 0;
+                }
             }
         };
         /// Every archetype storage. Homogeneous array: the comptime
@@ -1988,6 +3178,39 @@ pub fn ECS(comptime sets: anytype) type {
         var zone_scratch_perm: std.ArrayListUnmanaged(u32) = .empty;
         /// Reusable scratch for depth-zone consolidation (visited marks).
         var zone_scratch_visited: std.ArrayListUnmanaged(u8) = .empty;
+        /// Reusable scratch for `consolidateZones` counting sort (per-depth
+        /// counters, sized to the depth span on demand).
+        var zone_scratch_counts: std.ArrayListUnmanaged(u32) = .empty;
+        /// Reusable scratch for batch member id lists (`destroyBatch` order,
+        /// `migrateBatch` valid set, `reparentBatch` traversal). Retained
+        /// across batches; every use starts by clearing.
+        var batch_ids: std.ArrayListUnmanaged(u32) = .empty;
+        /// Reusable scratch for batch member-mark stamps. Compared against
+        /// `batch_stamp_epoch` instead of memsetting: no O(slots) clearing
+        /// per batch. Sized to max(slots, archetypes) on demand.
+        var batch_stamps: std.ArrayListUnmanaged(u32) = .empty;
+        /// Current mark epoch for `batch_stamps`. Bumped once per batch use;
+        /// zero is reserved for "unmarked" and never issued.
+        var batch_stamp_epoch: u32 = 1;
+        /// Reusable scratch for batch per-archetype counters, sized to
+        /// `archetype_count`. Zeroed at the start of every use.
+        var batch_counts: std.ArrayListUnmanaged(u32) = .empty;
+        /// Reusable scratch for batch distinct-archetype lists
+        /// (`migrateBatch` sources, `reparentBatch` touched).
+        var batch_archs: std.ArrayListUnmanaged(u32) = .empty;
+        /// One deferred depth move: member id plus its pre-move depth, for
+        /// the `DepthUpdate` filing pass of `reparentBatch` (filing runs
+        /// after all depths are final, with exact per-arch reservations).
+        const DepthMove = struct {
+            id: u32,
+            old_depth: u32,
+        };
+        /// Reusable scratch for deferred depth moves, in member order.
+        var batch_moves: std.ArrayListUnmanaged(DepthMove) = .empty;
+        /// Reusable scratch for segment end offsets (`destroyBatch`
+        /// per-root segments) and victim row lists. Sequential reuse:
+        /// segments are consumed before row collection starts.
+        var batch_bounds: std.ArrayListUnmanaged(u32) = .empty;
         /// Stack of freed entity ids ready for reuse.
         var free_ids: std.ArrayListUnmanaged(u32) = .empty;
         /// Counts entity slots.
@@ -2293,6 +3516,184 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.setEntityState(id, .{});
             try Ecs.free_ids.append(allocator, id);
         }
+        /// Destroys many entities and their subtrees in bulk. Semantically
+        /// identical to executing compatible `destroy` commands in slice
+        /// order (same stale-resolution, same lifecycle records in the same
+        /// per-subtree leaves-first order), but structured in passes: one
+        /// union traversal, one purge pass, one filing plus teardown pass,
+        /// and one zone-agnostic storage pass per touched archetype (order
+        /// preserving compact plus linear retiling, or plain `removeRow`
+        /// for a handful of victims) instead of one full cascade per node.
+        /// - `allocator` - funds the traversal buffer.
+        /// - `refs` - batch members in caller order; stale entries resolve
+        ///   exactly like singles (same-generation dead roots clear their
+        ///   pending flag, recycled slots are ignored).
+        fn destroyBatch(allocator: std.mem.Allocator, refs: []const EntityReference) EcsError!void {
+            @setEvalBranchQuota(10_000_000);
+            if (refs.len == 0) {
+                return;
+            }
+            if (refs.len == 1) {
+                // Fast path: single childless destroy is one row removal
+                // with zero traversal buffers (the old single-command path).
+                const ref = refs[0];
+                if (ref.isAlive()) {
+                    if (Ecs.entity_first_child.items[ref.id] == NO_ENTITY) {
+                        try Ecs.destroyNode(ref.id, allocator);
+                        return;
+                    }
+                } else if (ref.id < Ecs.entity_generation.items.len and
+                    Ecs.entity_generation.items[ref.id] == ref.gen)
+                {
+                    Ecs.clearPending(ref.id);
+                    return;
+                }
+            }
+            const order = &Ecs.batch_ids;
+            order.clearRetainingCapacity();
+            try order.ensureTotalCapacity(allocator, refs.len);
+            // Mark epoch for this batch: stamp comparison replaces the old
+            // O(slots) zeroed `visited` array (see `batch_stamps` docs). A
+            // second epoch below marks the dead set for compaction.
+            Ecs.batch_stamp_epoch +%= 1;
+            if (Ecs.batch_stamp_epoch == 0) {
+                @memset(Ecs.batch_stamps.items, 0);
+                Ecs.batch_stamp_epoch = 1;
+            }
+            const epoch = Ecs.batch_stamp_epoch;
+            const need: usize = @max(Ecs.entity_generation.items.len, Ecs.archetype_count);
+            if (Ecs.batch_stamps.items.len < need) {
+                try Ecs.batch_stamps.appendNTimes(allocator, 0, need - Ecs.batch_stamps.items.len);
+            }
+            const stamps = Ecs.batch_stamps.items;
+            const bounds = &Ecs.batch_bounds;
+            bounds.clearRetainingCapacity();
+            const counts = &Ecs.batch_counts;
+            counts.clearRetainingCapacity();
+            try counts.appendNTimes(allocator, 0, Ecs.archetype_count);
+            const count_items = counts.items;
+            const touched = &Ecs.batch_archs;
+            touched.clearRetainingCapacity();
+            // Pass 1: union of subtrees plus per-arch tally. Segments stay
+            // in root order for the filing pass below.
+            for (refs) |ref| {
+                if (!ref.isAlive()) {
+                    if (ref.id < Ecs.entity_generation.items.len and
+                        Ecs.entity_generation.items[ref.id] == ref.gen)
+                    {
+                        Ecs.clearPending(ref.id);
+                    }
+                    continue;
+                }
+                if (stamps[ref.id] == epoch) {
+                    continue;
+                }
+                try order.append(allocator, ref.id);
+                stamps[ref.id] = epoch;
+                var h: usize = order.items.len - 1;
+                while (h < order.items.len) : (h += 1) {
+                    var child = Ecs.entity_first_child.items[order.items[h]];
+                    while (child != NO_ENTITY) : (child = Ecs.entity_next_sibling.items[child]) {
+                        if (stamps[child] != epoch) {
+                            stamps[child] = epoch;
+                            try order.append(allocator, child);
+                        }
+                    }
+                }
+                try bounds.append(allocator, @intCast(order.items.len));
+            }
+            for (order.items) |id| {
+                const arch = Ecs.entity_archetype.items[id];
+                if (count_items[arch] == 0) {
+                    try touched.append(allocator, arch);
+                }
+                count_items[arch] += 1;
+            }
+            try Ecs.free_ids.ensureTotalCapacity(allocator, Ecs.free_ids.items.len + order.items.len);
+            const DestroyStore = Ecs.EventStore(Destroy);
+            try DestroyStore.ensureRegistered(allocator);
+            var file_cursor = DestroyStore.FileCursor{};
+            // Pass 2: purge event/attribute rows of the whole dead set at
+            // once (fully-dead pages drop wholesale); generations are still
+            // pre-bump, so the live-generation match holds.
+            try Ecs.notifyEventPurgeMany(epoch, allocator);
+            try Ecs.notifyAttributePurgeMany(epoch, allocator);
+            // Pass 3: file plus teardown, per segment leaves-first (matches
+            // sequential execution order).
+            var seg_start: usize = 0;
+            for (bounds.items) |seg_end| {
+                var k: usize = seg_end;
+                while (k > seg_start) {
+                    k -= 1;
+                    const id = order.items[k];
+                    const arch = Ecs.entity_archetype.items[id];
+                    const dead = EntityReference{ .id = @intCast(id), .gen = Ecs.entity_generation.items[id] };
+                    if (file_cursor.arch != arch) {
+                        file_cursor.arch = arch;
+                        file_cursor.pi = try DestroyStore.reserveFile(allocator, arch, count_items[arch]);
+                    }
+                    try DestroyStore.appendAssumed(allocator, file_cursor.pi, dead, .{ .archetype = arch });
+                    Ecs.unlinkFromParent(id);
+                    Ecs.entity_parent.items[id] = NO_ENTITY;
+                    Ecs.entity_first_child.items[id] = NO_ENTITY;
+                    Ecs.entity_next_sibling.items[id] = NO_ENTITY;
+                    Ecs.entity_prev_sibling.items[id] = NO_ENTITY;
+                    Ecs.entity_last_child.items[id] = NO_ENTITY;
+                    Ecs.entity_depth.items[id] = 0;
+                    Ecs.entity_pending_parent.items[id] = NO_ENTITY;
+                    Ecs.entity_generation.items[id] +%= 1;
+                    Ecs.setEntityState(id, .{});
+                    Ecs.free_ids.appendAssumeCapacity(id);
+                }
+                seg_start = seg_end;
+            }
+            // Pass 4: bulk storage removal per touched archetype. A handful
+            // of victims keeps the exact `removeRow` cascade; larger kills
+            // compact stably (tiling survives) plus linear retiling, which
+            // beats both the cascade and a full consolidate sort. Dead rows
+            // are collected into the reused bounds buffer (segments done).
+            Ecs.batch_stamp_epoch +%= 1;
+            if (Ecs.batch_stamp_epoch == 0) {
+                @memset(Ecs.batch_stamps.items, 0);
+                Ecs.batch_stamp_epoch = 1;
+            }
+            const dead_epoch = Ecs.batch_stamp_epoch;
+            for (order.items) |id| {
+                stamps[id] = dead_epoch;
+            }
+            const rows = bounds;
+            rows.clearRetainingCapacity();
+            for (touched.items) |arch| {
+                const st = &Ecs.storages[arch];
+                const live_rows: usize = st.refs.items.len;
+                const dead_here: usize = count_items[arch];
+                if (dead_here * 32 < live_rows and touched.items.len <= 32) {
+                    rows.clearRetainingCapacity();
+                    for (order.items) |id| {
+                        if (Ecs.entity_archetype.items[id] == arch) {
+                            try rows.append(allocator, Ecs.entity_row.items[id]);
+                        }
+                    }
+                    const Desc = struct {
+                        fn lt(_: void, a: u32, b: u32) bool {
+                            return a > b;
+                        }
+                    };
+                    std.mem.sort(u32, rows.items, {}, Desc.lt);
+                    for (rows.items) |r| {
+                        st.removeRow(r);
+                    }
+                    if (st.count() == 0) {
+                        Ecs.clearArchetypeNonEmpty(arch);
+                    }
+                } else {
+                    try st.compactRemoveDead(allocator, dead_epoch);
+                    if (st.count() == 0) {
+                        Ecs.clearArchetypeNonEmpty(arch);
+                    }
+                }
+            }
+        }
         /// Names the storage type of one archetype id. All archetypes share
         /// the homogeneous `ArchetypeStorage` type.
         /// - `id` - archetype id. Must be comptime-known.
@@ -2439,6 +3840,261 @@ pub fn ECS(comptime sets: anytype) type {
             std.debug.assert(column.elem_size == @sizeOf(T));
             const typed: [*]T = @ptrCast(@alignCast(column.bytes.ptr));
             return &typed[index];
+        }
+        /// Migrates many entities into one archetype in bulk. Semantically
+        /// identical to executing compatible `migrate` commands in slice
+        /// order (same stale-resolution, same shared-copy values, same
+        /// `Migrate` records, same attribute/event relocation and pending
+        /// rebase), but rows travel via zone-agnostic raw moves with one
+        /// `consolidateZones` per touched storage instead of one zone
+        /// cascade per entity, and the shared-column map per
+        /// `(src, dest)` pair is computed once instead of one binary search
+        /// per column per row.
+        /// - `allocator` - funds traversal buffers and growth.
+        /// - `refs` - batch members in caller order.
+        /// - `dest_id` - destination archetype id.
+        /// - `copy` - when true, shared component values are carried over.
+        fn migrateBatch(
+            allocator: std.mem.Allocator,
+            refs: []const EntityReference,
+            dest_id: u32,
+            copy: bool,
+        ) EcsError!void {
+            @setEvalBranchQuota(10_000_000);
+            if (refs.len == 0) {
+                return;
+            }
+            if (refs.len == 1) {
+                // Fast path: the old single-migrate path, with zero batch
+                // buffers (no filter lists, no counts, no consolidate).
+                const ref = refs[0];
+                if (ref.isAlive()) {
+                    _ = try ref.migrateById(allocator, dest_id, copy);
+                    Ecs.rebaseAttributePending(ref.id, ref.gen, Ecs.entity_generation.items[ref.id]);
+                    return;
+                } else if (ref.id < Ecs.entity_generation.items.len and
+                    Ecs.entity_generation.items[ref.id] == ref.gen)
+                {
+                    Ecs.clearPending(ref.id);
+                    return;
+                }
+                return;
+            }
+            // 1. Filter live members in order; stale resolve like singles.
+            const valid = &Ecs.batch_ids;
+            valid.clearRetainingCapacity();
+            try valid.ensureTotalCapacity(allocator, refs.len);
+            for (refs) |ref| {
+                if (!ref.isAlive()) {
+                    if (ref.id < Ecs.entity_generation.items.len and
+                        Ecs.entity_generation.items[ref.id] == ref.gen)
+                    {
+                        Ecs.clearPending(ref.id);
+                    }
+                    continue;
+                }
+                valid.appendAssumeCapacity(ref.id);
+            }
+            if (valid.items.len == 0) {
+                return;
+            }
+            // 2. Distinct source archetypes in first-seen order.
+            const src_seen = &Ecs.batch_archs;
+            src_seen.clearRetainingCapacity();
+            const counts = &Ecs.batch_counts;
+            counts.clearRetainingCapacity();
+            try counts.appendNTimes(allocator, 0, Ecs.archetype_count);
+            const count_items = counts.items;
+            for (valid.items) |id| {
+                const src = Ecs.entity_archetype.items[id];
+                if (count_items[src] == 0) {
+                    try src_seen.append(allocator, src);
+                }
+                count_items[src] += 1;
+            }
+            // 3. Reserve the destination once for the whole batch.
+            const dest_before: usize = Ecs.storages[dest_id].refs.items.len;
+            {
+                const dst = &Ecs.storages[dest_id];
+                const need: usize = dst.refs.items.len + valid.items.len;
+                for (dst.cols()) |*col| {
+                    try col.ensureRowCapacity(allocator, need);
+                }
+                try dst.refs.ensureTotalCapacity(allocator, need);
+                try dst.ensureEnabledCapacity(allocator, need);
+            }
+            // Lifecycle filing for the whole batch lands on one page:
+            // register once, resolve and reserve once, append per member.
+            const MigrateStore = Ecs.EventStore(Migrate);
+            try MigrateStore.ensureRegistered(allocator);
+            const migrate_pi = try MigrateStore.reserveFile(allocator, dest_id, valid.items.len);
+            // 4. Shared-column maps per source, memoized in retained
+            // scratch (see `SharedMemo`): no per-row search, no allocation.
+            const memos = &Ecs.batch_memos;
+            memos.clearRetainingCapacity();
+            // 5. Move every member in order via raw storage ops. Depths are
+            // preserved by migrate, so track uniformity for the fast path.
+            var first_depth: u32 = 0;
+            var uniform_depth: bool = true;
+            var seen_depth: bool = false;
+            for (valid.items) |id| {
+                const gen: u8 = Ecs.entity_generation.items[id];
+                const depth: u32 = Ecs.entity_depth.items[id];
+                if (!seen_depth) {
+                    first_depth = depth;
+                    seen_depth = true;
+                } else if (depth != first_depth) {
+                    uniform_depth = false;
+                }
+                const src_id: u32 = Ecs.entity_archetype.items[id];
+                const src_row: u32 = Ecs.entity_row.items[id];
+                const next_gen: u8 = gen +% 1;
+                const next = EntityReference{ .id = @intCast(id), .gen = next_gen };
+                try Ecs.notifyEventEntityMigrated(id, src_id, dest_id, next_gen, allocator);
+                try Ecs.notifyAttributeMigrated(id, src_id, dest_id, next_gen, allocator);
+                // Snapshot enabled flags before the raw moves: the entity flag
+                // always travels, shared component flags travel with `copy`.
+                const src_entity_bit = ArchetypeStorage.enabledBitGet(Ecs.storages[src_id].entity_enabled.items, src_row);
+                var src_comp_bits: [MAX_COLS]bool = [_]bool{true} ** MAX_COLS;
+                {
+                    const src_st = &Ecs.storages[src_id];
+                    const limit = @min(src_st.len, MAX_COLS);
+                    for (0..limit) |ci| {
+                        src_comp_bits[ci] = ArchetypeStorage.enabledBitGet(src_st.comp_enabled[ci].items, src_row);
+                    }
+                }
+                const dst_index: u32 = try Ecs.storages[dest_id].appendRaw(allocator, &next);
+                {
+                    const dst = &Ecs.storages[dest_id];
+                    if (ArchetypeStorage.enabledBitGet(dst.entity_enabled.items, dst_index) != src_entity_bit) {
+                        ArchetypeStorage.enabledBitSetRaw(dst.entity_enabled.items, dst_index, src_entity_bit);
+                        if (src_entity_bit) {
+                            dst.entity_enabled_count += 1;
+                        } else {
+                            dst.entity_enabled_count -= 1;
+                        }
+                    }
+                    if (copy) {
+                        if (src_id == dest_id) {
+                            for (0..dst.len) |ci| {
+                                const want = src_comp_bits[ci];
+                                if (ArchetypeStorage.enabledBitGet(dst.comp_enabled[ci].items, dst_index) != want) {
+                                    ArchetypeStorage.enabledBitSetRaw(dst.comp_enabled[ci].items, dst_index, want);
+                                    if (want) {
+                                        dst.comp_enabled_counts[ci] += 1;
+                                    } else {
+                                        dst.comp_enabled_counts[ci] -= 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            const src_ids = Ecs.archetypes[src_id].component_ids;
+                            for (0..dst.len) |di| {
+                                const scol_idx = Ecs.binarySearchIds(src_ids, dst.columns[di].comp_id) orelse continue;
+                                const want = src_comp_bits[scol_idx];
+                                if (ArchetypeStorage.enabledBitGet(dst.comp_enabled[di].items, dst_index) != want) {
+                                    ArchetypeStorage.enabledBitSetRaw(dst.comp_enabled[di].items, dst_index, want);
+                                    if (want) {
+                                        dst.comp_enabled_counts[di] += 1;
+                                    } else {
+                                        dst.comp_enabled_counts[di] -= 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (copy) {
+                    var memo_idx: ?usize = null;
+                    for (memos.items, 0..) |memo, mi| {
+                        if (memo.src == src_id) {
+                            memo_idx = mi;
+                            break;
+                        }
+                    }
+                    if (memo_idx == null) {
+                        var memo = SharedMemo{ .src = src_id };
+                        const dst = &Ecs.storages[dest_id];
+                        const src_ids = Ecs.archetypes[src_id].component_ids;
+                        for (dst.cols(), 0..) |*dcol, di| {
+                            if (dcol.elem_size == 0) {
+                                continue;
+                            }
+                            const scol_idx = Ecs.binarySearchIds(src_ids, dcol.comp_id) orelse continue;
+                            memo.shared[memo.len] = .{
+                                .scol = @intCast(scol_idx),
+                                .dcol = @intCast(di),
+                                .es = dcol.elem_size,
+                            };
+                            memo.len += 1;
+                        }
+                        try memos.append(allocator, memo);
+                        memo_idx = memos.items.len - 1;
+                    }
+                    const memo = &memos.items[memo_idx.?];
+                    const dst = &Ecs.storages[dest_id];
+                    const src = &Ecs.storages[src_id];
+                    for (memo.shared[0..memo.len]) |pair| {
+                        @memcpy(
+                            dst.columns[pair.dcol].bytes.ptr[dst_index * pair.es ..][0..pair.es],
+                            src.columns[pair.scol].bytes.ptr[src_row * pair.es ..][0..pair.es],
+                        );
+                    }
+                }
+                Ecs.storages[src_id].swapRemoveRaw(src_row);
+                Ecs.entity_generation.items[id] = next_gen;
+                Ecs.entity_archetype.items[id] = dest_id;
+                Ecs.entity_row.items[id] = dst_index;
+                Ecs.setEntityState(id, .{});
+                if (src_id != dest_id) {
+                    try MigrateStore.appendAssumed(allocator, migrate_pi, next, .{
+                        .from = src_id,
+                        .to = dest_id,
+                    });
+                }
+                Ecs.rebaseAttributePending(id, gen, next_gen);
+            }
+            // 6. One zone rebuild per touched storage; emptied ones drop
+            // their zones and occupancy bit instead.
+            for (src_seen.items) |src| {
+                if (src == dest_id) {
+                    continue;
+                }
+                if (Ecs.storages[src].count() == 0) {
+                    Ecs.storages[src].depth_zones.clearRetainingCapacity();
+                    Ecs.clearArchetypeNonEmpty(src);
+                } else {
+                    try Ecs.storages[src].consolidateZones(
+                        allocator,
+                        &Ecs.zone_scratch_perm,
+                        &Ecs.zone_scratch_visited,
+                    );
+                }
+            }
+            if (Ecs.storages[dest_id].count() > 0) {
+                Ecs.setArchetypeNonEmpty(dest_id);
+                if (dest_before == 0 and uniform_depth and seen_depth) {
+                    // Fast path: empty destination plus one depth needs no
+                    // sort. Raw appends landed in final order already and
+                    // `entity_row` was recorded per append.
+                    const dst = &Ecs.storages[dest_id];
+                    dst.depth_zones.clearRetainingCapacity();
+                    try dst.depth_zones.append(allocator, .{
+                        .depth = first_depth,
+                        .offset = 0,
+                        .len = @intCast(dst.refs.items.len),
+                    });
+                } else {
+                    try Ecs.storages[dest_id].consolidateZones(
+                        allocator,
+                        &Ecs.zone_scratch_perm,
+                        &Ecs.zone_scratch_visited,
+                    );
+                }
+            } else {
+                Ecs.storages[dest_id].depth_zones.clearRetainingCapacity();
+                Ecs.clearArchetypeNonEmpty(dest_id);
+            }
         }
         /// Copies values of components shared by two archetype rows.
         /// Pure runtime byte copies driven by the sorted component id
@@ -2728,6 +4384,393 @@ pub fn ECS(comptime sets: anytype) type {
                 pub inline fn isEmpty(self: *const PageNamespace) bool {
                     return !Ecs.isArchetypeNonEmpty(self.arch_id);
                 }
+                /// Summary of the entity enabled column.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `EnableState` - aggregate over live rows.
+                pub fn entityEnableState(self: *const PageNamespace) EnableState {
+                    return Ecs.storages[self.arch_id].entityEnableState();
+                }
+                /// Summary of one component enabled column.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                ///
+                /// Returns `EnableState` - aggregate over live rows.
+                pub fn componentEnableState(self: *const PageNamespace, comptime T: type) EnableState {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const col: usize = self.cols[qi];
+                    return Ecs.storages[self.arch_id].compEnableState(col);
+                }
+                /// Counts enabled entities in the page. `O(1)` via cached counter.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `u32` - enabled row count.
+                pub fn countEnabledEntities(self: *const PageNamespace) u32 {
+                    return Ecs.storages[self.arch_id].entity_enabled_count;
+                }
+                /// Counts disabled entities in the page. `O(1)`.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `u32` - disabled row count.
+                pub fn countDisabledEntities(self: *const PageNamespace) u32 {
+                    const s = &Ecs.storages[self.arch_id];
+                    return s.count() - s.entity_enabled_count;
+                }
+                /// Counts enabled rows of one component. `O(1)`.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                ///
+                /// Returns `u32` - enabled row count.
+                pub fn countEnabledComponents(self: *const PageNamespace, comptime T: type) u32 {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    return Ecs.storages[self.arch_id].comp_enabled_counts[self.cols[qi]];
+                }
+                /// Counts disabled rows of one component. `O(1)`.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                ///
+                /// Returns `u32` - disabled row count.
+                pub fn countDisabledComponents(self: *const PageNamespace, comptime T: type) u32 {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const s = &Ecs.storages[self.arch_id];
+                    return s.count() - s.comp_enabled_counts[self.cols[qi]];
+                }
+                /// Exposes the raw entity enabled bitmap (one bit per row).
+                /// Read-only; mutate through `setEntityEnabled` so cached
+                /// counters stay valid.
+                /// - `self` - page to inspect.
+                ///
+                /// Returns `[]const u64` - bitmap words.
+                pub fn entitiesEnabledBits(self: *const PageNamespace) []const u64 {
+                    return Ecs.storages[self.arch_id].entity_enabled.items;
+                }
+                /// Exposes the raw enabled bitmap of one component.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                ///
+                /// Returns `[]const u64` - bitmap words.
+                pub fn componentEnabledBits(self: *const PageNamespace, comptime T: type) []const u64 {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    return Ecs.storages[self.arch_id].comp_enabled[self.cols[qi]].items;
+                }
+                /// Checks the entity enabled bit of one row.
+                /// - `self` - page to inspect.
+                /// - `row` - row position.
+                ///
+                /// Returns `bool` - true when enabled, false when disabled or out of range.
+                pub fn isEntityEnabled(self: *const PageNamespace, row: u32) bool {
+                    const s = &Ecs.storages[self.arch_id];
+                    if (row >= s.refs.items.len) {
+                        return false;
+                    }
+                    return ArchetypeStorage.enabledBitGet(s.entity_enabled.items, row);
+                }
+                /// Writes the entity enabled bit of one row. Out-of-range rows
+                /// are ignored.
+                /// - `self` - page to inspect.
+                /// - `row` - row position.
+                /// - `value` - true to enable, false to disable.
+                pub fn setEntityEnabled(self: *const PageNamespace, row: u32, value: bool) void {
+                    const s = &Ecs.storages[self.arch_id];
+                    if (row >= s.refs.items.len) {
+                        return;
+                    }
+                    const old = ArchetypeStorage.enabledBitGet(s.entity_enabled.items, row);
+                    if (old == value) {
+                        return;
+                    }
+                    ArchetypeStorage.enabledBitSetRaw(s.entity_enabled.items, row, value);
+                    if (value) {
+                        s.entity_enabled_count += 1;
+                    } else {
+                        s.entity_enabled_count -= 1;
+                    }
+                }
+                /// Enables one entity row.
+                /// - `self` - page to inspect.
+                /// - `row` - row position.
+                pub fn enableEntity(self: *const PageNamespace, row: u32) void {
+                    self.setEntityEnabled(row, true);
+                }
+                /// Disables one entity row.
+                /// - `self` - page to inspect.
+                /// - `row` - row position.
+                pub fn disableEntity(self: *const PageNamespace, row: u32) void {
+                    self.setEntityEnabled(row, false);
+                }
+                /// Checks one component enabled bit.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                /// - `row` - row position.
+                ///
+                /// Returns `bool` - true when enabled, false when disabled or out of range.
+                pub fn isComponentEnabled(self: *const PageNamespace, comptime T: type, row: u32) bool {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const s = &Ecs.storages[self.arch_id];
+                    if (row >= s.refs.items.len) {
+                        return false;
+                    }
+                    return ArchetypeStorage.enabledBitGet(s.comp_enabled[self.cols[qi]].items, row);
+                }
+                /// Writes one component enabled bit. Out-of-range rows are ignored.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                /// - `row` - row position.
+                /// - `value` - true to enable, false to disable.
+                pub fn setComponentEnabled(self: *const PageNamespace, comptime T: type, row: u32, value: bool) void {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const s = &Ecs.storages[self.arch_id];
+                    if (row >= s.refs.items.len) {
+                        return;
+                    }
+                    const col: usize = self.cols[qi];
+                    const old = ArchetypeStorage.enabledBitGet(s.comp_enabled[col].items, row);
+                    if (old == value) {
+                        return;
+                    }
+                    ArchetypeStorage.enabledBitSetRaw(s.comp_enabled[col].items, row, value);
+                    if (value) {
+                        s.comp_enabled_counts[col] += 1;
+                    } else {
+                        s.comp_enabled_counts[col] -= 1;
+                    }
+                }
+                /// Enables one component row.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                /// - `row` - row position.
+                pub fn enableComponent(self: *const PageNamespace, comptime T: type, row: u32) void {
+                    self.setComponentEnabled(T, row, true);
+                }
+                /// Disables one component row.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                /// - `row` - row position.
+                pub fn disableComponent(self: *const PageNamespace, comptime T: type, row: u32) void {
+                    self.setComponentEnabled(T, row, false);
+                }
+                /// Enables every entity row in the page.
+                /// - `self` - page to inspect.
+                pub fn enableAllEntities(self: *const PageNamespace) void {
+                    const s = &Ecs.storages[self.arch_id];
+                    s.setEnabledRange(true, 0, 0, @intCast(s.refs.items.len), true);
+                }
+                /// Disables every entity row in the page.
+                /// - `self` - page to inspect.
+                pub fn disableAllEntities(self: *const PageNamespace) void {
+                    const s = &Ecs.storages[self.arch_id];
+                    s.setEnabledRange(true, 0, 0, @intCast(s.refs.items.len), false);
+                }
+                /// Enables one component column for every row.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                pub fn enableAllComponents(self: *const PageNamespace, comptime T: type) void {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const s = &Ecs.storages[self.arch_id];
+                    s.setEnabledRange(false, self.cols[qi], 0, @intCast(s.refs.items.len), true);
+                }
+                /// Disables one component column for every row.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                pub fn disableAllComponents(self: *const PageNamespace, comptime T: type) void {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const s = &Ecs.storages[self.arch_id];
+                    s.setEnabledRange(false, self.cols[qi], 0, @intCast(s.refs.items.len), false);
+                }
+                /// Finds the next entity row matching the filter.
+                /// Designed for `while` loops: pass the previous result as
+                /// `start` until null is returned.
+                /// - `self` - page to inspect.
+                /// - `start` - previous row, or null to start from row `0`.
+                ///   The search begins strictly after `start` (`start + 1`).
+                /// - `end` - exclusive upper bound, or null for no limit
+                ///   (search runs to the end of the page). The bound is
+                ///   exclusive (`[from, end)`), so a `DepthZone` range is
+                ///   passed as `end = zone.offset + zone.len`.
+                /// - `filter` - `.enabled` yields enabled rows, `.disabled`
+                ///   yields disabled rows.
+                ///
+                /// Returns `?u32` - page row index suitable for `get(T)[row]`,
+                /// or null when no matching row exists in the range.
+                pub fn nextEntityId(self: *const PageNamespace, start: ?u32, end: ?u32, filter: EnableFilter) ?u32 {
+                    const s = &Ecs.storages[self.arch_id];
+                    const n: u32 = @intCast(s.refs.items.len);
+                    const from: u32 = if (start) |st| blk: {
+                        if (st >= n) {
+                            return null;
+                        }
+                        if (st == std.math.maxInt(u32)) {
+                            return null;
+                        }
+                        break :blk st + 1;
+                    } else 0;
+                    const to: u32 = if (end) |e| @min(e, n) else n;
+                    if (from >= to) {
+                        return null;
+                    }
+                    const want = filter == .enabled;
+                    switch (s.entityEnableState()) {
+                        .all_enabled => return if (want) from else null,
+                        .all_disabled => return if (want) null else from,
+                        .mixed => return ArchetypeStorage.scanEnabledBits(s.entity_enabled.items, from, to, want),
+                    }
+                }
+                /// Finds the next row whose component bit matches the filter.
+                /// Same `while`-loop contract as `nextEntityId`: `start` is
+                /// exclusive, `end` is exclusive (`DepthZone` ranges pass
+                /// `end = zone.offset + zone.len`), null `start` begins at
+                /// row `0`, null `end` runs to the end of the page.
+                /// - `self` - page to inspect.
+                /// - `T` - component type, must be part of the query.
+                /// - `include_entity` - when true, the entity bit must match
+                ///   the filter too (conjunction of two bits). Comptime, so
+                ///   `false` compiles to the plain single-column scan with
+                ///   zero overhead.
+                /// - `start` - previous row, or null to start from row `0`.
+                /// - `end` - exclusive upper bound, or null for no limit.
+                /// - `filter` - `.enabled` or `.disabled` requirement.
+                ///
+                /// Returns `?u32` - page row index, or null when absent.
+                pub fn nextComponentId(self: *const PageNamespace, comptime T: type, comptime include_entity: bool, start: ?u32, end: ?u32, filter: EnableFilter) ?u32 {
+                    comptime {
+                        if (!hasType(query, T)) {
+                            @compileError("Requested component type is not part of this page.");
+                        }
+                    }
+                    const qi = comptime indexOfType(query, T);
+                    const col: usize = self.cols[qi];
+                    const s = &Ecs.storages[self.arch_id];
+                    const n: u32 = @intCast(s.refs.items.len);
+                    const from: u32 = if (start) |st| blk: {
+                        if (st >= n) {
+                            return null;
+                        }
+                        if (st == std.math.maxInt(u32)) {
+                            return null;
+                        }
+                        break :blk st + 1;
+                    } else 0;
+                    const to: u32 = if (end) |e| @min(e, n) else n;
+                    if (from >= to) {
+                        return null;
+                    }
+                    const want = filter == .enabled;
+                    if (include_entity) {
+                        var col_buf: [1]usize = .{col};
+                        return s.scanEnabledBitsJoint(col_buf[0..], true, from, to, want);
+                    } else {
+                        switch (s.compEnableState(col)) {
+                            .all_enabled => return if (want) from else null,
+                            .all_disabled => return if (want) null else from,
+                            .mixed => return ArchetypeStorage.scanEnabledBits(s.comp_enabled[col].items, from, to, want),
+                        }
+                    }
+                }
+                /// Finds the next row where every listed component (and
+                /// optionally the entity itself) matches the filter.
+                /// Conjunctive version of `nextComponentId` for `while` loops:
+                /// pass the previous result as `start` until null is returned.
+                /// The row matches only when **all** requested bits equal the
+                /// filter (logical AND, not OR).
+                /// - `self` - page to inspect.
+                /// - `bundle` - component bundle (tuple, array or single
+                ///   type, possibly nested): every type must be part of the
+                ///   query and declared in `ECS(...)`. Duplicates are ignored.
+                ///   An empty bundle with `include_entity == false` matches
+                ///   every row.
+                /// - `include_entity` - when true, the entity bit participates
+                ///   in the conjunction as if it were one more component.
+                ///   Comptime, so `false` skips the entity word entirely.
+                /// - `start` - previous row, or null to start from row `0`.
+                ///   The search begins strictly after `start` (`start + 1`).
+                /// - `end` - exclusive upper bound, or null for no limit
+                ///   (search runs to the end of the page). The bound is
+                ///   exclusive (`[from, end)`), so a `DepthZone` range is
+                ///   passed as `end = zone.offset + zone.len`.
+                /// - `filter` - `.enabled` requires all bits set, `.disabled`
+                ///   requires all bits clear.
+                ///
+                /// Returns `?u32` - page row index suitable for `get(T)[row]`,
+                /// or null when no matching row exists in the range.
+                pub fn nextComponentsId(
+                    self: *const PageNamespace,
+                    comptime bundle: anytype,
+                    comptime include_entity: bool,
+                    start: ?u32,
+                    end: ?u32,
+                    filter: EnableFilter,
+                ) ?u32 {
+                    const wanted = comptime canonicalQueryAllowEmpty(bundle);
+                    comptime {
+                        for (wanted) |T| {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                    }
+                    const s = &Ecs.storages[self.arch_id];
+                    const n: u32 = @intCast(s.refs.items.len);
+                    const from: u32 = if (start) |st| blk: {
+                        if (st >= n) {
+                            return null;
+                        }
+                        if (st == std.math.maxInt(u32)) {
+                            return null;
+                        }
+                        break :blk st + 1;
+                    } else 0;
+                    const to: u32 = if (end) |e| @min(e, n) else n;
+                    if (from >= to) {
+                        return null;
+                    }
+                    var col_buf: [wanted.len]usize = undefined;
+                    inline for (wanted, 0..) |T, k| {
+                        const qi = comptime indexOfType(query, T);
+                        col_buf[k] = self.cols[qi];
+                    }
+                    const want = filter == .enabled;
+                    return s.scanEnabledBitsJoint(col_buf[0..], include_entity, from, to, want);
+                }
                 /// Read-only view of one depth zone: a contiguous run of rows
                 /// sharing one hierarchy depth. Obtained from
                 /// `Page.zone(depth)` or `Page.zoneAt(index)`; the underlying
@@ -2782,6 +4825,345 @@ pub fn ECS(comptime sets: anytype) type {
                     /// Returns `[]const EntityReference` - zone row references.
                     pub fn entities(self: *const ZoneView) []const EntityReference {
                         return Ecs.storages[self.page.arch_id].refs.items[self.zone.offset..][0..self.zone.len];
+                    }
+                    /// Summary of the entity bits inside this zone only.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `EnableState` - aggregate over the zone range.
+                    pub fn entityEnableState(self: *const ZoneView) EnableState {
+                        if (self.zone.len == 0) {
+                            return .all_disabled;
+                        }
+                        const s = &Ecs.storages[self.page.arch_id];
+                        const from = self.zone.offset;
+                        const to = self.zone.offset + self.zone.len;
+                        const c = ArchetypeStorage.countEnabledInRange(s.entity_enabled.items, from, to);
+                        if (c == self.zone.len) {
+                            return .all_enabled;
+                        }
+                        if (c == 0) {
+                            return .all_disabled;
+                        }
+                        return .mixed;
+                    }
+                    /// Summary of one component column inside this zone only.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    ///
+                    /// Returns `EnableState` - aggregate over the zone range.
+                    pub fn componentEnableState(self: *const ZoneView, comptime T: type) EnableState {
+                        comptime {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                        if (self.zone.len == 0) {
+                            return .all_disabled;
+                        }
+                        const qi = comptime indexOfType(query, T);
+                        const s = &Ecs.storages[self.page.arch_id];
+                        const from = self.zone.offset;
+                        const to = self.zone.offset + self.zone.len;
+                        const c = ArchetypeStorage.countEnabledInRange(s.comp_enabled[self.page.cols[qi]].items, from, to);
+                        if (c == self.zone.len) {
+                            return .all_enabled;
+                        }
+                        if (c == 0) {
+                            return .all_disabled;
+                        }
+                        return .mixed;
+                    }
+                    /// Counts enabled entities inside this zone.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `u32` - enabled rows in the zone.
+                    pub fn countEnabledEntities(self: *const ZoneView) u32 {
+                        if (self.zone.len == 0) {
+                            return 0;
+                        }
+                        const s = &Ecs.storages[self.page.arch_id];
+                        return ArchetypeStorage.countEnabledInRange(s.entity_enabled.items, self.zone.offset, self.zone.offset + self.zone.len);
+                    }
+                    /// Counts enabled rows of one component inside this zone.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    ///
+                    /// Returns `u32` - enabled rows in the zone.
+                    pub fn countEnabledComponents(self: *const ZoneView, comptime T: type) u32 {
+                        comptime {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                        if (self.zone.len == 0) {
+                            return 0;
+                        }
+                        const qi = comptime indexOfType(query, T);
+                        const s = &Ecs.storages[self.page.arch_id];
+                        return ArchetypeStorage.countEnabledInRange(s.comp_enabled[self.page.cols[qi]].items, self.zone.offset, self.zone.offset + self.zone.len);
+                    }
+                    /// Counts disabled entities inside this zone.
+                    /// - `self` - zone view to inspect.
+                    ///
+                    /// Returns `u32` - disabled rows in the zone.
+                    pub fn countDisabledEntities(self: *const ZoneView) u32 {
+                        return self.zone.len - self.countEnabledEntities();
+                    }
+                    /// Counts disabled rows of one component inside this zone.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    ///
+                    /// Returns `u32` - disabled rows in the zone.
+                    pub fn countDisabledComponents(self: *const ZoneView, comptime T: type) u32 {
+                        return self.zone.len - self.countEnabledComponents(T);
+                    }
+                    /// Checks one entity bit by page-global row. Forwards to the page.
+                    /// - `self` - zone view to inspect.
+                    /// - `row` - page-global row position.
+                    ///
+                    /// Returns `bool` - true when enabled.
+                    pub fn isEntityEnabled(self: *const ZoneView, row: u32) bool {
+                        return self.page.isEntityEnabled(row);
+                    }
+                    /// Writes one entity bit by page-global row.
+                    /// - `self` - zone view to inspect.
+                    /// - `row` - page-global row position.
+                    /// - `value` - true to enable, false to disable.
+                    pub fn setEntityEnabled(self: *const ZoneView, row: u32, value: bool) void {
+                        self.page.setEntityEnabled(row, value);
+                    }
+                    /// Enables one entity row (page-global index).
+                    /// - `self` - zone view to inspect.
+                    /// - `row` - page-global row position.
+                    pub fn enableEntity(self: *const ZoneView, row: u32) void {
+                        self.page.enableEntity(row);
+                    }
+                    /// Disables one entity row (page-global index).
+                    /// - `self` - zone view to inspect.
+                    /// - `row` - page-global row position.
+                    pub fn disableEntity(self: *const ZoneView, row: u32) void {
+                        self.page.disableEntity(row);
+                    }
+                    /// Checks one component bit by page-global row.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    /// - `row` - page-global row position.
+                    ///
+                    /// Returns `bool` - true when enabled.
+                    pub fn isComponentEnabled(self: *const ZoneView, comptime T: type, row: u32) bool {
+                        return self.page.isComponentEnabled(T, row);
+                    }
+                    /// Writes one component bit by page-global row.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    /// - `row` - page-global row position.
+                    /// - `value` - true to enable, false to disable.
+                    pub fn setComponentEnabled(self: *const ZoneView, comptime T: type, row: u32, value: bool) void {
+                        self.page.setComponentEnabled(T, row, value);
+                    }
+                    /// Enables one component row (page-global index).
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    /// - `row` - page-global row position.
+                    pub fn enableComponent(self: *const ZoneView, comptime T: type, row: u32) void {
+                        self.page.enableComponent(T, row);
+                    }
+                    /// Disables one component row (page-global index).
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    /// - `row` - page-global row position.
+                    pub fn disableComponent(self: *const ZoneView, comptime T: type, row: u32) void {
+                        self.page.disableComponent(T, row);
+                    }
+                    /// Enables every entity row inside this zone only.
+                    /// - `self` - zone view to inspect.
+                    pub fn enableAllEntities(self: *const ZoneView) void {
+                        if (self.zone.len == 0) {
+                            return;
+                        }
+                        const s = &Ecs.storages[self.page.arch_id];
+                        s.setEnabledRange(true, 0, self.zone.offset, self.zone.offset + self.zone.len, true);
+                    }
+                    /// Disables every entity row inside this zone only.
+                    /// - `self` - zone view to inspect.
+                    pub fn disableAllEntities(self: *const ZoneView) void {
+                        if (self.zone.len == 0) {
+                            return;
+                        }
+                        const s = &Ecs.storages[self.page.arch_id];
+                        s.setEnabledRange(true, 0, self.zone.offset, self.zone.offset + self.zone.len, false);
+                    }
+                    /// Enables one component column inside this zone only.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    pub fn enableAllComponents(self: *const ZoneView, comptime T: type) void {
+                        comptime {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                        if (self.zone.len == 0) {
+                            return;
+                        }
+                        const qi = comptime indexOfType(query, T);
+                        const s = &Ecs.storages[self.page.arch_id];
+                        s.setEnabledRange(false, self.page.cols[qi], self.zone.offset, self.zone.offset + self.zone.len, true);
+                    }
+                    /// Disables one component column inside this zone only.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    pub fn disableAllComponents(self: *const ZoneView, comptime T: type) void {
+                        comptime {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                        if (self.zone.len == 0) {
+                            return;
+                        }
+                        const qi = comptime indexOfType(query, T);
+                        const s = &Ecs.storages[self.page.arch_id];
+                        s.setEnabledRange(false, self.page.cols[qi], self.zone.offset, self.zone.offset + self.zone.len, false);
+                    }
+                    /// Finds the next matching entity row inside this zone.
+                    /// Page-global row indices are used (suitable for
+                    /// `page.get(T)[row]`); the search is clamped to
+                    /// `[zone.offset, zone.offset + zone.len)`. `start` is
+                    /// exclusive, null starts at the zone offset.
+                    /// - `self` - zone view to inspect.
+                    /// - `start` - previous page-global row, or null.
+                    /// - `filter` - `.enabled` or `.disabled` requirement.
+                    ///
+                    /// Returns `?u32` - page-global row, or null when absent.
+                    pub fn nextEntityId(self: *const ZoneView, start: ?u32, filter: EnableFilter) ?u32 {
+                        if (self.zone.len == 0) {
+                            return null;
+                        }
+                        const from: u32 = if (start) |st| blk: {
+                            if (st == std.math.maxInt(u32)) {
+                                return null;
+                            }
+                            const cand = st + 1;
+                            break :blk @max(cand, self.zone.offset);
+                        } else self.zone.offset;
+                        const to = self.zone.offset + self.zone.len;
+                        if (from >= to) {
+                            return null;
+                        }
+                        const s = &Ecs.storages[self.page.arch_id];
+                        const want = filter == .enabled;
+                        switch (self.entityEnableState()) {
+                            .all_enabled => return if (want) from else null,
+                            .all_disabled => return if (want) null else from,
+                            .mixed => return ArchetypeStorage.scanEnabledBits(s.entity_enabled.items, from, to, want),
+                        }
+                    }
+                    /// Finds the next matching component row inside this zone.
+                    /// Page-global indices; `start` exclusive, null starts at
+                    /// the zone offset.
+                    /// - `self` - zone view to inspect.
+                    /// - `T` - component type, must be part of the query.
+                    /// - `include_entity` - when true, the entity bit must
+                    ///   match the filter too. Comptime, so `false` costs
+                    ///   nothing extra.
+                    /// - `start` - previous page-global row, or null.
+                    /// - `filter` - `.enabled` or `.disabled` requirement.
+                    ///
+                    /// Returns `?u32` - page-global row, or null when absent.
+                    pub fn nextComponentId(self: *const ZoneView, comptime T: type, comptime include_entity: bool, start: ?u32, filter: EnableFilter) ?u32 {
+                        comptime {
+                            if (!hasType(query, T)) {
+                                @compileError("Requested component type is not part of this page.");
+                            }
+                        }
+                        if (self.zone.len == 0) {
+                            return null;
+                        }
+                        const from: u32 = if (start) |st| blk: {
+                            if (st == std.math.maxInt(u32)) {
+                                return null;
+                            }
+                            const cand = st + 1;
+                            break :blk @max(cand, self.zone.offset);
+                        } else self.zone.offset;
+                        const to = self.zone.offset + self.zone.len;
+                        if (from >= to) {
+                            return null;
+                        }
+                        const qi = comptime indexOfType(query, T);
+                        const col: usize = self.page.cols[qi];
+                        const s = &Ecs.storages[self.page.arch_id];
+                        const want = filter == .enabled;
+                        if (include_entity) {
+                            var col_buf: [1]usize = .{col};
+                            return s.scanEnabledBitsJoint(col_buf[0..], true, from, to, want);
+                        } else {
+                            switch (self.componentEnableState(T)) {
+                                .all_enabled => return if (want) from else null,
+                                .all_disabled => return if (want) null else from,
+                                .mixed => return ArchetypeStorage.scanEnabledBits(s.comp_enabled[col].items, from, to, want),
+                            }
+                        }
+                    }
+                    /// Finds the next row inside this zone where every listed
+                    /// component (and optionally the entity itself) matches
+                    /// the filter. Conjunctive version of `nextComponentId`.
+                    /// Page-global row indices are used (suitable for
+                    /// `page.get(T)[row]`); the search is clamped to
+                    /// `[zone.offset, zone.offset + zone.len)`. `start` is
+                    /// exclusive, null starts at the zone offset. A row
+                    /// matches only when **all** requested bits equal the
+                    /// filter (logical AND, not OR).
+                    /// - `self` - zone view to inspect.
+                    /// - `bundle` - component bundle: every type must be
+                    ///   part of the query and declared in `ECS(...)`.
+                    ///   Duplicates are ignored. An empty bundle with
+                    ///   `include_entity == false` matches every row.
+                    /// - `include_entity` - when true, the entity bit
+                    ///   participates in the conjunction too. Comptime, so
+                    ///   `false` skips the entity word entirely.
+                    /// - `start` - previous page-global row, or null.
+                    /// - `filter` - `.enabled` requires all bits set,
+                    ///   `.disabled` requires all bits clear.
+                    ///
+                    /// Returns `?u32` - page-global row, or null when absent.
+                    pub fn nextComponentsId(
+                        self: *const ZoneView,
+                        comptime bundle: anytype,
+                        comptime include_entity: bool,
+                        start: ?u32,
+                        filter: EnableFilter,
+                    ) ?u32 {
+                        const wanted = comptime canonicalQueryAllowEmpty(bundle);
+                        comptime {
+                            for (wanted) |T| {
+                                if (!hasType(query, T)) {
+                                    @compileError("Requested component type is not part of this page.");
+                                }
+                            }
+                        }
+                        if (self.zone.len == 0) {
+                            return null;
+                        }
+                        const from: u32 = if (start) |st| blk: {
+                            if (st == std.math.maxInt(u32)) {
+                                return null;
+                            }
+                            const cand = st + 1;
+                            break :blk @max(cand, self.zone.offset);
+                        } else self.zone.offset;
+                        const to = self.zone.offset + self.zone.len;
+                        if (from >= to) {
+                            return null;
+                        }
+                        var col_buf: [wanted.len]usize = undefined;
+                        inline for (wanted, 0..) |T, k| {
+                            const qi = comptime indexOfType(query, T);
+                            col_buf[k] = self.page.cols[qi];
+                        }
+                        const s = &Ecs.storages[self.page.arch_id];
+                        const want = filter == .enabled;
+                        return s.scanEnabledBitsJoint(col_buf[0..], include_entity, from, to, want);
                     }
                 };
                 /// Returns every depth zone of the page, sorted ascending by
@@ -3545,6 +5927,7 @@ pub fn ECS(comptime sets: anytype) type {
                         .deinitStore = deinitStore,
                         .onEntityDestroyed = onEntityDestroyed,
                         .onEntityMigrated = onEntityMigrated,
+                        .purgeMany = purgeMany,
                         .resetRegistered = resetRegistered,
                     });
                     registered = true;
@@ -3789,6 +6172,61 @@ pub fn ECS(comptime sets: anytype) type {
                 ) EcsError!void {
                     try Store.ensureRegistered(allocator);
                     try appendRow(allocator, arch, ref, value);
+                }
+                /// Batch filing cursor: caches the resolved page of the
+                /// current run of same-arch filings. The caller guarantees no
+                /// removals from this store's committed pages between
+                /// `reserveFile` and the `appendAssumed` calls it covers
+                /// (lifecycle pages filed by bulk paths are append-only for
+                /// the batch duration: purges never match filed rows, whose
+                /// generation is already stale), so the cached index stays
+                /// valid without re-searching.
+                const FileCursor = struct {
+                    arch: u32 = std.math.maxInt(u32),
+                    pi: usize = 0,
+                };
+                /// Resolves the page for `arch` once and reserves room for
+                /// `n` further rows. See `FileCursor` for the stability
+                /// contract.
+                /// - `allocator` - funds page and row allocation.
+                /// - `arch` - archetype page to file under.
+                /// - `n` - rows that must fit afterwards (upper bound is
+                ///   fine; excess capacity is reclaimed by the limits trim).
+                ///
+                /// Returns `usize` - position in `committed`.
+                fn reserveFile(
+                    allocator: std.mem.Allocator,
+                    arch: u32,
+                    n: usize,
+                ) EcsError!usize {
+                    const pi = try pageIndexFor(allocator, arch);
+                    const page = &committed.items[pi];
+                    try page.entities.ensureTotalCapacity(allocator, page.entities.items.len + n);
+                    try page.values.ensureTotalCapacity(allocator, page.values.items.len + n);
+                    try page.next.ensureTotalCapacity(allocator, page.next.items.len + n);
+                    return pi;
+                }
+                /// Appends one row to a reserved page: the `appendRow` body
+                /// minus page search and capacity checks (slot coverage is
+                /// still ensured per row). The page must come from
+                /// `reserveFile` for the same `arch` (see `FileCursor`).
+                /// - `pi` - reserved position in `committed`.
+                /// - `ref` - entity carrying the event.
+                /// - `value` - payload to store.
+                fn appendAssumed(
+                    allocator: std.mem.Allocator,
+                    pi: usize,
+                    ref: EntityReference,
+                    value: E,
+                ) EcsError!void {
+                    try ensureSlot(allocator, ref.id);
+                    const page = &committed.items[pi];
+                    const at: u32 = @intCast(page.entities.items.len);
+                    page.entities.appendAssumeCapacity(ref);
+                    page.values.appendAssumeCapacity(value);
+                    page.next.appendAssumeCapacity(rows.items[ref.id]);
+                    rows.items[ref.id] = packRow(page.arch_id, at);
+                    dirty = true;
                 }
                 /// Inserts or rewrites one committed entry in O(1) amortized:
                 /// the slot chain is walked for a same-generation row and
@@ -4175,6 +6613,77 @@ pub fn ECS(comptime sets: anytype) type {
                         try removeAt(allocator, loc.page, loc.index);
                     }
                 }
+                /// Purges live-generation rows of every slot marked dead in
+                /// the batch stamp set (see `Ecs.batch_stamps`). Pages whose
+                /// rows are all dead-live are dropped wholesale: chain heads
+                /// pointing into the page are repaired and the shell is pooled
+                /// with zero row moves. Other pages purge their dead members
+                /// through the regular per-row path. Descending page order
+                /// keeps indices valid across page drops.
+                /// - `dead_epoch` - mark epoch covering the dead set.
+                /// - `allocator` - funds pool pushes.
+                fn purgeMany(dead_epoch: u32, allocator: std.mem.Allocator) EcsError!void {
+                    if (committed.items.len == 0) {
+                        return;
+                    }
+                    const stamps = Ecs.batch_stamps.items;
+                    const gens = Ecs.entity_generation.items;
+                    try page_pool.ensureTotalCapacity(allocator, page_pool.items.len + committed.items.len);
+                    var pi: usize = committed.items.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        const page = &committed.items[pi];
+                        if (page.entities.items.len == 0) {
+                            continue;
+                        }
+                        var dead_count: usize = 0;
+                        var all_dead = true;
+                        for (page.entities.items) |e| {
+                            if (e.id < stamps.len and stamps[e.id] == dead_epoch and
+                                e.id < gens.len and e.gen == gens[e.id])
+                            {
+                                dead_count += 1;
+                            } else {
+                                all_dead = false;
+                            }
+                        }
+                        if (dead_count == 0) {
+                            continue;
+                        }
+                        if (all_dead) {
+                            for (page.entities.items, 0..) |e, k| {
+                                if (e.id < rows.items.len and
+                                    rows.items[e.id] == packRow(page.arch_id, @intCast(k)))
+                                {
+                                    rows.items[e.id] = page.next.items[k];
+                                }
+                            }
+                            page.entities.items.len = 0;
+                            page.values.items.len = 0;
+                            page.next.items.len = 0;
+                            dirty = true;
+                            const shell = committed.orderedRemove(pi);
+                            page_pool.appendAssumeCapacity(shell);
+                            continue;
+                        }
+                        // Partial page: drop dead-live rows one at a time,
+                        // re-resolving the page (by arch) after every removal.
+                        const arch = page.arch_id;
+                        while (findPageIndex(arch)) |p| {
+                            var hit: ?usize = null;
+                            for (committed.items[p].entities.items, 0..) |e, k| {
+                                if (e.id < stamps.len and stamps[e.id] == dead_epoch and
+                                    e.id < gens.len and e.gen == gens[e.id])
+                                {
+                                    hit = k;
+                                    break;
+                                }
+                            }
+                            const kk = hit orelse break;
+                            try removeAt(allocator, p, kk);
+                        }
+                    }
+                }
                 /// Relocates one entity rows to the destination archetype
                 /// page and refreshes their generation, keeping the invariant
                 /// that a page arch always equals the live entity archetype.
@@ -4313,6 +6822,8 @@ pub fn ECS(comptime sets: anytype) type {
                         .onEntityDestroyed = onEntityDestroyed,
                         .onEntityMigrated = onEntityMigrated,
                         .onDepthChanged = onDepthChanged,
+                        .moveDepthMany = moveDepthMany,
+                        .purgeMany = purgeMany,
                         .rebasePending = rebasePending,
                         .resetRegistered = resetRegistered,
                     });
@@ -4612,6 +7123,226 @@ pub fn ECS(comptime sets: anytype) type {
                     try removeAt(allocator, pi, k);
                     const npi = try pageIndexFor(allocator, arch);
                     _ = try insertRowAtDepth(allocator, npi, ref, v, new_depth);
+                }
+                /// Rebuilds one page around explicit per-row depths: stable
+                /// sort by depth, cycle-rotate the columns, repair every slot
+                /// link and retile the zones. Bulk alternative to N×
+                /// `moveRowToDepth` cascades when many rows of the page move.
+                /// - `allocator` - funds zone-list growth.
+                /// - `pi` - position of the page in `committed`.
+                /// - `depths` - new depth per current row; length must equal
+                ///   the row count.
+                fn rezoneFromDepths(
+                    allocator: std.mem.Allocator,
+                    pi: usize,
+                    depths: []const u32,
+                ) EcsError!void {
+                    const page = &committed.items[pi];
+                    const n = page.entities.items.len;
+                    std.debug.assert(depths.len == n);
+                    if (n == 0) {
+                        return;
+                    }
+                    var min_d: u32 = depths[0];
+                    var max_d: u32 = depths[0];
+                    for (depths[1..]) |d| {
+                        if (d < min_d) {
+                            min_d = d;
+                        } else if (d > max_d) {
+                            max_d = d;
+                        }
+                    }
+                    page.depth_zones.clearRetainingCapacity();
+                    if (min_d == max_d) {
+                        try page.depth_zones.append(allocator, .{
+                            .depth = min_d,
+                            .offset = 0,
+                            .len = @intCast(n),
+                        });
+                        return;
+                    }
+                    const perm = &Ecs.zone_scratch_perm;
+                    try perm.resize(allocator, n);
+                    const span: usize = @as(usize, max_d) - @as(usize, min_d) + 1;
+                    if (span > 4 * n) {
+                        for (0..n) |i| {
+                            perm.items[i] = @intCast(i);
+                        }
+                        const Ctx = struct {
+                            ds: []const u32,
+                            fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                                return ctx.ds[a] < ctx.ds[b] or (ctx.ds[a] == ctx.ds[b] and a < b);
+                            }
+                        };
+                        std.mem.sort(u32, perm.items, Ctx{ .ds = depths }, Ctx.lessThan);
+                    } else {
+                        const counts = &Ecs.zone_scratch_counts;
+                        counts.clearRetainingCapacity();
+                        try counts.appendNTimes(allocator, 0, span);
+                        const slots = counts.items;
+                        for (depths) |d| {
+                            slots[d - min_d] += 1;
+                        }
+                        var acc: u32 = 0;
+                        for (slots) |*s| {
+                            const c: u32 = s.*;
+                            s.* = acc;
+                            acc += c;
+                        }
+                        for (depths, 0..) |d, i| {
+                            perm.items[slots[d - min_d]] = @intCast(i);
+                            slots[d - min_d] += 1;
+                        }
+                    }
+                    // Cycle-rotate entities and values into sorted order.
+                    var visited = Ecs.zone_scratch_visited.items;
+                    if (visited.len < n) {
+                        try Ecs.zone_scratch_visited.resize(allocator, n);
+                        visited = Ecs.zone_scratch_visited.items;
+                    }
+                    @memset(visited[0..n], 0);
+                    {
+                        const ents = page.entities.items;
+                        for (0..n) |start| {
+                            if (visited[start] != 0) {
+                                continue;
+                            }
+                            const tmp = ents[start];
+                            var j: usize = start;
+                            while (true) {
+                                const next: usize = perm.items[j];
+                                if (next == start) {
+                                    ents[j] = tmp;
+                                    break;
+                                }
+                                ents[j] = ents[next];
+                                j = next;
+                            }
+                            var mark: usize = start;
+                            while (true) {
+                                visited[mark] = 1;
+                                mark = perm.items[mark];
+                                if (mark == start) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (@sizeOf(E) != 0) {
+                        @memset(visited[0..n], 0);
+                        const vals = page.values.items;
+                        for (0..n) |start| {
+                            if (visited[start] != 0) {
+                                continue;
+                            }
+                            const tmp = vals[start];
+                            var j: usize = start;
+                            while (true) {
+                                const next: usize = perm.items[j];
+                                if (next == start) {
+                                    vals[j] = tmp;
+                                    break;
+                                }
+                                vals[j] = vals[next];
+                                j = next;
+                            }
+                            var mark: usize = start;
+                            while (true) {
+                                visited[mark] = 1;
+                                mark = perm.items[mark];
+                                if (mark == start) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    const arch = page.arch_id;
+                    for (perm.items, 0..) |old, new_pos| {
+                        _ = old;
+                        rows.items[page.entities.items[new_pos].id] = packRow(arch, @intCast(new_pos));
+                    }
+                    var i: usize = 0;
+                    while (i < n) {
+                        const depth = depths[perm.items[i]];
+                        var j: usize = i + 1;
+                        while (j < n and depths[perm.items[j]] == depth) : (j += 1) {}
+                        try page.depth_zones.append(allocator, .{
+                            .depth = depth,
+                            .offset = @intCast(i),
+                            .len = @intCast(j - i),
+                        });
+                        i = j;
+                    }
+                }
+                /// Moves many attribute rows to their live depths in bulk.
+                /// New depths are read live from `entity_depth`, so callers
+                /// pass only member ids (packed as `DepthMove` alongside the
+                /// stale depth used elsewhere). Pages with a handful of hits
+                /// keep the exact per-row cascade; busier pages rebuild once
+                /// via `rezoneFromDepths`. Descending page order keeps indices
+                /// valid across page drops.
+                /// - `moves` - batch members carrying new depths.
+                /// - `allocator` - funds scratch and zone growth.
+                fn moveDepthMany(moves: []const DepthMove, allocator: std.mem.Allocator) EcsError!void {
+                    if (committed.items.len == 0 or moves.len == 0) {
+                        return;
+                    }
+                    const gens = Ecs.entity_generation.items;
+                    const depths = &Ecs.batch_ids;
+                    var pi: usize = committed.items.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        const arch = committed.items[pi].arch_id;
+                        const row_count: usize = committed.items[pi].entities.items.len;
+                        if (row_count == 0) {
+                            continue;
+                        }
+                        try depths.ensureTotalCapacity(allocator, row_count);
+                        depths.items.len = row_count;
+                        for (committed.items[pi].depth_zones.items) |z| {
+                            @memset(depths.items[z.offset..][0..z.len], z.depth);
+                        }
+                        var hits: usize = 0;
+                        for (moves) |mv| {
+                            if (mv.id >= rows.items.len or mv.id >= gens.len) {
+                                continue;
+                            }
+                            const link = rows.items[mv.id];
+                            if (link == NO_PACK or link >> 32 != arch) {
+                                continue;
+                            }
+                            const loc = resolvePacked(link) orelse continue;
+                            const e = committed.items[loc.page].entities.items[loc.index];
+                            if (e.id != mv.id or e.gen != gens[mv.id]) {
+                                continue;
+                            }
+                            depths.items[loc.index] = Ecs.entity_depth.items[mv.id];
+                            hits += 1;
+                        }
+                        if (hits == 0) {
+                            continue;
+                        }
+                        if (hits * 32 < row_count) {
+                            for (moves) |mv| {
+                                if (mv.id >= rows.items.len or mv.id >= gens.len) {
+                                    continue;
+                                }
+                                const loc = findSlotRow(mv.id, gens[mv.id]) orelse continue;
+                                if (committed.items[loc.page].arch_id != arch) {
+                                    continue;
+                                }
+                                try moveRowToDepth(
+                                    allocator,
+                                    loc.page,
+                                    loc.index,
+                                    Ecs.entity_depth.items[mv.id],
+                                );
+                            }
+                        } else {
+                            const pg = findPageIndex(arch) orelse continue;
+                            try rezoneFromDepths(allocator, pg, depths.items[0..row_count]);
+                        }
+                    }
                 }
                 /// Inserts or rewrites one committed entry in O(1) amortized:
                 /// the slot map resolves to at most one row, updated in
@@ -4962,6 +7693,74 @@ pub fn ECS(comptime sets: anytype) type {
                         try removeAt(allocator, loc.page, loc.index);
                     }
                 }
+                /// Purges committed rows of every slot marked dead in the
+                /// batch stamp set. Pages whose rows are all dead-live are
+                /// dropped wholesale (slot links cleared, shell pooled);
+                /// other pages purge their dead members through the regular
+                /// per-row path. Upsert keeps one row per slot, so no chain
+                /// repair is needed. Descending page order keeps indices
+                /// valid across page drops.
+                /// - `dead_epoch` - mark epoch covering the dead set.
+                /// - `allocator` - funds pool pushes.
+                fn purgeMany(dead_epoch: u32, allocator: std.mem.Allocator) EcsError!void {
+                    if (committed.items.len == 0) {
+                        return;
+                    }
+                    const stamps = Ecs.batch_stamps.items;
+                    const gens = Ecs.entity_generation.items;
+                    try page_pool.ensureTotalCapacity(allocator, page_pool.items.len + committed.items.len);
+                    var pi: usize = committed.items.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        const page = &committed.items[pi];
+                        if (page.entities.items.len == 0) {
+                            continue;
+                        }
+                        var dead_count: usize = 0;
+                        var all_dead = true;
+                        for (page.entities.items) |e| {
+                            if (e.id < stamps.len and stamps[e.id] == dead_epoch and
+                                e.id < gens.len and e.gen == gens[e.id])
+                            {
+                                dead_count += 1;
+                            } else {
+                                all_dead = false;
+                            }
+                        }
+                        if (dead_count == 0) {
+                            continue;
+                        }
+                        if (all_dead) {
+                            for (page.entities.items, 0..) |e, k| {
+                                if (e.id < rows.items.len and
+                                    rows.items[e.id] == packRow(page.arch_id, @intCast(k)))
+                                {
+                                    rows.items[e.id] = NO_PACK;
+                                }
+                            }
+                            page.entities.items.len = 0;
+                            page.values.items.len = 0;
+                            page.depth_zones.items.len = 0;
+                            const shell = committed.orderedRemove(pi);
+                            page_pool.appendAssumeCapacity(shell);
+                            continue;
+                        }
+                        const arch = page.arch_id;
+                        while (findPageIndex(arch)) |p| {
+                            var hit: ?usize = null;
+                            for (committed.items[p].entities.items, 0..) |e, k| {
+                                if (e.id < stamps.len and stamps[e.id] == dead_epoch and
+                                    e.id < gens.len and e.gen == gens[e.id])
+                                {
+                                    hit = k;
+                                    break;
+                                }
+                            }
+                            const kk = hit orelse break;
+                            try removeAt(allocator, p, kk);
+                        }
+                    }
+                }
                 /// Relocates one entity row to the destination archetype page
                 /// at the unchanged depth, refreshing its generation.
                 /// - `id` - migrated entity slot id.
@@ -5071,10 +7870,16 @@ pub fn ECS(comptime sets: anytype) type {
             deinitStore: *const fn (std.mem.Allocator) void,
             /// Purges the committed row of one destroyed entity slot.
             onEntityDestroyed: *const fn (u32, std.mem.Allocator) EcsError!void,
+            /// Purges rows of every slot marked dead in a batch stamp set,
+            /// dropping fully-dead pages wholesale.
+            purgeMany: *const fn (u32, std.mem.Allocator) EcsError!void,
             /// Moves one entity row to the destination archetype page.
             onEntityMigrated: *const fn (u32, u32, u32, u8, std.mem.Allocator) EcsError!void,
             /// Moves one entity row to the zone of its new depth.
             onDepthChanged: *const fn (u32, u32, std.mem.Allocator) EcsError!void,
+            /// Moves many rows to their live depths in bulk (see
+            /// `moveDepthMany`). Clobbers the `batch_ids` scratch.
+            moveDepthMany: *const fn ([]const DepthMove, std.mem.Allocator) EcsError!void,
             /// Rewrites the entity generation on queued ops of one slot.
             /// Runs when the entity migrates mid-flush, before the attribute
             /// flush: pending ops keep tracking the same logical entity.
@@ -5127,6 +7932,19 @@ pub fn ECS(comptime sets: anytype) type {
                 try entry.onEntityDestroyed(id, allocator);
             }
         }
+        /// Purges committed attributes of every slot marked dead in a batch
+        /// stamp set, payload by payload. Skipped entirely when no attribute
+        /// type was ever registered.
+        /// - `dead_epoch` - mark epoch in `Ecs.batch_stamps` covering dead slots.
+        /// - `allocator` - funds pool pushes.
+        fn notifyAttributePurgeMany(dead_epoch: u32, allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.attribute_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.purgeMany(dead_epoch, allocator);
+            }
+        }
         /// Relocates committed attributes of one migrated entity, payload by
         /// payload. Skipped entirely when no attribute type was ever registered.
         /// - `id` - migrated entity slot id.
@@ -5175,6 +7993,20 @@ pub fn ECS(comptime sets: anytype) type {
             }
             for (Ecs.attribute_registry.items) |entry| {
                 try entry.onDepthChanged(id, new_depth, allocator);
+            }
+        }
+        /// Moves committed attributes of every batch member to its live
+        /// depth, payload by payload (see `moveDepthMany`). Skipped entirely
+        /// when no attribute type was ever registered or no member moved.
+        /// New depths are read live, so members carry only their ids.
+        /// - `moves` - batch members with pending depth moves, in order.
+        /// - `allocator` - funds scratch and zone growth.
+        fn notifyAttributeDepthChangedMany(moves: []const DepthMove, allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.attribute_registry.items.len == 0 or moves.len == 0) {
+                return;
+            }
+            for (Ecs.attribute_registry.items) |entry| {
+                try entry.moveDepthMany(moves, allocator);
             }
         }
         /// Filtered view over one payload committed pages: the comptime
@@ -5238,6 +8070,9 @@ pub fn ECS(comptime sets: anytype) type {
             deinitStore: *const fn (std.mem.Allocator) void,
             /// Purges every committed entry of one destroyed entity slot.
             onEntityDestroyed: *const fn (u32, std.mem.Allocator) EcsError!void,
+            /// Purges entries of every slot marked dead in a batch stamp
+            /// set, dropping fully-dead pages wholesale.
+            purgeMany: *const fn (u32, std.mem.Allocator) EcsError!void,
             /// Moves one entity entries to the destination archetype page.
             onEntityMigrated: *const fn (u32, u32, u32, u8, std.mem.Allocator) EcsError!void,
             /// Marks the payload store as unregistered, so a reused ECS
@@ -5284,6 +8119,19 @@ pub fn ECS(comptime sets: anytype) type {
             }
             for (Ecs.event_registry.items) |entry| {
                 try entry.onEntityDestroyed(id, allocator);
+            }
+        }
+        /// Purges committed events of every slot marked dead in a batch
+        /// stamp set, payload by payload. Skipped entirely when no event
+        /// type was ever registered.
+        /// - `dead_epoch` - mark epoch in `Ecs.batch_stamps` covering dead slots.
+        /// - `allocator` - funds pool pushes.
+        fn notifyEventPurgeMany(dead_epoch: u32, allocator: std.mem.Allocator) EcsError!void {
+            if (Ecs.event_registry.items.len == 0) {
+                return;
+            }
+            for (Ecs.event_registry.items) |entry| {
+                try entry.purgeMany(dead_epoch, allocator);
             }
         }
         /// Relocates committed events of one migrated entity to the
@@ -5343,8 +8191,26 @@ pub fn ECS(comptime sets: anytype) type {
                 comptime bundle: anytype,
             ) Page(bundle) {
                 _ = self;
+                const arch = comptime archetypeId(bundle);
+                const query = comptime canonicalQuery(bundle);
+                const cols = comptime blk: {
+                    @setEvalBranchQuota(10_000_000);
+                    var tmp: [query.len]u32 = [_]u32{0} ** query.len;
+                    for (query, 0..) |T, qi| {
+                        const qid: u32 = @intCast(componentIndex(T).?);
+                        const ids = Tables.arch_comp[arch][0..Tables.arch_lens[arch]];
+                        for (ids, 0..) |cid, ci| {
+                            if (cid == qid) {
+                                tmp[qi] = @intCast(ci);
+                                break;
+                            }
+                        }
+                    }
+                    break :blk tmp;
+                };
                 return Page(bundle){
-                    .arch_id = comptime archetypeId(bundle),
+                    .arch_id = arch,
+                    .cols = cols,
                 };
             }
             /// Counts entities in archetypes containing all `include` components
@@ -5387,6 +8253,84 @@ pub fn ECS(comptime sets: anytype) type {
                     Ecs.entity_row.items[entity_index],
                 );
             }
+            /// Checks the entity enabled flag via a handler. Mirrors
+            /// `EntityReference.isEntityEnabled` for call sites that already
+            /// hold a handler (symmetric with `getComponent`).
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            ///
+            /// Returns `bool` - true when enabled.
+            pub fn isEntityEnabled(self: *const SystemHandler, ref: EntityReference) EcsError!bool {
+                _ = self;
+                if (!ref.isAlive()) {
+                    return EcsError.EntityIsNotAlive;
+                }
+                const entity_index: u32 = ref.id;
+                const arch: u32 = Ecs.entity_archetype.items[entity_index];
+                const row: u32 = Ecs.entity_row.items[entity_index];
+                const s = &Ecs.storages[arch];
+                if (row >= s.refs.items.len) {
+                    return EcsError.IndexOutOfBounds;
+                }
+                return ArchetypeStorage.enabledBitGet(s.entity_enabled.items, row);
+            }
+            /// Writes the entity enabled flag via a handler. Immediate.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `value` - true to enable, false to disable.
+            pub fn setEntityEnabled(self: *const SystemHandler, ref: EntityReference, value: bool) EcsError!void {
+                _ = self;
+                try ref.setEntityEnabled(value);
+            }
+            /// Enables one entity via a handler.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            pub fn enableEntity(self: *const SystemHandler, ref: EntityReference) EcsError!void {
+                _ = self;
+                return ref.enableEntity();
+            }
+            /// Disables one entity via a handler.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            pub fn disableEntity(self: *const SystemHandler, ref: EntityReference) EcsError!void {
+                _ = self;
+                return ref.disableEntity();
+            }
+            /// Checks one component enabled flag via a handler.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            ///
+            /// Returns `bool` - true when enabled.
+            pub fn isComponentEnabled(self: *const SystemHandler, ref: EntityReference, comptime T: type) EcsError!bool {
+                _ = self;
+                return ref.isComponentEnabled(T);
+            }
+            /// Writes one component enabled flag via a handler. Immediate.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            /// - `value` - true to enable, false to disable.
+            pub fn setComponentEnabled(self: *const SystemHandler, ref: EntityReference, comptime T: type, value: bool) EcsError!void {
+                _ = self;
+                return ref.setComponentEnabled(T, value);
+            }
+            /// Enables one component via a handler.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            pub fn enableComponent(self: *const SystemHandler, ref: EntityReference, comptime T: type) EcsError!void {
+                _ = self;
+                return ref.enableComponent(T);
+            }
+            /// Disables one component via a handler.
+            /// - `self` - handler of the running system.
+            /// - `ref` - entity reference to resolve. Must be alive.
+            /// - `T` - component type, must be stored in the entity archetype.
+            pub fn disableComponent(self: *const SystemHandler, ref: EntityReference, comptime T: type) EcsError!void {
+                _ = self;
+                return ref.disableComponent(T);
+            }
             /// Queues entity creation and returns the future handle. The id
             /// and generation are reserved immediately (the slot is marked
             /// `pending_create`), so the returned reference can already be
@@ -5407,6 +8351,9 @@ pub fn ECS(comptime sets: anytype) type {
                 values: anytype,
             ) EcsError!EntityReference {
                 const arch = comptime archetypeId(bundle);
+                // Order vs an open destroy/migrate/reparent batch: seal it
+                // first so the create flushes after the earlier members.
+                try Ecs.sealOpenBatch(self.allocator);
                 const blob = try Ecs.packValues(arch, values, self.allocator);
                 errdefer self.allocator.free(blob);
                 const reservation = try Ecs.reserveSlot(self.allocator, @intCast(arch));
@@ -5497,6 +8444,7 @@ pub fn ECS(comptime sets: anytype) type {
             ) EcsError!EntityReference {
                 try Ecs.requireParent(parent);
                 const arch = comptime archetypeId(bundle);
+                try Ecs.sealOpenBatch(self.allocator);
                 const blob = try Ecs.packValues(arch, values, self.allocator);
                 errdefer self.allocator.free(blob);
                 const reservation = try Ecs.reserveSlot(self.allocator, @intCast(arch));
@@ -5529,6 +8477,10 @@ pub fn ECS(comptime sets: anytype) type {
                 n: u32,
                 parent: ?EntityReference,
             ) EcsError![]const EntityReference {
+                // Order vs an open batch: seal it first (see cmdCreate).
+                // Note: seals before any reservation, so OOM here leaves the
+                // queue exactly as found.
+                try Ecs.sealOpenBatch(self.allocator);
                 const blob = try Ecs.packValues(arch, values, self.allocator);
                 errdefer self.allocator.free(blob);
                 const reserved = try self.allocator.alloc(EntityReference, n);
@@ -5607,12 +8559,33 @@ pub fn ECS(comptime sets: anytype) type {
                     }
                     parent_id = p.id;
                 }
-                try Ecs.commands.append(self.allocator, .{ .reparent = .{
-                    .ref = ref,
-                    .parent = parent,
-                } });
+                try ensureOpenReparent(self.allocator, parent);
+                try Ecs.open_batch_refs.append(self.allocator, ref);
                 Ecs.setEntityState(entity_index, .{ .pending_reparent = true });
                 Ecs.entity_pending_parent.items[entity_index] = parent_id;
+            }
+            /// Ensures the open batch accepts reparent members for `parent`,
+            /// sealing any incompatible open batch first. Compatibility =
+            /// equal parent (both null, or equal id plus generation).
+            /// - `allocator` - funds a possible seal.
+            /// - `parent` - new parent, or null to detach.
+            fn ensureOpenReparent(
+                allocator: std.mem.Allocator,
+                parent: ?EntityReference,
+            ) EcsError!void {
+                const same = if (Ecs.open_batch == .reparent) blk: {
+                    if (parent) |p| {
+                        if (Ecs.open_batch.reparent.parent) |tp| {
+                            break :blk p.id == tp.id and p.gen == tp.gen;
+                        }
+                        break :blk false;
+                    }
+                    break :blk Ecs.open_batch.reparent.parent == null;
+                } else false;
+                if (!same) {
+                    try Ecs.sealOpenBatch(allocator);
+                }
+                Ecs.open_batch = .{ .reparent = .{ .parent = parent } };
             }
             /// Queues entity destruction. Applied after the current system finishes.
             /// Fails with `EntityIsNotAlive` when the reference is stale and
@@ -5622,7 +8595,11 @@ pub fn ECS(comptime sets: anytype) type {
             /// - `ref` - entity reference to destroy.
             pub fn cmdDestroy(self: *const SystemHandler, ref: EntityReference) EcsError!void {
                 const entity_index = try Ecs.requireIdle(ref);
-                try Ecs.commands.append(self.allocator, .{ .destroy = ref });
+                if (Ecs.open_batch != .destroy) {
+                    try Ecs.sealOpenBatch(self.allocator);
+                }
+                Ecs.open_batch = .destroy;
+                try Ecs.open_batch_refs.append(self.allocator, ref);
                 Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
             }
             /// Queues entity migration into another archetype.
@@ -5641,11 +8618,15 @@ pub fn ECS(comptime sets: anytype) type {
             ) EcsError!void {
                 const entity_index = try Ecs.requireIdle(ref);
                 const dest_id: u32 = @intCast(comptime archetypeId(dest));
-                try Ecs.commands.append(self.allocator, .{ .migrate = .{
-                    .ref = ref,
-                    .dest = dest_id,
-                    .copy = copy,
-                } });
+                const compatible = if (Ecs.open_batch == .migrate) blk: {
+                    const m = Ecs.open_batch.migrate;
+                    break :blk m.dest == dest_id and m.copy == copy;
+                } else false;
+                if (!compatible) {
+                    try Ecs.sealOpenBatch(self.allocator);
+                }
+                Ecs.open_batch = .{ .migrate = .{ .dest = dest_id, .copy = copy } };
+                try Ecs.open_batch_refs.append(self.allocator, ref);
                 Ecs.setEntityState(entity_index, .{ .pending_migrate = true });
             }
             /// Queues destruction of every entity on pages matching `include`
@@ -5660,11 +8641,36 @@ pub fn ECS(comptime sets: anytype) type {
                 comptime include: anytype,
                 comptime exclude: anytype,
             ) EcsError!void {
+                // Pass 1: validate everything without mutating, so a pending
+                // row still aborts the whole call with EntityHasPendingCommand
+                // and leaves zero trace (via Schedule the net effect matches
+                // the old partial-queue-plus-discard behavior).
+                var total: usize = 0;
                 for (self.pages(include, exclude).allPages()) |p| {
                     for (p.entities()) |ref| {
-                        const entity_index = try Ecs.requireIdle(ref);
-                        try Ecs.commands.append(self.allocator, .{ .destroy = ref });
-                        Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
+                        _ = try Ecs.requireIdle(ref);
+                        total += 1;
+                    }
+                }
+                if (total == 0) {
+                    return;
+                }
+                // Pass 2: append into the open destroy batch (infallible
+                // validation-wise: flags are still clear and no structural
+                // change happened in between; appends may still OOM).
+                if (Ecs.open_batch != .destroy) {
+                    try Ecs.sealOpenBatch(self.allocator);
+                }
+                Ecs.open_batch = .destroy;
+                const start = Ecs.open_batch_refs.items.len;
+                errdefer {
+                    for (Ecs.open_batch_refs.items[start..]) |ref| Ecs.clearPending(ref.id);
+                    Ecs.open_batch_refs.items.len = start;
+                }
+                for (self.pages(include, exclude).allPages()) |p| {
+                    for (p.entities()) |ref| {
+                        try Ecs.open_batch_refs.append(self.allocator, ref);
+                        Ecs.setEntityState(ref.id, .{ .pending_destroy = true });
                     }
                 }
             }
@@ -5680,11 +8686,127 @@ pub fn ECS(comptime sets: anytype) type {
             ) EcsError!void {
                 @setEvalBranchQuota(10_000_000);
                 const id: u32 = @intCast(comptime archetypeId(bundle));
+                // Order vs an open batch: seal it first (see cmdCreate).
+                try Ecs.sealOpenBatch(self.allocator);
                 for (Ecs.storages[id].refs.items) |ref| {
                     const entity_index = try Ecs.requireIdle(ref);
                     Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
                 }
                 try Ecs.commands.append(self.allocator, .{ .destroy_page = id });
+            }
+            /// Queues destruction of every entity in the slice. Unlike the
+            /// single command, stale or already-pending entries are skipped
+            /// silently instead of failing the batch; an empty (or fully
+            /// stale) slice is a no-op. Members are processed in slice order
+            /// at flush, exactly as if queued singly in that order.
+            /// - `self` - handler of the running system.
+            /// - `refs` - entity references to destroy.
+            pub fn cmdDestroyMany(self: *const SystemHandler, refs: []const EntityReference) EcsError!void {
+                if (Ecs.open_batch != .destroy) {
+                    try Ecs.sealOpenBatch(self.allocator);
+                }
+                Ecs.open_batch = .destroy;
+                const start = Ecs.open_batch_refs.items.len;
+                errdefer {
+                    for (Ecs.open_batch_refs.items[start..]) |ref| Ecs.clearPending(ref.id);
+                    Ecs.open_batch_refs.items.len = start;
+                }
+                for (refs) |ref| {
+                    const entity_index = Ecs.requireIdle(ref) catch continue;
+                    try Ecs.open_batch_refs.append(self.allocator, ref);
+                    Ecs.setEntityState(entity_index, .{ .pending_destroy = true });
+                }
+            }
+            /// Queues migration of every entity in the slice into another
+            /// archetype. Same skip-stale policy as `cmdDestroyMany`: stale,
+            /// already-pending or cycling entries are skipped, an empty
+            /// result is a no-op. Members are processed in slice order.
+            /// - `self` - handler of the running system.
+            /// - `refs` - entity references to move.
+            /// - `dest` - component bundle of the destination archetype.
+            /// - `copy` - when true, shared component values are carried over.
+            pub fn cmdMigrateMany(
+                self: *const SystemHandler,
+                refs: []const EntityReference,
+                comptime dest: anytype,
+                copy: bool,
+            ) EcsError!void {
+                const dest_id: u32 = @intCast(comptime archetypeId(dest));
+                const compatible = if (Ecs.open_batch == .migrate) blk: {
+                    const m = Ecs.open_batch.migrate;
+                    break :blk m.dest == dest_id and m.copy == copy;
+                } else false;
+                if (!compatible) {
+                    try Ecs.sealOpenBatch(self.allocator);
+                }
+                Ecs.open_batch = .{ .migrate = .{ .dest = dest_id, .copy = copy } };
+                const start = Ecs.open_batch_refs.items.len;
+                errdefer {
+                    for (Ecs.open_batch_refs.items[start..]) |ref| Ecs.clearPending(ref.id);
+                    Ecs.open_batch_refs.items.len = start;
+                }
+                for (refs) |ref| {
+                    const entity_index = Ecs.requireIdle(ref) catch continue;
+                    try Ecs.open_batch_refs.append(self.allocator, ref);
+                    Ecs.setEntityState(entity_index, .{ .pending_migrate = true });
+                }
+            }
+            /// Queues reparenting of every entity in the slice under one
+            /// parent, or detaches them when `parent` is null. Same
+            /// skip-stale policy as `cmdDestroyMany`: stale, already-pending
+            /// and hierarchy-cycling members are skipped, an empty result is
+            /// a no-op. Members are processed in slice order; the cycle check
+            /// sees pending parents of earlier members, exactly as with
+            /// sequentially queued singles.
+            /// - `self` - handler of the running system.
+            /// - `refs` - entity references to move.
+            /// - `parent` - new parent, or null to detach. Must be alive.
+            pub fn cmdReparentMany(
+                self: *const SystemHandler,
+                refs: []const EntityReference,
+                parent: ?EntityReference,
+            ) EcsError!void {
+                var parent_id: u32 = NO_ENTITY;
+                if (parent) |p| {
+                    if (!p.isAlive()) {
+                        return EcsError.EntityIsNotAlive;
+                    }
+                    parent_id = p.id;
+                }
+                try ensureOpenReparent(self.allocator, parent);
+                const start = Ecs.open_batch_refs.items.len;
+                errdefer {
+                    for (Ecs.open_batch_refs.items[start..]) |ref| {
+                        Ecs.clearPending(ref.id);
+                        if (ref.id < Ecs.entityStateLen()) {
+                            Ecs.entity_pending_parent.items[ref.id] = NO_ENTITY;
+                        }
+                    }
+                    Ecs.open_batch_refs.items.len = start;
+                }
+                for (refs) |ref| {
+                    const entity_index = Ecs.requireIdle(ref) catch continue;
+                    if (parent) |p| {
+                        if (p.id == ref.id) {
+                            continue;
+                        }
+                        var cur: u32 = p.id;
+                        var cycle: bool = false;
+                        while (cur != NO_ENTITY) {
+                            if (cur == ref.id) {
+                                cycle = true;
+                                break;
+                            }
+                            cur = Ecs.effectiveParent(cur);
+                        }
+                        if (cycle) {
+                            continue;
+                        }
+                    }
+                    try Ecs.open_batch_refs.append(self.allocator, ref);
+                    Ecs.setEntityState(entity_index, .{ .pending_reparent = true });
+                    Ecs.entity_pending_parent.items[entity_index] = parent_id;
+                }
             }
             /// Queues an event for the entity, creating it when absent and
             /// overwriting the payload when present (upsert). Applied at the
@@ -6204,26 +9326,82 @@ pub fn ECS(comptime sets: anytype) type {
                 reserved: []EntityReference,
                 from_free: []bool,
             },
-            /// Destroy an entity and its whole subtree; skipped when stale.
-            destroy: EntityReference,
-            /// Migrate an entity; skipped when the reference is stale.
-            migrate: struct {
-                ref: EntityReference,
+            /// Destroy every entity in one exact archetype (with subtrees).
+            destroy_page: u32,
+            /// Destroy listed entities and their subtrees; stale entries are
+            /// skipped at flush. Singles and `cmdDestroyMany` alike arrive
+            /// here already batched via queue-time tail coalescing.
+            destroy_batch: []EntityReference,
+            /// Migrate many entities into one archetype; stale entries are
+            /// skipped at flush. Produced by `cmdMigrate`, `cmdMigrateMany`
+            /// and tail coalescing.
+            migrate_batch: struct {
+                refs: []EntityReference,
                 dest: u32,
                 copy: bool,
             },
-            /// Destroy every entity in one exact archetype (with subtrees).
-            destroy_page: u32,
-            /// Reparent an entity; `parent` is null when detaching. The
-            /// parent reference carries its queue-time generation, so flush
-            /// can detect a parent destroyed earlier in the same batch.
-            reparent: struct {
-                ref: EntityReference,
+            /// Reparent many entities under one parent (`null` detaches);
+            /// stale entries are skipped at flush. Produced by
+            /// `cmdReparent`, `cmdReparentMany` and tail coalescing.
+            reparent_batch: struct {
+                refs: []EntityReference,
                 parent: ?EntityReference,
             },
         };
         /// Queued structural changes of the running system.
         var commands: std.ArrayListUnmanaged(Command) = .empty;
+        /// Open tail batch under construction. Singles and `*Many` calls of
+        /// one kind accumulate here with amortized (geometric) growth and are
+        /// sealed into a single `*_batch` command on kind switch, before any
+        /// other command kind, at flush, or at discard. This is the queue-time
+        /// coalescing: mass loops arrive at flush already batched, with zero
+        /// extra pass and zero per-member reallocations.
+        const OpenBatch = union(enum) {
+            none,
+            destroy,
+            migrate: struct {
+                dest: u32,
+                copy: bool,
+            },
+            reparent: struct {
+                parent: ?EntityReference,
+            },
+        };
+        /// Key of the batch under construction; `.none` with empty refs idle.
+        var open_batch: OpenBatch = .none;
+        /// Members of the open batch, in queue order. Buffer retained across
+        /// seals via `clearRetainingCapacity`, like `commands` itself.
+        var open_batch_refs: std.ArrayListUnmanaged(EntityReference) = .empty;
+        /// Seals the open tail batch into one `*_batch` command, preserving
+        /// queue order. No-op when nothing is open. On allocation failure
+        /// everything stays as-is (members keep flags, buffer retained) for
+        /// the discard path.
+        /// - `allocator` - funds the sealed slice.
+        fn sealOpenBatch(allocator: std.mem.Allocator) EcsError!void {
+            const tag = Ecs.open_batch;
+            if (tag == .none or Ecs.open_batch_refs.items.len == 0) {
+                Ecs.open_batch = .none;
+                return;
+            }
+            const slice = try allocator.alloc(EntityReference, Ecs.open_batch_refs.items.len);
+            errdefer allocator.free(slice);
+            @memcpy(slice, Ecs.open_batch_refs.items);
+            switch (tag) {
+                .none => unreachable,
+                .destroy => try Ecs.commands.append(allocator, .{ .destroy_batch = slice }),
+                .migrate => |m| try Ecs.commands.append(allocator, .{ .migrate_batch = .{
+                    .refs = slice,
+                    .dest = m.dest,
+                    .copy = m.copy,
+                } }),
+                .reparent => |r| try Ecs.commands.append(allocator, .{ .reparent_batch = .{
+                    .refs = slice,
+                    .parent = r.parent,
+                } }),
+            }
+            Ecs.open_batch_refs.clearRetainingCapacity();
+            Ecs.open_batch = .none;
+        }
         /// Finds the values-tuple field holding the given component type.
         /// - `V` - values tuple type.
         /// - `T` - component type to locate. Must be present exactly once.
@@ -6334,6 +9512,8 @@ pub fn ECS(comptime sets: anytype) type {
         fn flushCommands(allocator: std.mem.Allocator) EcsError!void {
             @setEvalBranchQuota(10_000_000);
             defer Ecs.commands.clearRetainingCapacity();
+            // Seal any open tail batch first so it executes in queue order.
+            try Ecs.sealOpenBatch(allocator);
             // Events flush first: sets file under the pre-command archetype,
             // then entity migrates relocate them and destroys purge them.
             try Ecs.flushEventPending(allocator);
@@ -6400,25 +9580,6 @@ pub fn ECS(comptime sets: anytype) type {
                         allocator.free(c.reserved);
                         allocator.free(c.from_free);
                     },
-                    .destroy => |ref| {
-                        if (ref.isAlive()) {
-                            try ref.destroy(allocator);
-                        } else if (Ecs.entity_generation.items[ref.id] == ref.gen) {
-                            Ecs.clearPending(ref.id);
-                        }
-                    },
-                    .migrate => |m| {
-                        if (m.ref.isAlive()) {
-                            _ = try m.ref.migrateById(allocator, m.dest, m.copy);
-                            // Attribute sets queued earlier in this system
-                            // still carry the old generation: rebase them so
-                            // the attribute flush below files under the live
-                            // archetype instead of dropping them as stale.
-                            Ecs.rebaseAttributePending(m.ref.id, m.ref.gen, Ecs.entity_generation.items[m.ref.id]);
-                        } else if (Ecs.entity_generation.items[m.ref.id] == m.ref.gen) {
-                            Ecs.clearPending(m.ref.id);
-                        }
-                    },
                     .destroy_page => |arch| {
                         // Drain from the tail: every destroy cascades
                         // into the subtree, and swap-removal can touch
@@ -6431,24 +9592,20 @@ pub fn ECS(comptime sets: anytype) type {
                             try ref.destroy(allocator);
                         }
                     },
-                    .reparent => |r| {
-                        if (r.ref.isAlive()) {
-                            // A parent destroyed by an earlier command of this
-                            // batch is silently skipped, mirroring the stale
-                            // reference semantics of destroy/migrate.
-                            if (r.parent) |p| {
-                                if (p.isAlive()) {
-                                    try r.ref.reparentById(allocator, p.id);
-                                }
-                            } else {
-                                try r.ref.reparentById(allocator, NO_ENTITY);
-                            }
-                            Ecs.entity_pending_parent.items[r.ref.id] = NO_ENTITY;
-                            Ecs.setEntityState(r.ref.id, .{});
-                        } else if (Ecs.entity_generation.items[r.ref.id] == r.ref.gen) {
-                            Ecs.entity_pending_parent.items[r.ref.id] = NO_ENTITY;
-                            Ecs.clearPending(r.ref.id);
-                        }
+                    .destroy_batch => |batch| {
+                        errdefer allocator.free(batch);
+                        try Ecs.destroyBatch(allocator, batch);
+                        allocator.free(batch);
+                    },
+                    .migrate_batch => |b| {
+                        errdefer allocator.free(b.refs);
+                        try Ecs.migrateBatch(allocator, b.refs, b.dest, b.copy);
+                        allocator.free(b.refs);
+                    },
+                    .reparent_batch => |b| {
+                        errdefer allocator.free(b.refs);
+                        try Ecs.reparentBatch(allocator, b.refs, b.parent);
+                        allocator.free(b.refs);
                     },
                 }
             }
@@ -6474,6 +9631,16 @@ pub fn ECS(comptime sets: anytype) type {
             // events of earlier systems stay untouched. Same for attributes.
             Ecs.discardEventPending();
             Ecs.discardAttributePending();
+            // Drop the open tail batch: members never flushed, so clear
+            // their flags (and queued parents) and keep the buffer.
+            for (Ecs.open_batch_refs.items) |ref| {
+                Ecs.clearPending(ref.id);
+                if (ref.id < Ecs.entityStateLen()) {
+                    Ecs.entity_pending_parent.items[ref.id] = NO_ENTITY;
+                }
+            }
+            Ecs.open_batch_refs.clearRetainingCapacity();
+            Ecs.open_batch = .none;
             var i: usize = Ecs.commands.items.len;
             while (i > 0) {
                 i -= 1;
@@ -6518,18 +9685,31 @@ pub fn ECS(comptime sets: anytype) type {
                         allocator.free(c.reserved);
                         allocator.free(c.from_free);
                     },
-                    .destroy => |ref| Ecs.clearPending(ref.id),
-                    .migrate => |m| Ecs.clearPending(m.ref.id),
-                    .reparent => |r| {
-                        Ecs.clearPending(r.ref.id);
-                        if (r.ref.id < Ecs.entityStateLen()) {
-                            Ecs.entity_pending_parent.items[r.ref.id] = NO_ENTITY;
-                        }
-                    },
                     .destroy_page => |arch| {
                         for (Ecs.storages[arch].refs.items) |ref| {
                             Ecs.clearPending(ref.id);
                         }
+                    },
+                    .destroy_batch => |batch| {
+                        for (batch) |ref| {
+                            Ecs.clearPending(ref.id);
+                        }
+                        allocator.free(batch);
+                    },
+                    .migrate_batch => |b| {
+                        for (b.refs) |ref| {
+                            Ecs.clearPending(ref.id);
+                        }
+                        allocator.free(b.refs);
+                    },
+                    .reparent_batch => |b| {
+                        for (b.refs) |ref| {
+                            Ecs.clearPending(ref.id);
+                            if (ref.id < Ecs.entityStateLen()) {
+                                Ecs.entity_pending_parent.items[ref.id] = NO_ENTITY;
+                            }
+                        }
+                        allocator.free(b.refs);
                     },
                 }
             }
@@ -6606,6 +9786,9 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.discardCommands(allocator);
             Ecs.commands.deinit(allocator);
             Ecs.commands = .empty;
+            Ecs.open_batch_refs.deinit(allocator);
+            Ecs.open_batch_refs = .empty;
+            Ecs.open_batch = .none;
             for (Ecs.event_registry.items) |entry| {
                 entry.deinitStore(allocator);
                 entry.resetRegistered();
@@ -6644,6 +9827,23 @@ pub fn ECS(comptime sets: anytype) type {
             Ecs.zone_scratch_perm = .empty;
             Ecs.zone_scratch_visited.deinit(allocator);
             Ecs.zone_scratch_visited = .empty;
+            Ecs.zone_scratch_counts.deinit(allocator);
+            Ecs.zone_scratch_counts = .empty;
+            Ecs.batch_ids.deinit(allocator);
+            Ecs.batch_ids = .empty;
+            Ecs.batch_stamps.deinit(allocator);
+            Ecs.batch_stamps = .empty;
+            Ecs.batch_stamp_epoch = 1;
+            Ecs.batch_counts.deinit(allocator);
+            Ecs.batch_counts = .empty;
+            Ecs.batch_archs.deinit(allocator);
+            Ecs.batch_archs = .empty;
+            Ecs.batch_moves.deinit(allocator);
+            Ecs.batch_moves = .empty;
+            Ecs.batch_bounds.deinit(allocator);
+            Ecs.batch_bounds = .empty;
+            Ecs.batch_memos.deinit(allocator);
+            Ecs.batch_memos = .empty;
             Ecs.free_ids.deinit(allocator);
             Ecs.free_ids = .empty;
         }
@@ -6965,7 +10165,72 @@ test "schedule runs systems in order and applies commands between them" {
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
     try App.run(allocator);
-    try std.testing.expect(Ecs.count(&[_]type{Pos}) == 2);
+}
+test "consolidateZones sparse fallback keeps zones exact" {
+    // 401-chain in Pos, all but depths {0,100,200,300,400} migrated away:
+    // the source keeps 5 rows over span 401 > 4*5, forcing the comparison
+    // fallback instead of counting sort. Verifies tiling, order, rows and
+    // carried values on both sides.
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const S = struct {
+        const S = @This();
+        fn build(h: *Ecs.SystemHandler) anyerror!void {
+            var tip = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 0,
+                .vertical_coordinate = 0,
+            }});
+            var i: u32 = 0;
+            while (i < 400) : (i += 1) {
+                tip = try h.cmdCreateChild(tip, &[_]type{Pos}, .{Pos{
+                    .horizontal_coordinate = @intCast(i + 1),
+                    .vertical_coordinate = 0,
+                }});
+            }
+        }
+        fn thin(h: *Ecs.SystemHandler) anyerror!void {
+            for (h.pages(&[_]type{Pos}, &[_]type{Vel}).nonEmptyPages()) |page| {
+                for (page.entities()) |e| {
+                    const d = try e.depthOf();
+                    if (d % 100 != 0) {
+                        try h.cmdMigrate(e, &[_]type{ Pos, Vel }, true);
+                    }
+                }
+            }
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            const src = h.pages(&[_]type{Pos}, &[_]type{Vel});
+            try std.testing.expect(src.nonEmptyPages().len == 1);
+            const page = src.nonEmptyPages()[0];
+            try std.testing.expect(page.entities().len == 5);
+            var prev_end: u32 = 0;
+            var prev_depth: u32 = 0;
+            var first: bool = true;
+            for (page.depthZones()) |z| {
+                try std.testing.expect(z.offset == prev_end);
+                try std.testing.expect(z.len == 1);
+                if (!first) {
+                    try std.testing.expect(z.depth > prev_depth);
+                }
+                first = false;
+                prev_depth = z.depth;
+                prev_end = z.offset + z.len;
+            }
+            try std.testing.expect(prev_end == 5);
+            try std.testing.expect(prev_depth == 400);
+            for (page.entities(), 0..) |e, row| {
+                try std.testing.expect(Ecs.entity_row.items[e.id] == row);
+                const pos = try h.getComponent(e, Pos);
+                try std.testing.expect(pos.horizontal_coordinate == @as(i32, @intCast(try e.depthOf())));
+            }
+            const dst = h.pages(&[_]type{ Pos, Vel }, null);
+            try std.testing.expect(dst.nonEmptyPages().len == 1);
+            try std.testing.expect(dst.nonEmptyPages()[0].entities().len == 396);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.build, S.thin, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
 }
 test "deferred migrate rejects a second queued command" {
     const Ecs = ECS(.{ .{ Pos, Vel }, .{Pos} });
@@ -10389,4 +13654,899 @@ test "mass children keep creation order and consistent links" {
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
     try App.run(allocator);
+}
+test "cmdDestroyMany destroys listed entities and skips stale entries" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var refs: [8]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }}, 8);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn kill(h: *Ecs.SystemHandler) anyerror!void {
+            // Duplicate and out-of-range entries are skipped, not errors.
+            var list: [10]Ecs.EntityReference = undefined;
+            for (0..8) |i| {
+                list[i] = S.refs[i];
+            }
+            list[8] = S.refs[0];
+            list[9] = .{ .id = 9999, .gen = 0 };
+            try h.cmdDestroyMany(list[0..]);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            for (S.refs) |ref| {
+                try std.testing.expect(!ref.isAlive());
+            }
+        }
+        fn kill_empty(h: *Ecs.SystemHandler) anyerror!void {
+            // Fully stale input is a no-op.
+            const stale = [_]Ecs.EntityReference{.{ .id = 9999, .gen = 0 }};
+            try h.cmdDestroyMany(stale[0..]);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.kill, S.verify, S.kill_empty });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdDestroyMany handles ancestor and descendant in one batch" {
+    const Ecs = ECS(.{.{Pos}});
+    const S = struct {
+        const S = @This();
+        var parent: Ecs.EntityReference = undefined;
+        var child: Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.parent = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.child = try h.cmdCreateChild(S.parent, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+        }
+        fn kill(h: *Ecs.SystemHandler) anyerror!void {
+            const list = [_]Ecs.EntityReference{ S.parent, S.child };
+            try h.cmdDestroyMany(list[0..]);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(!S.parent.isAlive());
+            try std.testing.expect(!S.child.isAlive());
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.kill, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdMigrateMany moves listed entities and skips stale entries" {
+    const Ecs = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const S = struct {
+        const S = @This();
+        var refs: [8]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            const created = try h.cmdCreateN(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 4,
+            }}, 8);
+            for (created, 0..) |ref, i| {
+                S.refs[i] = ref;
+            }
+        }
+        fn move(h: *Ecs.SystemHandler) anyerror!void {
+            var list: [10]Ecs.EntityReference = undefined;
+            for (0..8) |i| {
+                list[i] = S.refs[i];
+            }
+            list[8] = S.refs[0];
+            list[9] = .{ .id = 9999, .gen = 0 };
+            try h.cmdMigrateMany(list[0..], &[_]type{ Pos, Vel }, true);
+        }
+        fn verify(h: *Ecs.SystemHandler) anyerror!void {
+            var total: usize = 0;
+            for (h.pages(&[_]type{ Pos, Vel }, null).nonEmptyPages()) |page| {
+                for (page.entities()) |_| {
+                    total += 1;
+                }
+                for (page.get(Pos)) |pos| {
+                    try std.testing.expect(pos.horizontal_coordinate == 3);
+                    try std.testing.expect(pos.vertical_coordinate == 4);
+                }
+            }
+            try std.testing.expect(total == 8);
+        }
+    };
+    const App = Ecs.Schedule(.{ S.spawn, S.move, S.verify });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "cmdReparentMany moves children under one parent and detaches" {
+    const Ecs = ECS(.{.{Pos}});
+    const N: usize = 8;
+    const S = struct {
+        const S = @This();
+        var root_a: Ecs.EntityReference = undefined;
+        var root_b: Ecs.EntityReference = undefined;
+        var kids: [N]Ecs.EntityReference = undefined;
+        fn spawn(h: *Ecs.SystemHandler) anyerror!void {
+            S.root_a = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 1,
+                .vertical_coordinate = 0,
+            }});
+            S.root_b = try h.cmdCreate(&[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 2,
+                .vertical_coordinate = 0,
+            }});
+            const created = try h.cmdCreateChildren(S.root_a, &[_]type{Pos}, .{Pos{
+                .horizontal_coordinate = 3,
+                .vertical_coordinate = 0,
+            }}, N);
+            for (created, 0..) |ref, i| {
+                S.kids[i] = ref;
+            }
+        }
+        fn move(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdReparentMany(S.kids[0..], S.root_b);
+        }
+        fn verify_moved(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.root_a.childCount() == 0);
+            try std.testing.expect(try S.root_b.childCount() == N);
+            for (S.kids) |kid| {
+                try std.testing.expect(try kid.depthOf() == 1);
+                try std.testing.expect(kid.parent().?.id == S.root_b.id);
+            }
+        }
+        fn detach(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdReparentMany(S.kids[0..], null);
+        }
+        fn verify_detached(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(try S.root_b.childCount() == 0);
+            for (S.kids) |kid| {
+                try std.testing.expect(try kid.depthOf() == 0);
+                try std.testing.expect(kid.parent() == null);
+            }
+        }
+        fn cycle_skipped(h: *Ecs.SystemHandler) anyerror!void {
+            // kids[0] is a child of root_b again: moving root_b under its
+            // own descendant would cycle, so the member is skipped silently.
+            // A stale entry alongside it is skipped too.
+            const list = [_]Ecs.EntityReference{ S.root_b, .{ .id = 9999, .gen = 0 } };
+            try h.cmdReparentMany(list[0..], S.kids[0]);
+        }
+        fn verify_cycle(h: *Ecs.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(S.root_b.parent() == null);
+            try std.testing.expect(try S.root_b.depthOf() == 0);
+            try std.testing.expect(try S.kids[0].depthOf() == 1);
+        }
+        fn reattach_one(h: *Ecs.SystemHandler) anyerror!void {
+            try h.cmdReparent(S.kids[0], S.root_b);
+        }
+    };
+    const App = Ecs.Schedule(.{
+        S.spawn,
+        S.move,
+        S.verify_moved,
+        S.detach,
+        S.verify_detached,
+        S.reattach_one,
+        S.cycle_skipped,
+        S.verify_cycle,
+    });
+    const allocator = std.testing.allocator;
+    defer Ecs.deinit(allocator);
+    try App.run(allocator);
+}
+test "enabled bitmap nextEntityId iterates mixed rows" {
+    const E = ECS(.{.{Pos}});
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    for (0..5) |_| {
+        _ = try E.create(allocator, &[_]type{Pos});
+    }
+    const page = handler.page(&[_]type{Pos});
+    // Born enabled.
+    try std.testing.expect(page.entityEnableState() == .all_enabled);
+    try std.testing.expect(page.countEnabledEntities() == 5);
+    // Disable rows 1 and 3 (page rows, creation order == row order here).
+    page.disableEntity(1);
+    page.disableEntity(3);
+    try std.testing.expect(page.entityEnableState() == .mixed);
+    try std.testing.expect(page.countEnabledEntities() == 3);
+    try std.testing.expect(page.countDisabledEntities() == 2);
+    try std.testing.expect(!page.isEntityEnabled(1));
+    try std.testing.expect(page.isEntityEnabled(2));
+    // while-loop over enabled.
+    var got_enabled: [5]u32 = undefined;
+    var n_enabled: usize = 0;
+    var cur: ?u32 = null;
+    while (page.nextEntityId(cur, null, .enabled)) |row| {
+        got_enabled[n_enabled] = row;
+        n_enabled += 1;
+        cur = row;
+    }
+    try std.testing.expect(n_enabled == 3);
+    try std.testing.expect(got_enabled[0] == 0 and got_enabled[1] == 2 and got_enabled[2] == 4);
+    // Disabled iteration.
+    var got_disabled: [5]u32 = undefined;
+    var n_disabled: usize = 0;
+    cur = null;
+    while (page.nextEntityId(cur, null, .disabled)) |row| {
+        got_disabled[n_disabled] = row;
+        n_disabled += 1;
+        cur = row;
+    }
+    try std.testing.expect(n_disabled == 2);
+    try std.testing.expect(got_disabled[0] == 1 and got_disabled[1] == 3);
+    // Exclusive start/end: [1, 4) disabled -> rows 1 and 3 only.
+    try std.testing.expect(page.nextEntityId(null, 4, .disabled) == 1);
+    try std.testing.expect(page.nextEntityId(1, 4, .disabled) == 3);
+    try std.testing.expect(page.nextEntityId(3, 4, .disabled) == null);
+    try std.testing.expect(page.nextEntityId(null, 1, .enabled) == 0);
+    try std.testing.expect(page.nextEntityId(0, 1, .enabled) == null);
+    // Fast paths: all enabled / all disabled.
+    page.enableAllEntities();
+    try std.testing.expect(page.entityEnableState() == .all_enabled);
+    try std.testing.expect(page.nextEntityId(null, null, .disabled) == null);
+    try std.testing.expect(page.nextEntityId(null, null, .enabled) == 0);
+    try std.testing.expect(page.nextEntityId(3, null, .enabled) == 4);
+    page.disableAllEntities();
+    try std.testing.expect(page.entityEnableState() == .all_disabled);
+    try std.testing.expect(page.nextEntityId(null, null, .enabled) == null);
+    try std.testing.expect(page.nextEntityId(null, null, .disabled) == 0);
+    try std.testing.expect(page.nextEntityId(4, null, .disabled) == null);
+}
+test "enabled bitmap nextComponentId is per-component" {
+    const E = ECS(.{ .{ Pos, Vel } });
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    for (0..4) |_| {
+        _ = try E.create(allocator, &[_]type{ Pos, Vel });
+    }
+    const page = handler.page(&[_]type{ Pos, Vel });
+    try std.testing.expect(page.componentEnableState(Pos) == .all_enabled);
+    page.disableComponent(Pos, 0);
+    page.disableComponent(Vel, 1);
+    // Entity column untouched.
+    try std.testing.expect(page.entityEnableState() == .all_enabled);
+    try std.testing.expect(page.componentEnableState(Pos) == .mixed);
+    try std.testing.expect(page.countEnabledComponents(Pos) == 3);
+    try std.testing.expect(page.countEnabledComponents(Vel) == 3);
+    try std.testing.expect(page.nextComponentId(Pos, false, null, null, .disabled) == 0);
+    try std.testing.expect(page.nextComponentId(Pos, false, 0, null, .disabled) == null);
+    try std.testing.expect(page.nextComponentId(Vel, false, null, null, .disabled) == 1);
+    try std.testing.expect(page.nextComponentId(Vel, false, null, null, .enabled) == 0);
+    try std.testing.expect(page.nextComponentId(Vel, false, 0, null, .enabled) == 2);
+    // With entity check: entity column is all_enabled, so enabled results
+    // match the plain call, but disabled finds nothing (entity never off).
+    try std.testing.expect(page.nextComponentId(Pos, true, null, null, .enabled) == 1);
+    try std.testing.expect(page.nextComponentId(Pos, true, null, null, .disabled) == null);
+    page.disableEntity(1);
+    try std.testing.expect(page.nextComponentId(Pos, true, null, null, .enabled) == 2);
+    try std.testing.expect(page.nextComponentId(Pos, true, null, null, .disabled) == null);
+    page.enableEntity(1);
+    // EntityRef + handler API mirrors page bits.
+    const refs = page.entities();
+    try std.testing.expect(try refs[0].isComponentEnabled(Pos) == false);
+    try std.testing.expect(try refs[1].isComponentEnabled(Pos) == true);
+    try std.testing.expect(refs[2].isEntityEnabled() == true);
+    try std.testing.expect(try handler.isComponentEnabled(refs[0], Pos) == false);
+    try refs[0].enableComponent(Pos);
+    try std.testing.expect(page.isComponentEnabled(Pos, 0) == true);
+    try handler.disableComponent(refs[2], Vel);
+    try std.testing.expect(page.isComponentEnabled(Vel, 2) == false);
+    try handler.setEntityEnabled(refs[2], false);
+    try std.testing.expect(page.isEntityEnabled(2) == false);
+    try std.testing.expect(refs[2].isEntityEnabled() == false);
+    try refs[2].enableEntity();
+    try std.testing.expect(page.isEntityEnabled(2) == true);
+    // Raw bitmap access stays in sync with counters.
+    try std.testing.expect(page.entitiesEnabledBits().len == 1);
+    try std.testing.expect(page.componentEnabledBits(Pos).len == 1);
+}
+test "enabled bits survive removeRow rotation and word boundary" {
+    const E = ECS(.{.{Pos}});
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    const total: u32 = 130;
+    for (0..total) |_| {
+        _ = try E.create(allocator, &[_]type{Pos});
+    }
+    const page = handler.page(&[_]type{Pos});
+    try std.testing.expect(page.entitiesEnabledBits().len == 3);
+    // Disable every third row.
+    var i: u32 = 0;
+    while (i < total) : (i += 3) {
+        page.disableEntity(i);
+    }
+    const want_disabled: u32 = (total + 2) / 3;
+    try std.testing.expect(page.countDisabledEntities() == want_disabled);
+    try std.testing.expect(page.countEnabledEntities() == total - want_disabled);
+    // Full scan via next* must visit exactly the disabled set.
+    var seen: u32 = 0;
+    var cur: ?u32 = null;
+    while (page.nextEntityId(cur, null, .disabled)) |row| {
+        try std.testing.expect(row % 3 == 0);
+        seen += 1;
+        cur = row;
+    }
+    try std.testing.expect(seen == want_disabled);
+    // Destroy the first row (removeRow cascade head): counters must stay exact.
+    const victim = page.entities()[0];
+    try victim.destroy(allocator);
+    try std.testing.expect(E.count(&[_]type{Pos}) == total - 1);
+    var recount: u32 = 0;
+    cur = null;
+    while (page.nextEntityId(cur, null, .enabled)) |row| {
+        recount += 1;
+        cur = row;
+    }
+    try std.testing.expect(recount == page.countEnabledEntities());
+    var recount_d: u32 = 0;
+    cur = null;
+    while (page.nextEntityId(cur, null, .disabled)) |row| {
+        recount_d += 1;
+        cur = row;
+    }
+    try std.testing.expect(recount_d == page.countDisabledEntities());
+    try std.testing.expect(recount + recount_d == total - 1);
+}
+test "enabled flags survive migrate and reparent" {
+    const E = ECS(.{ .{ Pos, Vel }, .{ Pos, Health } });
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const a = try E.create(allocator, &[_]type{ Pos, Vel });
+    const b = try E.create(allocator, &[_]type{ Pos, Vel });
+    const handler = E.SystemHandler{ .allocator = allocator };
+    const page_src = handler.page(&[_]type{ Pos, Vel });
+    page_src.disableEntity(0);
+    page_src.disableComponent(Pos, 1);
+    try std.testing.expect(a.isEntityEnabled() == false);
+    // Migrate a with copy: entity flag travels, shared Pos flag (enabled) travels.
+    const a2 = try a.migrate(allocator, &[_]type{ Pos, Health }, true);
+    const page_dst = handler.page(&[_]type{ Pos, Health });
+    try std.testing.expect(a2.isEntityEnabled() == false);
+    try std.testing.expect(try a2.isComponentEnabled(Pos) == true);
+    try std.testing.expect(page_dst.countEnabledEntities() == 0);
+    // Migrate b without copy: fresh component flags default to enabled.
+    try b.disableComponent(Vel);
+    const b2 = try b.migrate(allocator, &[_]type{ Pos, Health }, false);
+    try std.testing.expect(b2.isEntityEnabled() == true);
+    try std.testing.expect(try b2.isComponentEnabled(Pos) == true);
+    // Reparent depth move preserves flags (removeRow + insertRowAtDepth path).
+    const parent = try E.create(allocator, &[_]type{ Pos, Health });
+    try b2.disableEntity();
+    try b2.setComponentEnabled(Pos, false);
+    try b2.reparentById(allocator, parent.id);
+    try std.testing.expect(b2.isEntityEnabled() == false);
+    try std.testing.expect(try b2.isComponentEnabled(Pos) == false);
+}
+test "enabled iteration composes with DepthZone bounds" {
+    const E = ECS(.{.{Pos}});
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    const root = try E.create(allocator, &[_]type{Pos});
+    var kids: [4]E.EntityReference = undefined;
+    for (0..4) |k| {
+        kids[k] = try E.create(allocator, &[_]type{Pos});
+        try kids[k].reparentById(allocator, root.id);
+    }
+    const page = handler.page(&[_]type{Pos});
+    try std.testing.expect(page.depthCount() == 2);
+    const z0 = page.zone(0);
+    const z1 = page.zone(1);
+    try std.testing.expect(z0.len() == 1);
+    try std.testing.expect(z1.len() == 4);
+    // Disable one kid; zone-scoped iteration must stay inside the zone.
+    const kid_row = try kids[1].indexOf();
+    page.disableEntity(kid_row);
+    try std.testing.expect(z1.entityEnableState() == .mixed);
+    try std.testing.expect(z1.countEnabledEntities() == 3);
+    var seen: u32 = 0;
+    var cur: ?u32 = null;
+    while (z1.nextEntityId(cur, .enabled)) |row| {
+        try std.testing.expect(row >= z1.zone.offset and row < z1.zone.offset + z1.zone.len);
+        seen += 1;
+        cur = row;
+    }
+    try std.testing.expect(seen == 3);
+    // Same range via page-level end bound (DepthZone idiom, end exclusive).
+    var seen2: u32 = 0;
+    cur = null;
+    while (page.nextEntityId(cur, z1.zone.offset + z1.zone.len, .enabled)) |row| {
+        if (row < z1.zone.offset) {
+            cur = row;
+            continue;
+        }
+        seen2 += 1;
+        cur = row;
+    }
+    try std.testing.expect(seen2 == 3);
+    // Zone bulk ops affect only the zone.
+    z1.disableAllEntities();
+    try std.testing.expect(z0.countEnabledEntities() == 1);
+    try std.testing.expect(z1.countEnabledEntities() == 0);
+    try std.testing.expect(page.countEnabledEntities() == 1);
+}
+test "enabled bits survive bulk batch commands" {
+    const E = ECS(.{ .{ Pos, Vel }, .{ Pos, Health } });
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const S = struct {
+        var src_refs: [8]E.EntityReference = undefined;
+        var dst_check: [8]bool = undefined;
+        fn spawn(h: *E.SystemHandler) anyerror!void {
+            for (0..8) |k| {
+                src_refs[k] = try h.cmdCreate(&[_]type{ Pos, Vel }, .{ Pos{ .horizontal_coordinate = 0, .vertical_coordinate = 0 }, Vel{ .horizontal_speed = 0, .vertical_speed = 0 } });
+            }
+        }
+        fn disable_some(h: *E.SystemHandler) anyerror!void {
+            const p = h.page(&[_]type{ Pos, Vel });
+            // Disable even rows: survives the create_batch consolidate.
+            var r: u32 = 0;
+            while (r < 8) : (r += 2) {
+                p.disableEntity(r);
+                p.disableComponent(Pos, r);
+            }
+            try std.testing.expect(p.countEnabledEntities() == 4);
+        }
+        fn migrate_half(h: *E.SystemHandler) anyerror!void {
+            // Migrate first 4 via batch path (len > 1 -> migrateBatch).
+            try h.cmdMigrateMany(src_refs[0..4], &[_]type{ Pos, Health }, true);
+        }
+        fn verify_migrated(h: *E.SystemHandler) anyerror!void {
+            const dst = h.page(&[_]type{ Pos, Health });
+            try std.testing.expect(E.count(&[_]type{ Pos, Health }) == 4);
+            // Rows 0,2 disabled traveled; rows 1,3 enabled traveled.
+            var disabled: u32 = 0;
+            var cur: ?u32 = null;
+            while (dst.nextEntityId(cur, null, .disabled)) |row| {
+                disabled += 1;
+                cur = row;
+            }
+            try std.testing.expect(disabled == 2);
+            try std.testing.expect(dst.countEnabledEntities() == 2);
+            var disabled_c: u32 = 0;
+            cur = null;
+            while (dst.nextComponentId(Pos, false, cur, null, .disabled)) |row| {
+                disabled_c += 1;
+                cur = row;
+            }
+            try std.testing.expect(disabled_c == 2);
+            // Refresh handles (migrate bumps generations).
+            for (0..4) |k| {
+                src_refs[k] = E.EntityReference{ .id = src_refs[k].id, .gen = E.entity_generation.items[src_refs[k].id] };
+                dst_check[k] = src_refs[k].isEntityEnabled();
+            }
+            try std.testing.expect(dst_check[0] == false);
+            try std.testing.expect(dst_check[1] == true);
+            try std.testing.expect(dst_check[2] == false);
+            try std.testing.expect(dst_check[3] == true);
+        }
+        fn destroy_half(h: *E.SystemHandler) anyerror!void {
+            // Destroy remaining 4 source rows via batch path (compactRemoveDead).
+            try h.cmdDestroyMany(src_refs[4..8]);
+        }
+        fn verify_destroyed(h: *E.SystemHandler) anyerror!void {
+            _ = h;
+            try std.testing.expect(E.count(&[_]type{ Pos, Vel }) == 0);
+            try std.testing.expect(E.count(&[_]type{ Pos, Health }) == 4);
+        }
+    };
+    const App = E.Schedule(.{
+        S.spawn,
+        S.disable_some,
+        S.migrate_half,
+        S.verify_migrated,
+        S.destroy_half,
+        S.verify_destroyed,
+    });
+    try App.run(allocator);
+}
+test "nextComponentsId matches conjunction of component bits" {
+    const E = ECS(.{ .{ Pos, Vel, Health } });
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    for (0..6) |_| {
+        _ = try E.create(allocator, &[_]type{ Pos, Vel, Health });
+    }
+    const page = handler.page(&[_]type{ Pos, Vel, Health });
+    // Row plan (page rows == creation order, single depth zone):
+    // row: entity Pos Vel Health
+    // 0:   on     on  off on
+    // 1:   on     off on  on
+    // 2:   off    on  on  on
+    // 3:   on     off off on
+    // 4:   on     on  on  off
+    // 5:   on     on  on  on
+    page.disableComponent(Vel, 0);
+    page.disableComponent(Pos, 1);
+    page.disableEntity(2);
+    page.disableComponent(Pos, 3);
+    page.disableComponent(Vel, 3);
+    page.disableComponent(Health, 4);
+    // Pos+Vel enabled -> rows 2, 4, 5 (entity flag ignored).
+    var got: [6]u32 = undefined;
+    var n: usize = 0;
+    var cur: ?u32 = null;
+    while (page.nextComponentsId(&[_]type{ Pos, Vel }, false, cur, null, .enabled)) |row| {
+        got[n] = row;
+        n += 1;
+        cur = row;
+    }
+    try std.testing.expect(n == 3);
+    try std.testing.expect(got[0] == 2 and got[1] == 4 and got[2] == 5);
+    // Pos+Vel disabled -> row 3 only.
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, null, null, .disabled) == 3);
+    // Same pair plus entity check: row 2 drops out (entity off).
+    cur = null;
+    n = 0;
+    while (page.nextComponentsId(&[_]type{ Pos, Vel }, true, cur, null, .enabled)) |row| {
+        got[n] = row;
+        n += 1;
+        cur = row;
+    }
+    try std.testing.expect(n == 2);
+    try std.testing.expect(got[0] == 4 and got[1] == 5);
+    // Exclusive bounds: [1, 5) enabled without entity -> rows 2 and 4.
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, null, 5, .enabled) == 2);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, 2, 5, .enabled) == 4);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, 4, 5, .enabled) == null);
+    // Single-component call matches nextComponentId.
+    try std.testing.expect(page.nextComponentsId(&[_]type{Pos}, false, null, null, .disabled) == page.nextComponentId(Pos, false, null, null, .disabled));
+    // Empty bundle without entity matches every row; with entity it mirrors nextEntityId.
+    try std.testing.expect(page.nextComponentsId(&[_]type{}, false, null, null, .enabled) == 0);
+    try std.testing.expect(page.nextComponentsId(&[_]type{}, false, 4, null, .enabled) == 5);
+    try std.testing.expect(page.nextComponentsId(&[_]type{}, true, null, null, .disabled) == page.nextEntityId(null, null, .disabled));
+    // Fast-path extremes.
+    page.enableAllComponents(Pos);
+    page.enableAllComponents(Vel);
+    page.enableAllComponents(Health);
+    page.enableAllEntities();
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, true, null, null, .disabled) == null);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, true, 3, null, .enabled) == 4);
+    page.disableAllComponents(Pos);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, null, null, .enabled) == null);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, null, null, .disabled) == null);
+    page.disableAllComponents(Vel);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, null, null, .disabled) == 0);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Vel }, false, 4, null, .disabled) == 5);
+}
+test "nextComponentsId on ZoneView stays inside the zone" {
+    const E = ECS(.{.{ Pos, Vel }});
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    const root = try E.create(allocator, &[_]type{ Pos, Vel });
+    _ = root;
+    var kids: [4]E.EntityReference = undefined;
+    for (0..4) |k| {
+        kids[k] = try E.create(allocator, &[_]type{ Pos, Vel });
+    }
+    // Parent the kids one by one, re-resolving rows after each move
+    // (every reparent rotates rows, so stale row indices would disable
+    // the wrong rows).
+    const parent = (handler.page(&[_]type{ Pos, Vel })).entities()[0];
+    for (kids) |kid| {
+        try kid.reparentById(allocator, parent.id);
+    }
+    const page = handler.page(&[_]type{ Pos, Vel });
+    const z1 = page.zone(1);
+    try std.testing.expect(z1.len() == 4);
+    // Disable Pos on the first zone row and Vel on the second zone row.
+    page.disableComponent(Pos, z1.zone.offset);
+    page.disableComponent(Vel, z1.zone.offset + 1);
+    // Joint enabled search inside the zone yields the other two rows.
+    var n: usize = 0;
+    var cur: ?u32 = null;
+    var last: u32 = 0;
+    while (z1.nextComponentsId(&[_]type{ Pos, Vel }, false, cur, .enabled)) |row| {
+        try std.testing.expect(row >= z1.zone.offset and row < z1.zone.offset + z1.zone.len);
+        n += 1;
+        last = row;
+        cur = row;
+    }
+    try std.testing.expect(n == 2);
+    // The row after the last match reports null (exclusive start).
+    try std.testing.expect(z1.nextComponentsId(&[_]type{ Pos, Vel }, false, last, .enabled) == null);
+    // Entity flag participates when requested.
+    page.disableEntity(z1.zone.offset + 2);
+    try std.testing.expect(z1.nextComponentsId(&[_]type{ Pos, Vel }, true, null, .enabled) == z1.zone.offset + 3);
+    try std.testing.expect(z1.nextComponentsId(&[_]type{ Pos, Vel }, false, null, .enabled) == z1.zone.offset + 2);
+}
+test "enabled full Page/Ref/Handler API matrix" {
+    const E = ECS(.{ .{Pos}, .{ Pos, Vel } });
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    const Ghost = struct { x: u32 };
+    var refs: [3]E.EntityReference = undefined;
+    for (0..3) |k| {
+        refs[k] = try E.create(allocator, &[_]type{ Pos, Vel });
+    }
+    const page = handler.page(&[_]type{ Pos, Vel });
+    // Disabled-component counters start at zero.
+    try std.testing.expect(page.countDisabledComponents(Pos) == 0);
+    try std.testing.expect(page.countDisabledComponents(Vel) == 0);
+    // Raw bitmap layout: LSB is row 0. Disable rows 1 and 3 at entity level.
+    page.disableEntity(1);
+    page.disableEntity(3);
+    try std.testing.expect(page.entitiesEnabledBits()[0] == 0b101);
+    // Direct set with both values, plus idempotent re-set keeps counters.
+    page.setEntityEnabled(1, true);
+    try std.testing.expect(page.countEnabledEntities() == 3);
+    page.setEntityEnabled(1, true);
+    try std.testing.expect(page.countEnabledEntities() == 3);
+    page.setEntityEnabled(1, false);
+    try std.testing.expect(page.countDisabledEntities() == 1);
+    page.setComponentEnabled(Pos, 0, false);
+    try std.testing.expect(page.countEnabledComponents(Pos) == 2);
+    try std.testing.expect(page.countDisabledComponents(Pos) == 1);
+    page.setComponentEnabled(Pos, 0, false);
+    try std.testing.expect(page.countDisabledComponents(Pos) == 1);
+    page.setComponentEnabled(Pos, 0, true);
+    try std.testing.expect(page.countDisabledComponents(Pos) == 0);
+    // Out-of-range access: reads report disabled, writes are ignored.
+    try std.testing.expect(page.isEntityEnabled(9999) == false);
+    page.setEntityEnabled(9999, false);
+    page.enableEntity(9999);
+    try std.testing.expect(page.countEnabledEntities() == 2);
+    try std.testing.expect(page.isComponentEnabled(Pos, 9999) == false);
+    page.setComponentEnabled(Pos, 9999, false);
+    page.disableComponent(Vel, 9999);
+    try std.testing.expect(page.countEnabledComponents(Pos) == 3);
+    try std.testing.expect(page.countEnabledComponents(Vel) == 3);
+    // Incremental walk to the extremes without bulk helpers.
+    page.setEntityEnabled(0, false);
+    page.setEntityEnabled(2, false);
+    try std.testing.expect(page.entityEnableState() == .all_disabled);
+    try std.testing.expect(page.nextEntityId(null, null, .enabled) == null);
+    try std.testing.expect(page.nextEntityId(null, null, .disabled) == 0);
+    page.setEntityEnabled(0, true);
+    page.setEntityEnabled(1, true);
+    try std.testing.expect(page.entityEnableState() == .mixed);
+    page.setEntityEnabled(2, true);
+    try std.testing.expect(page.entityEnableState() == .all_enabled);
+    try std.testing.expect(page.countDisabledEntities() == 0);
+    // Full SystemHandler matrix.
+    try std.testing.expect(try handler.isEntityEnabled(refs[0]) == true);
+    try handler.enableEntity(refs[0]);
+    try std.testing.expect(refs[0].isEntityEnabled() == true);
+    try handler.disableEntity(refs[0]);
+    try std.testing.expect(refs[0].isEntityEnabled() == false);
+    try handler.setEntityEnabled(refs[0], true);
+    try std.testing.expect(refs[0].isEntityEnabled() == true);
+    try handler.enableComponent(refs[1], Vel);
+    try std.testing.expect(page.isComponentEnabled(Vel, 1) == true);
+    try handler.setComponentEnabled(refs[1], Vel, false);
+    try std.testing.expect(page.isComponentEnabled(Vel, 1) == false);
+    try handler.setComponentEnabled(refs[1], Vel, true);
+    try std.testing.expect(page.isComponentEnabled(Vel, 1) == true);
+    // EntityReference direct set with both values.
+    try refs[2].setEntityEnabled(false);
+    try std.testing.expect(refs[2].isEntityEnabled() == false);
+    try refs[2].setEntityEnabled(true);
+    try std.testing.expect(refs[2].isEntityEnabled() == true);
+    // Duplicate and nested bundles dedup to the same columns.
+    page.disableComponent(Pos, 0);
+    try std.testing.expect(page.nextComponentsId(&[_]type{ Pos, Pos }, false, null, null, .disabled) == 0);
+    try std.testing.expect(page.nextComponentsId(.{ .{Pos}, Vel }, false, null, null, .enabled) == 1);
+    page.enableComponent(Pos, 0);
+    // Component missing from the entity archetype.
+    const solo = try E.create(allocator, &[_]type{Pos});
+    try std.testing.expectError(E.EcsError.ComponentNotFoundInArchetype, solo.isComponentEnabled(Vel));
+    try std.testing.expectError(E.EcsError.ComponentNotFoundInArchetype, solo.setComponentEnabled(Vel, false));
+    try std.testing.expectError(E.EcsError.ComponentNotFoundInArchetype, solo.enableComponent(Vel));
+    try std.testing.expectError(E.EcsError.ComponentNotFoundInArchetype, solo.disableComponent(Vel));
+    // Component type never declared in ECS(...).
+    try std.testing.expectError(E.EcsError.ComponentNotFoundInArchetype, refs[1].isComponentEnabled(Ghost));
+    try std.testing.expectError(E.EcsError.ComponentNotFoundInArchetype, refs[1].setComponentEnabled(Ghost, false));
+    // Dead references: reads report disabled, writes fail.
+    const dead = refs[0];
+    try dead.destroy(allocator);
+    try std.testing.expect(dead.isEntityEnabled() == false);
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, dead.setEntityEnabled(true));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, dead.enableEntity());
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, dead.disableEntity());
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, dead.isComponentEnabled(Pos));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, dead.setComponentEnabled(Pos, true));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.isEntityEnabled(dead));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.setEntityEnabled(dead, true));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.enableEntity(dead));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.disableEntity(dead));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.isComponentEnabled(dead, Pos));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.setComponentEnabled(dead, Pos, true));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.enableComponent(dead, Pos));
+    try std.testing.expectError(E.EcsError.EntityIsNotAlive, handler.disableComponent(dead, Pos));
+    // A recycled slot is born fully enabled.
+    const recycled = try E.create(allocator, &[_]type{ Pos, Vel });
+    try std.testing.expect(recycled.id == dead.id);
+    try std.testing.expect(recycled.isEntityEnabled() == true);
+    try std.testing.expect(try recycled.isComponentEnabled(Pos) == true);
+    try std.testing.expect(try recycled.isComponentEnabled(Vel) == true);
+}
+test "enabled full ZoneView matrix incl empty views" {
+    const E = ECS(.{.{Pos}});
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    // Empty page: every state is all_disabled, every search misses.
+    const blank = handler.page(&[_]type{Pos});
+    try std.testing.expect(blank.entityEnableState() == .all_disabled);
+    try std.testing.expect(blank.componentEnableState(Pos) == .all_disabled);
+    try std.testing.expect(blank.countEnabledEntities() == 0);
+    try std.testing.expect(blank.countDisabledEntities() == 0);
+    try std.testing.expect(blank.countEnabledComponents(Pos) == 0);
+    try std.testing.expect(blank.countDisabledComponents(Pos) == 0);
+    try std.testing.expect(blank.nextEntityId(null, null, .enabled) == null);
+    try std.testing.expect(blank.nextEntityId(null, null, .disabled) == null);
+    try std.testing.expect(blank.nextComponentId(Pos, false, null, null, .enabled) == null);
+    try std.testing.expect(blank.nextComponentId(Pos, true, null, null, .disabled) == null);
+    try std.testing.expect(blank.nextComponentsId(&[_]type{Pos}, false, null, null, .enabled) == null);
+    try std.testing.expect(blank.nextComponentsId(&[_]type{}, false, null, null, .enabled) == null);
+    try std.testing.expect(blank.entitiesEnabledBits().len == 0);
+    try std.testing.expect(blank.componentEnabledBits(Pos).len == 0);
+    // Empty zone: same contract, bulk ops are no-ops.
+    const ez = blank.zone(7);
+    try std.testing.expect(ez.len() == 0);
+    try std.testing.expect(ez.entityEnableState() == .all_disabled);
+    try std.testing.expect(ez.componentEnableState(Pos) == .all_disabled);
+    try std.testing.expect(ez.countEnabledEntities() == 0);
+    try std.testing.expect(ez.countDisabledEntities() == 0);
+    try std.testing.expect(ez.countEnabledComponents(Pos) == 0);
+    try std.testing.expect(ez.countDisabledComponents(Pos) == 0);
+    try std.testing.expect(ez.nextEntityId(null, .enabled) == null);
+    try std.testing.expect(ez.nextEntityId(null, .disabled) == null);
+    try std.testing.expect(ez.nextComponentId(Pos, false, null, .enabled) == null);
+    try std.testing.expect(ez.nextComponentId(Pos, true, null, .disabled) == null);
+    try std.testing.expect(ez.nextComponentsId(&[_]type{Pos}, false, null, .enabled) == null);
+    try std.testing.expect(ez.nextComponentsId(&[_]type{Pos}, true, null, .disabled) == null);
+    ez.enableAllEntities();
+    ez.disableAllEntities();
+    ez.enableAllComponents(Pos);
+    ez.disableAllComponents(Pos);
+    try std.testing.expect(blank.countEnabledEntities() == 0);
+    // Search-edge guards on a live page.
+    for (0..3) |_| {
+        _ = try E.create(allocator, &[_]type{Pos});
+    }
+    const page = handler.page(&[_]type{Pos});
+    try std.testing.expect(page.nextEntityId(9999, null, .enabled) == null);
+    try std.testing.expect(page.nextEntityId(std.math.maxInt(u32), null, .enabled) == null);
+    try std.testing.expect(page.nextEntityId(null, 0, .enabled) == null);
+    try std.testing.expect(page.nextEntityId(null, 0, .disabled) == null);
+    try std.testing.expect(page.nextComponentId(Pos, false, 9999, null, .enabled) == null);
+    try std.testing.expect(page.nextComponentId(Pos, false, null, 0, .disabled) == null);
+    try std.testing.expect(page.nextComponentId(Pos, true, std.math.maxInt(u32), null, .enabled) == null);
+    try std.testing.expect(page.nextComponentsId(&[_]type{Pos}, false, 9999, null, .enabled) == null);
+    try std.testing.expect(page.nextComponentsId(&[_]type{Pos}, true, null, 0, .disabled) == null);
+    // ZoneView single-row forwards read and write the same bits as Page.
+    const z = page.zone(0);
+    try std.testing.expect(z.len() == 3);
+    try std.testing.expect(z.isEntityEnabled(0) == true);
+    z.disableEntity(0);
+    try std.testing.expect(page.isEntityEnabled(0) == false);
+    try std.testing.expect(z.countEnabledEntities() == 2);
+    try std.testing.expect(z.countDisabledEntities() == 1);
+    z.enableEntity(0);
+    z.setEntityEnabled(1, false);
+    try std.testing.expect(page.isEntityEnabled(1) == false);
+    z.setEntityEnabled(1, true);
+    try std.testing.expect(z.isComponentEnabled(Pos, 2) == true);
+    z.setComponentEnabled(Pos, 2, false);
+    try std.testing.expect(page.isComponentEnabled(Pos, 2) == false);
+    try std.testing.expect(z.countEnabledComponents(Pos) == 2);
+    try std.testing.expect(z.countDisabledComponents(Pos) == 1);
+    z.setComponentEnabled(Pos, 2, true);
+    z.enableComponent(Pos, 2);
+    try std.testing.expect(page.isComponentEnabled(Pos, 2) == true);
+    z.disableComponent(Pos, 2);
+    try std.testing.expect(page.isComponentEnabled(Pos, 2) == false);
+    z.enableComponent(Pos, 2);
+    // ZoneView single-component search, both entity modes.
+    z.setComponentEnabled(Pos, 1, false);
+    try std.testing.expect(z.nextComponentId(Pos, false, null, .disabled) == 1);
+    try std.testing.expect(z.nextComponentId(Pos, false, 1, .disabled) == null);
+    try std.testing.expect(z.nextComponentId(Pos, true, null, .enabled) == 0);
+    z.disableEntity(0);
+    try std.testing.expect(z.nextComponentId(Pos, true, null, .enabled) == 2);
+    try std.testing.expect(z.nextComponentId(Pos, false, null, .enabled) == 0);
+    z.enableEntity(0);
+    z.setComponentEnabled(Pos, 1, true);
+    // Zone-scoped component bulk ops leave the rest of the page alone.
+    z.disableAllComponents(Pos);
+    try std.testing.expect(z.countEnabledComponents(Pos) == 0);
+    try std.testing.expect(z.countDisabledComponents(Pos) == 3);
+    try std.testing.expect(page.countEnabledComponents(Pos) == 0);
+    z.enableAllComponents(Pos);
+    try std.testing.expect(page.countEnabledComponents(Pos) == 3);
+}
+test "enabled bulk multi-word and batch removeRow path" {
+    const E = ECS(.{.{Pos}});
+    const allocator = std.testing.allocator;
+    defer E.deinit(allocator);
+    const handler = E.SystemHandler{ .allocator = allocator };
+    const total: u32 = 100;
+    var refs: [100]E.EntityReference = undefined;
+    for (0..100) |k| {
+        refs[k] = try E.create(allocator, &[_]type{Pos});
+    }
+    const page = handler.page(&[_]type{Pos});
+    page.disableEntity(10);
+    page.disableEntity(20);
+    page.disableComponent(Pos, 30);
+    try std.testing.expect(page.entitiesEnabledBits().len == 2);
+    // Whole-page bulk ops cross word boundaries with exact counters.
+    page.disableAllEntities();
+    try std.testing.expect(page.countEnabledEntities() == 0);
+    try std.testing.expect(page.nextEntityId(null, null, .disabled) == 0);
+    page.enableAllEntities();
+    try std.testing.expect(page.countEnabledEntities() == total);
+    page.disableAllComponents(Pos);
+    try std.testing.expect(page.countEnabledComponents(Pos) == 0);
+    try std.testing.expect(page.nextComponentId(Pos, false, null, null, .disabled) == 0);
+    page.enableAllComponents(Pos);
+    page.disableEntity(10);
+    page.disableEntity(20);
+    page.disableComponent(Pos, 30);
+    // Two victims out of 100 take the exact removeRow cascade
+    // (dead * 32 < live), not the stable compact path.
+    const S = struct {
+        var victims: [2]E.EntityReference = undefined;
+        fn kill(h: *E.SystemHandler) anyerror!void {
+            try h.cmdDestroyMany(victims[0..]);
+        }
+    };
+    S.victims[0] = refs[50];
+    S.victims[1] = refs[60];
+    const App = E.Schedule(.{S.kill});
+    try App.run(allocator);
+    try std.testing.expect(E.count(&[_]type{Pos}) == total - 2);
+    try std.testing.expect(page.countDisabledEntities() == 2);
+    try std.testing.expect(page.countEnabledEntities() == total - 4);
+    try std.testing.expect(page.countDisabledComponents(Pos) == 1);
+    // Survivors keep their flags across the cascade (handles re-resolve rows).
+    try std.testing.expect(refs[10].isEntityEnabled() == false);
+    try std.testing.expect(refs[20].isEntityEnabled() == false);
+    try std.testing.expect(try refs[30].isComponentEnabled(Pos) == false);
+    try std.testing.expect(refs[31].isEntityEnabled() == true);
+    // Counters agree with full scans.
+    var enabled: u32 = 0;
+    var cur: ?u32 = null;
+    while (page.nextEntityId(cur, null, .enabled)) |row| {
+        enabled += 1;
+        cur = row;
+    }
+    try std.testing.expect(enabled == page.countEnabledEntities());
+    var disabled: u32 = 0;
+    cur = null;
+    while (page.nextEntityId(cur, null, .disabled)) |row| {
+        disabled += 1;
+        cur = row;
+    }
+    try std.testing.expect(disabled == page.countDisabledEntities());
+    try std.testing.expect(enabled + disabled == total - 2);
+    var comp_disabled: u32 = 0;
+    cur = null;
+    while (page.nextComponentId(Pos, false, cur, null, .disabled)) |row| {
+        comp_disabled += 1;
+        cur = row;
+    }
+    try std.testing.expect(comp_disabled == page.countDisabledComponents(Pos));
 }
