@@ -7,12 +7,12 @@ const Vel = struct { vx: f32 = 0, vy: f32 = 0 };
 
 const EcsM = ecs_module.ECS(.{ .{Pos}, .{ Pos, Vel } });
 
-const Ns: []const usize = if (builtin.mode == .Debug)
+const Ns: []const usize = if (builtin.mode == .debug)
     &.{ 500, 1000, 2000 }
 else
     &.{ 10000, 25000, 50000, 100000 };
 
-const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
+const REPS: usize = if (builtin.mode == .debug) 2 else 3;
 
 fn benchIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();

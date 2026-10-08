@@ -757,7 +757,7 @@ pub fn ECS(comptime sets: anytype) type {
                     // rebirths them as enabled, so snapshot and restore.
                     const st = &Ecs.storages[arch];
                     const saved_entity = ArchetypeStorage.enabledBitGet(st.entity_enabled.items, row);
-                    var saved_comps: [MAX_COLS]bool = [_]bool{true} ** MAX_COLS;
+                    var saved_comps: [MAX_COLS]bool = @splat(true);
                     for (0..st.len) |ci| {
                         saved_comps[ci] = ArchetypeStorage.enabledBitGet(st.comp_enabled[ci].items, row);
                     }
@@ -838,7 +838,7 @@ pub fn ECS(comptime sets: anytype) type {
                 // set (mirroring `copyShared`), fresh components stay enabled.
                 const src_storage = &Ecs.storages[source_id];
                 const saved_entity_bit = ArchetypeStorage.enabledBitGet(src_storage.entity_enabled.items, source_index);
-                var saved_src_comp: [MAX_COLS]bool = [_]bool{true} ** MAX_COLS;
+                var saved_src_comp: [MAX_COLS]bool = @splat(true);
                 for (0..src_storage.len) |ci| {
                     saved_src_comp[ci] = ArchetypeStorage.enabledBitGet(src_storage.comp_enabled[ci].items, source_index);
                 }
@@ -1155,7 +1155,7 @@ pub fn ECS(comptime sets: anytype) type {
             if (info != .@"struct" or !info.@"struct".is_tuple) {
                 @compileError("ECS expects a tuple of archetype tuples, e.g. ECS(.{ .{Pos, Vel}, .{Pos} }).");
             }
-            break :blk info.@"struct".fields.len;
+            break :blk info.@"struct".field_names.len;
         };
         /// Largest leaf count over all archetype bundles. Statically frozen so it
         /// can size comptime buffers. Nested tuples are counted recursively.
@@ -1186,7 +1186,7 @@ pub fn ECS(comptime sets: anytype) type {
         const Tables = blk: {
             @setEvalBranchQuota(10_000_000);
             var canon_types: [input_count][max_len]type = undefined;
-            var canon_lens: [input_count]usize = [_]usize{0} ** input_count;
+            var canon_lens: [input_count]usize = @splat(0);
             for (0..input_count) |i| {
                 const flat = flattenTypes(sets[i]);
                 var uniq: [max_len]type = undefined;
@@ -1220,7 +1220,7 @@ pub fn ECS(comptime sets: anytype) type {
             }
             var order_scratch: [input_count]HashIndex = undefined;
             sortHashIndices(order[0..], order_scratch[0..]);
-            var is_dup: [input_count]bool = [_]bool{false} ** input_count;
+            var is_dup: [input_count]bool = @splat(false);
             var run: usize = 0;
             while (run < input_count) {
                 var run_end: usize = run + 1;
@@ -1255,7 +1255,7 @@ pub fn ECS(comptime sets: anytype) type {
                 run = run_end;
             }
             var arch_types: [input_count][max_len]type = undefined;
-            var arch_lens: [input_count]usize = [_]usize{0} ** input_count;
+            var arch_lens: [input_count]usize = @splat(0);
             var uniq_count: usize = 0;
             for (0..input_count) |i| {
                 if (is_dup[i]) {
@@ -1344,7 +1344,7 @@ pub fn ECS(comptime sets: anytype) type {
         /// owns `flat[offsets[c]..offsets[c]+lens[c]]`.
         const CompArchetypes = blk: {
             @setEvalBranchQuota(10_000_000);
-            var lens: [input_count * max_len]usize = [_]usize{0} ** (input_count * max_len);
+            var lens: [input_count * max_len]usize = @splat(0);
             for (0..ARCH_COUNT) |a| {
                 for (Tables.arch_comp[a][0..Tables.arch_lens[a]]) |c| {
                     lens[c] += 1;
@@ -1358,7 +1358,7 @@ pub fn ECS(comptime sets: anytype) type {
             }
             offsets[component_count] = acc;
             var flat: [input_count * max_len]u32 = undefined;
-            var cursors: [input_count * max_len]usize = [_]usize{0} ** (input_count * max_len);
+            var cursors: [input_count * max_len]usize = @splat(0);
             for (0..component_count) |c| {
                 cursors[c] = offsets[c];
             }
@@ -1500,7 +1500,7 @@ pub fn ECS(comptime sets: anytype) type {
             }
             if (Info == .@"struct" and Info.@"struct".is_tuple) {
                 var total: usize = 0;
-                for (0..Info.@"struct".fields.len) |i| {
+                for (0..Info.@"struct".field_names.len) |i| {
                     total += countLeafTypes(node[i]);
                 }
                 return total;
@@ -1535,7 +1535,7 @@ pub fn ECS(comptime sets: anytype) type {
             }
             if (Info == .@"struct" and Info.@"struct".is_tuple) {
                 var cursor: usize = start;
-                for (0..Info.@"struct".fields.len) |i| {
+                for (0..Info.@"struct".field_names.len) |i| {
                     cursor = collectLeafTypes(node[i], buf, cursor);
                 }
                 return cursor;
@@ -1824,7 +1824,7 @@ pub fn ECS(comptime sets: anytype) type {
                 if (self.elem_size == 0) {
                     return;
                 }
-                self.bytes = self.bytes.ptr[0..(row_count + 1) * self.elem_size];
+                self.bytes = self.bytes.ptr[0 .. (row_count + 1) * self.elem_size];
             }
             /// Shrinks the live length by one row. `row_count` is the count
             /// before popping.
@@ -1832,7 +1832,7 @@ pub fn ECS(comptime sets: anytype) type {
                 if (self.elem_size == 0) {
                     return;
                 }
-                self.bytes = self.bytes.ptr[0..(row_count - 1) * self.elem_size];
+                self.bytes = self.bytes.ptr[0 .. (row_count - 1) * self.elem_size];
             }
             /// Copies one row inside the column.
             fn copyRow(self: *const Column, src_row: u32, dst_row: u32) void {
@@ -1850,7 +1850,7 @@ pub fn ECS(comptime sets: anytype) type {
                 if (self.cap_rows > 0 and self.elem_size > 0) {
                     const align_val = std.mem.Alignment.fromByteUnits(self.alignment);
                     allocator.rawFree(
-                        self.bytes.ptr[0..self.cap_rows * self.elem_size],
+                        self.bytes.ptr[0 .. self.cap_rows * self.elem_size],
                         align_val,
                         @returnAddress(),
                     );
@@ -1877,7 +1877,7 @@ pub fn ECS(comptime sets: anytype) type {
             depth_zones: std.ArrayListUnmanaged(DepthZone) = .empty,
             /// Fixed backing for component columns; only `columns[0..len]`
             /// is valid. Comptime generation sets `len` and metadata.
-            columns: [MAX_COLS]Column = [_]Column{.{}} ** MAX_COLS,
+            columns: [MAX_COLS]Column = @splat(.{}),
             /// Number of valid entries in `columns`.
             len: usize = 0,
             /// Owning archetype id. Used for debug checks and typed lookup.
@@ -1890,9 +1890,9 @@ pub fn ECS(comptime sets: anytype) type {
             entity_enabled_count: u32 = 0,
             /// Enabled bit per row per component column. Only
             /// `comp_enabled[0..len]` is valid, aligned with `columns`.
-            comp_enabled: [MAX_COLS]std.ArrayListUnmanaged(u64) = [_]std.ArrayListUnmanaged(u64){.empty} ** MAX_COLS,
+            comp_enabled: [MAX_COLS]std.ArrayListUnmanaged(u64) = @splat(.empty),
             /// Cached popcounts, one per valid component column.
-            comp_enabled_counts: [MAX_COLS]u32 = [_]u32{0} ** MAX_COLS,
+            comp_enabled_counts: [MAX_COLS]u32 = @splat(0),
             /// Live component columns.
             fn cols(self: *Self) []Column {
                 return self.columns[0..self.len];
@@ -2137,7 +2137,7 @@ pub fn ECS(comptime sets: anytype) type {
                         },
                     }
                 }
-                    for (col_ids) |col| {
+                for (col_ids) |col| {
                     switch (self.compEnableState(col)) {
                         .all_enabled => all_off = false,
                         .all_disabled => all_on = false,
@@ -2185,7 +2185,7 @@ pub fn ECS(comptime sets: anytype) type {
                             continue;
                         }
                     }
-                for (col_ids) |col| {
+                    for (col_ids) |col| {
                         const words = self.comp_enabled[col].items;
                         const w: u64 = if (wi < words.len) words[wi] else 0;
                         cand &= if (want_enabled) w else ~w;
@@ -2437,7 +2437,7 @@ pub fn ECS(comptime sets: anytype) type {
                 const n = self.refs.items.len;
                 var i: usize = 0;
                 var new_entity_count: u32 = 0;
-                var new_comp_counts: [MAX_COLS]u32 = [_]u32{0} ** MAX_COLS;
+                var new_comp_counts: [MAX_COLS]u32 = @splat(0);
                 while (i < n) : (i += 1) {
                     if (stamps[self.refs.items[i].id] == epoch) {
                         continue;
@@ -2725,7 +2725,7 @@ pub fn ECS(comptime sets: anytype) type {
                 const old_n: usize = self.refs.items.len;
                 const old_last: u32 = @intCast(old_n - 1);
                 const last_entity_bit = enabledBitGet(self.entity_enabled.items, old_last);
-                var last_comp_bits: [MAX_COLS]bool = [_]bool{false} ** MAX_COLS;
+                var last_comp_bits: [MAX_COLS]bool = @splat(false);
                 for (0..self.len) |ci| {
                     last_comp_bits[ci] = enabledBitGet(self.comp_enabled[ci].items, old_last);
                 }
@@ -3114,7 +3114,7 @@ pub fn ECS(comptime sets: anytype) type {
         /// Occupancy bits, one per archetype: 1 means the storage holds at
         /// least one row, 0 means empty. Dense (`512` flags per cache line)
         /// so `nonEmptyPages()` filters without touching scattered headers.
-        var archetype_nonempty_bits: [ARCH_WORDS]u64 = [_]u64{0} ** ARCH_WORDS;
+        var archetype_nonempty_bits: [ARCH_WORDS]u64 = @splat(0);
         /// Checks the occupancy bit of one archetype.
         /// - `arch_id` - archetype id, an index into `archetypes`.
         ///
@@ -3955,7 +3955,7 @@ pub fn ECS(comptime sets: anytype) type {
                 // Snapshot enabled flags before the raw moves: the entity flag
                 // always travels, shared component flags travel with `copy`.
                 const src_entity_bit = ArchetypeStorage.enabledBitGet(Ecs.storages[src_id].entity_enabled.items, src_row);
-                var src_comp_bits: [MAX_COLS]bool = [_]bool{true} ** MAX_COLS;
+                var src_comp_bits: [MAX_COLS]bool = @splat(true);
                 {
                     const src_st = &Ecs.storages[src_id];
                     const limit = @min(src_st.len, MAX_COLS);
@@ -4332,7 +4332,7 @@ pub fn ECS(comptime sets: anytype) type {
                 /// `cols[qi]` is the position in `storages[arch_id].columns`
                 /// of `query[qi]`. Filled once in comptime by
                 /// `PagesContainer`, so `get` needs no binary search.
-                cols: [query.len]u32 = [_]u32{0} ** query.len,
+                cols: [query.len]u32 = @splat(0),
                 /// Returns the whole mutable column of one component via the
                 /// precomputed map: comptime query position plus one runtime
                 /// array load, no search and no indirect call.
@@ -8195,7 +8195,7 @@ pub fn ECS(comptime sets: anytype) type {
                 const query = comptime canonicalQuery(bundle);
                 const cols = comptime blk: {
                     @setEvalBranchQuota(10_000_000);
-                    var tmp: [query.len]u32 = [_]u32{0} ** query.len;
+                    var tmp: [query.len]u32 = @splat(0);
                     for (query, 0..) |T, qi| {
                         const qid: u32 = @intCast(componentIndex(T).?);
                         const ids = Tables.arch_comp[arch][0..Tables.arch_lens[arch]];
@@ -9408,9 +9408,9 @@ pub fn ECS(comptime sets: anytype) type {
         ///
         /// Returns `usize` - field index inside the values tuple.
         fn valuesFieldIndex(comptime V: type, comptime T: type) usize {
-            const fields = @typeInfo(V).@"struct".fields;
-            inline for (0..fields.len) |j| {
-                if (fields[j].type == T) {
+            const field_types = @typeInfo(V).@"struct".field_types;
+            inline for (0..field_types.len) |j| {
+                if (field_types[j] == T) {
                     return j;
                 }
             }
@@ -9434,14 +9434,14 @@ pub fn ECS(comptime sets: anytype) type {
                 if (VInfo != .@"struct" or !VInfo.@"struct".is_tuple) {
                     @compileError("values must be a tuple of component values matching the bundle.");
                 }
-                if (VInfo.@"struct".fields.len != Ar) {
+                if (VInfo.@"struct".field_names.len != Ar) {
                     @compileError("values count must match the bundle component count.");
                 }
                 for (0..Ar) |i| {
                     const T = Tables.arch_types[arch][i];
                     var found: usize = 0;
-                    for (0..VInfo.@"struct".fields.len) |j| {
-                        const FT = VInfo.@"struct".fields[j].type;
+                    for (0..VInfo.@"struct".field_names.len) |j| {
+                        const FT = VInfo.@"struct".field_types[j];
                         if (FT == type) {
                             @compileError("values must hold component values, not types.");
                         }
@@ -9727,17 +9727,17 @@ pub fn ECS(comptime sets: anytype) type {
             if (info != .@"struct" or !info.@"struct".is_tuple) {
                 @compileError("Schedule expects a tuple of system functions.");
             }
-            for (0..info.@"struct".fields.len) |i| {
+            for (0..info.@"struct".field_names.len) |i| {
                 const S = @TypeOf(systems[i]);
                 const finfo = @typeInfo(S);
                 if (finfo != .@"fn") {
                     @compileError("Every schedule entry must be a system function.");
                 }
                 const Fn = finfo.@"fn";
-                if (Fn.params.len != 1) {
+                if (Fn.param_types.len != 1) {
                     @compileError("Every system must take exactly one *SystemHandler parameter.");
                 }
-                const P = Fn.params[0].type orelse
+                const P = Fn.param_types[0] orelse
                     @compileError("System parameter type must be known.");
                 if (P != *SystemHandler) {
                     @compileError("Every system must take exactly one *SystemHandler parameter.");
@@ -11457,7 +11457,7 @@ test "discard rolls back reserved slots" {
             try std.testing.expect(h.count(&[_]type{Pos}, null) == 1);
         }
     };
-    const Failing = Ecs.Schedule(.{ S.spawn_then_fail });
+    const Failing = Ecs.Schedule(.{S.spawn_then_fail});
     const Recovery = Ecs.Schedule(.{ S.retry, S.verify });
     const allocator = std.testing.allocator;
     defer Ecs.deinit(allocator);
@@ -11499,7 +11499,7 @@ test "discard returns recycled reservations to the free list" {
     // its recycled slot.
     const a = try Ecs.create(allocator, &[_]type{Pos});
     try a.destroy(allocator);
-    const Failing = Ecs.Schedule(.{ S.reserve_then_fail });
+    const Failing = Ecs.Schedule(.{S.reserve_then_fail});
     const Recovery = Ecs.Schedule(.{ S.retry, S.verify });
     try std.testing.expectError(CustomError.Boom, Failing.run(allocator));
     try Recovery.run(allocator);
@@ -11741,7 +11741,7 @@ test "migrating an entity moves its events" {
             try std.testing.expect(pages[0].valueAt(0).amount == 9);
             const filtered = h.filterEvents(Damage, &[_]type{Pos}, null);
             try std.testing.expect(filtered.len == 1);
-            const missing = h.filterEvents(Damage, &[_]type{Pos, Vel}, null);
+            const missing = h.filterEvents(Damage, &[_]type{ Pos, Vel }, null);
             try std.testing.expect(missing.len == 0);
             // The pre-migrate handle is invalidated by the generation bump.
             try std.testing.expectError(
@@ -13909,7 +13909,7 @@ test "enabled bitmap nextEntityId iterates mixed rows" {
     try std.testing.expect(page.nextEntityId(4, null, .disabled) == null);
 }
 test "enabled bitmap nextComponentId is per-component" {
-    const E = ECS(.{ .{ Pos, Vel } });
+    const E = ECS(.{.{ Pos, Vel }});
     const allocator = std.testing.allocator;
     defer E.deinit(allocator);
     const handler = E.SystemHandler{ .allocator = allocator };
@@ -14159,7 +14159,7 @@ test "enabled bits survive bulk batch commands" {
     try App.run(allocator);
 }
 test "nextComponentsId matches conjunction of component bits" {
-    const E = ECS(.{ .{ Pos, Vel, Health } });
+    const E = ECS(.{.{ Pos, Vel, Health }});
     const allocator = std.testing.allocator;
     defer E.deinit(allocator);
     const handler = E.SystemHandler{ .allocator = allocator };

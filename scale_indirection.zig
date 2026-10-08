@@ -9,7 +9,7 @@ const Move = struct { dx: f32 = 0, dy: f32 = 0 };
 const Ecs = ecs_module.ECS(.{.{ Position, MoveSpeed }});
 
 const N_ENTITIES: u32 = 100_000;
-const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
+const REPS: usize = if (builtin.mode == .debug) 2 else 3;
 
 // Single offset applied to every entity by the direct pass.
 const CDX: f32 = 2.0;

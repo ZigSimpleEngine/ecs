@@ -6,12 +6,12 @@ const Pos = struct { x: f32 = 0, y: f32 = 0 };
 
 const EcsFlat = ecs_module.ECS(.{.{Pos}});
 
-const Ns: []const usize = if (builtin.mode == .Debug)
+const Ns: []const usize = if (builtin.mode == .debug)
     &.{ 500, 1000, 2000 }
 else
     &.{ 10000, 25000, 50000, 100000 };
 
-const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
+const REPS: usize = if (builtin.mode == .debug) 2 else 3;
 
 fn benchIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();

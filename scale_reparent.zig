@@ -6,12 +6,12 @@ const Pos = struct { x: f32 = 0, y: f32 = 0 };
 
 const EcsR = ecs_module.ECS(.{.{Pos}});
 
-const Ns: []const usize = if (builtin.mode == .Debug)
+const Ns: []const usize = if (builtin.mode == .debug)
     &.{ 500, 1000, 2000 }
 else
     &.{ 10000, 25000, 50000, 100000 };
 
-const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
+const REPS: usize = if (builtin.mode == .debug) 2 else 3;
 
 fn benchIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -177,7 +177,7 @@ test "bench S15b: reparent-subtree depth shift at max N (singles)" {
 test "bench S15c: reparent deep-chain single vs batch" {
     const allocator = std.testing.allocator;
     defer EcsR.deinit(allocator);
-    const depth_links: u32 = if (builtin.mode == .Debug) 128 else 2048;
+    const depth_links: u32 = if (builtin.mode == .debug) 128 else 2048;
     const S = struct {
         const S = @This();
         var root: EcsR.EntityReference = undefined;

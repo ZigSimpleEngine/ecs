@@ -18,14 +18,14 @@ const Ecs4 = ecs_module.ECS(.{
 });
 
 // Smaller ladder in Debug: low per-op constants dominate there.
-const Ns: []const usize = if (builtin.mode == .Debug)
+const Ns: []const usize = if (builtin.mode == .debug)
     &.{ 500, 1000, 2000 }
 else
     &.{ 10000, 25000, 50000, 100000 };
 
 // Repetitions per scenario: first run is cold (growth, allocator caches),
 // best of the rest is the warm steady state the gate is measured against.
-const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
+const REPS: usize = if (builtin.mode == .debug) 2 else 3;
 
 fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;

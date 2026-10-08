@@ -7,12 +7,12 @@ const Buff = struct { amount: u32 = 0 };
 
 const EcsA = ecs_module.ECS(.{.{Pos}});
 
-const Ns: []const usize = if (builtin.mode == .Debug)
+const Ns: []const usize = if (builtin.mode == .debug)
     &.{ 500, 1000, 2000 }
 else
     &.{ 10000, 25000, 50000, 100000 };
 
-const REPS: usize = if (builtin.mode == .Debug) 2 else 3;
+const REPS: usize = if (builtin.mode == .debug) 2 else 3;
 
 fn benchIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -219,8 +219,7 @@ test "bench S12d: reparent zone moves at max N (one subtree)" {
             // O(N) probe per entity via the slot map; only missing ones queue.
             for (h.pages(&[_]type{Pos}, null).nonEmptyPages()) |page| {
                 for (page.entities()) |e| {
-                    if (h.getAttribute(e, Buff)) |_| {
-                    } else |_| {
+                    if (h.getAttribute(e, Buff)) |_| {} else |_| {
                         try h.cmdSetAttribute(e, Buff, .{ .amount = 1 });
                     }
                 }

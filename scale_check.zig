@@ -1,129 +1,369 @@
-﻿const std = @import("std");
+const std = @import("std");
 const ecs_module = @import("src/ecs.zig");
 
 const Base0 = struct { tag0: u8 = 0 };
 const Base1 = struct { tag1: u8 = 0 };
 
-const C0 = struct { v: u32 = 0, };
-const C1 = struct { v: u32 = 1, };
-const C2 = struct { v: u32 = 2, };
-const C3 = struct { v: u32 = 3, };
-const C4 = struct { v: u32 = 4, };
-const C5 = struct { v: u32 = 5, };
-const C6 = struct { v: u32 = 6, };
-const C7 = struct { v: u32 = 7, };
-const C8 = struct { v: u32 = 8, };
-const C9 = struct { v: u32 = 9, };
-const C10 = struct { v: u32 = 10, };
-const C11 = struct { v: u32 = 11, };
-const C12 = struct { v: u32 = 12, };
-const C13 = struct { v: u32 = 13, };
-const C14 = struct { v: u32 = 14, };
-const C15 = struct { v: u32 = 15, };
-const C16 = struct { v: u32 = 16, };
-const C17 = struct { v: u32 = 17, };
-const C18 = struct { v: u32 = 18, };
-const C19 = struct { v: u32 = 19, };
-const C20 = struct { v: u32 = 20, };
-const C21 = struct { v: u32 = 21, };
-const C22 = struct { v: u32 = 22, };
-const C23 = struct { v: u32 = 23, };
-const C24 = struct { v: u32 = 24, };
-const C25 = struct { v: u32 = 25, };
-const C26 = struct { v: u32 = 26, };
-const C27 = struct { v: u32 = 27, };
-const C28 = struct { v: u32 = 28, };
-const C29 = struct { v: u32 = 29, };
-const C30 = struct { v: u32 = 30, };
-const C31 = struct { v: u32 = 31, };
-const C32 = struct { v: u32 = 32, };
-const C33 = struct { v: u32 = 33, };
-const C34 = struct { v: u32 = 34, };
-const C35 = struct { v: u32 = 35, };
-const C36 = struct { v: u32 = 36, };
-const C37 = struct { v: u32 = 37, };
-const C38 = struct { v: u32 = 38, };
-const C39 = struct { v: u32 = 39, };
-const C40 = struct { v: u32 = 40, };
-const C41 = struct { v: u32 = 41, };
-const C42 = struct { v: u32 = 42, };
-const C43 = struct { v: u32 = 43, };
-const C44 = struct { v: u32 = 44, };
-const C45 = struct { v: u32 = 45, };
-const C46 = struct { v: u32 = 46, };
-const C47 = struct { v: u32 = 47, };
-const C48 = struct { v: u32 = 48, };
-const C49 = struct { v: u32 = 49, };
-const C50 = struct { v: u32 = 50, };
-const C51 = struct { v: u32 = 51, };
-const C52 = struct { v: u32 = 52, };
-const C53 = struct { v: u32 = 53, };
-const C54 = struct { v: u32 = 54, };
-const C55 = struct { v: u32 = 55, };
-const C56 = struct { v: u32 = 56, };
-const C57 = struct { v: u32 = 57, };
-const C58 = struct { v: u32 = 58, };
-const C59 = struct { v: u32 = 59, };
-const C60 = struct { v: u32 = 60, };
-const C61 = struct { v: u32 = 61, };
-const C62 = struct { v: u32 = 62, };
-const C63 = struct { v: u32 = 63, };
-const C64 = struct { v: u32 = 64, };
-const C65 = struct { v: u32 = 65, };
-const C66 = struct { v: u32 = 66, };
-const C67 = struct { v: u32 = 67, };
-const C68 = struct { v: u32 = 68, };
-const C69 = struct { v: u32 = 69, };
-const C70 = struct { v: u32 = 70, };
-const C71 = struct { v: u32 = 71, };
-const C72 = struct { v: u32 = 72, };
-const C73 = struct { v: u32 = 73, };
-const C74 = struct { v: u32 = 74, };
-const C75 = struct { v: u32 = 75, };
-const C76 = struct { v: u32 = 76, };
-const C77 = struct { v: u32 = 77, };
-const C78 = struct { v: u32 = 78, };
-const C79 = struct { v: u32 = 79, };
-const C80 = struct { v: u32 = 80, };
-const C81 = struct { v: u32 = 81, };
-const C82 = struct { v: u32 = 82, };
-const C83 = struct { v: u32 = 83, };
-const C84 = struct { v: u32 = 84, };
-const C85 = struct { v: u32 = 85, };
-const C86 = struct { v: u32 = 86, };
-const C87 = struct { v: u32 = 87, };
-const C88 = struct { v: u32 = 88, };
-const C89 = struct { v: u32 = 89, };
-const C90 = struct { v: u32 = 90, };
-const C91 = struct { v: u32 = 91, };
-const C92 = struct { v: u32 = 92, };
-const C93 = struct { v: u32 = 93, };
-const C94 = struct { v: u32 = 94, };
-const C95 = struct { v: u32 = 95, };
-const C96 = struct { v: u32 = 96, };
-const C97 = struct { v: u32 = 97, };
-const C98 = struct { v: u32 = 98, };
-const C99 = struct { v: u32 = 99, };
-const C100 = struct { v: u32 = 100, };
-const C101 = struct { v: u32 = 101, };
-const C102 = struct { v: u32 = 102, };
-const C103 = struct { v: u32 = 103, };
-const C104 = struct { v: u32 = 104, };
-const C105 = struct { v: u32 = 105, };
-const C106 = struct { v: u32 = 106, };
-const C107 = struct { v: u32 = 107, };
-const C108 = struct { v: u32 = 108, };
-const C109 = struct { v: u32 = 109, };
-const C110 = struct { v: u32 = 110, };
-const C111 = struct { v: u32 = 111, };
-const C112 = struct { v: u32 = 112, };
-const C113 = struct { v: u32 = 113, };
-const C114 = struct { v: u32 = 114, };
-const C115 = struct { v: u32 = 115, };
-const C116 = struct { v: u32 = 116, };
-const C117 = struct { v: u32 = 117, };
-const C118 = struct { v: u32 = 118, };
-const C119 = struct { v: u32 = 119, };
+const C0 = struct {
+    v: u32 = 0,
+};
+const C1 = struct {
+    v: u32 = 1,
+};
+const C2 = struct {
+    v: u32 = 2,
+};
+const C3 = struct {
+    v: u32 = 3,
+};
+const C4 = struct {
+    v: u32 = 4,
+};
+const C5 = struct {
+    v: u32 = 5,
+};
+const C6 = struct {
+    v: u32 = 6,
+};
+const C7 = struct {
+    v: u32 = 7,
+};
+const C8 = struct {
+    v: u32 = 8,
+};
+const C9 = struct {
+    v: u32 = 9,
+};
+const C10 = struct {
+    v: u32 = 10,
+};
+const C11 = struct {
+    v: u32 = 11,
+};
+const C12 = struct {
+    v: u32 = 12,
+};
+const C13 = struct {
+    v: u32 = 13,
+};
+const C14 = struct {
+    v: u32 = 14,
+};
+const C15 = struct {
+    v: u32 = 15,
+};
+const C16 = struct {
+    v: u32 = 16,
+};
+const C17 = struct {
+    v: u32 = 17,
+};
+const C18 = struct {
+    v: u32 = 18,
+};
+const C19 = struct {
+    v: u32 = 19,
+};
+const C20 = struct {
+    v: u32 = 20,
+};
+const C21 = struct {
+    v: u32 = 21,
+};
+const C22 = struct {
+    v: u32 = 22,
+};
+const C23 = struct {
+    v: u32 = 23,
+};
+const C24 = struct {
+    v: u32 = 24,
+};
+const C25 = struct {
+    v: u32 = 25,
+};
+const C26 = struct {
+    v: u32 = 26,
+};
+const C27 = struct {
+    v: u32 = 27,
+};
+const C28 = struct {
+    v: u32 = 28,
+};
+const C29 = struct {
+    v: u32 = 29,
+};
+const C30 = struct {
+    v: u32 = 30,
+};
+const C31 = struct {
+    v: u32 = 31,
+};
+const C32 = struct {
+    v: u32 = 32,
+};
+const C33 = struct {
+    v: u32 = 33,
+};
+const C34 = struct {
+    v: u32 = 34,
+};
+const C35 = struct {
+    v: u32 = 35,
+};
+const C36 = struct {
+    v: u32 = 36,
+};
+const C37 = struct {
+    v: u32 = 37,
+};
+const C38 = struct {
+    v: u32 = 38,
+};
+const C39 = struct {
+    v: u32 = 39,
+};
+const C40 = struct {
+    v: u32 = 40,
+};
+const C41 = struct {
+    v: u32 = 41,
+};
+const C42 = struct {
+    v: u32 = 42,
+};
+const C43 = struct {
+    v: u32 = 43,
+};
+const C44 = struct {
+    v: u32 = 44,
+};
+const C45 = struct {
+    v: u32 = 45,
+};
+const C46 = struct {
+    v: u32 = 46,
+};
+const C47 = struct {
+    v: u32 = 47,
+};
+const C48 = struct {
+    v: u32 = 48,
+};
+const C49 = struct {
+    v: u32 = 49,
+};
+const C50 = struct {
+    v: u32 = 50,
+};
+const C51 = struct {
+    v: u32 = 51,
+};
+const C52 = struct {
+    v: u32 = 52,
+};
+const C53 = struct {
+    v: u32 = 53,
+};
+const C54 = struct {
+    v: u32 = 54,
+};
+const C55 = struct {
+    v: u32 = 55,
+};
+const C56 = struct {
+    v: u32 = 56,
+};
+const C57 = struct {
+    v: u32 = 57,
+};
+const C58 = struct {
+    v: u32 = 58,
+};
+const C59 = struct {
+    v: u32 = 59,
+};
+const C60 = struct {
+    v: u32 = 60,
+};
+const C61 = struct {
+    v: u32 = 61,
+};
+const C62 = struct {
+    v: u32 = 62,
+};
+const C63 = struct {
+    v: u32 = 63,
+};
+const C64 = struct {
+    v: u32 = 64,
+};
+const C65 = struct {
+    v: u32 = 65,
+};
+const C66 = struct {
+    v: u32 = 66,
+};
+const C67 = struct {
+    v: u32 = 67,
+};
+const C68 = struct {
+    v: u32 = 68,
+};
+const C69 = struct {
+    v: u32 = 69,
+};
+const C70 = struct {
+    v: u32 = 70,
+};
+const C71 = struct {
+    v: u32 = 71,
+};
+const C72 = struct {
+    v: u32 = 72,
+};
+const C73 = struct {
+    v: u32 = 73,
+};
+const C74 = struct {
+    v: u32 = 74,
+};
+const C75 = struct {
+    v: u32 = 75,
+};
+const C76 = struct {
+    v: u32 = 76,
+};
+const C77 = struct {
+    v: u32 = 77,
+};
+const C78 = struct {
+    v: u32 = 78,
+};
+const C79 = struct {
+    v: u32 = 79,
+};
+const C80 = struct {
+    v: u32 = 80,
+};
+const C81 = struct {
+    v: u32 = 81,
+};
+const C82 = struct {
+    v: u32 = 82,
+};
+const C83 = struct {
+    v: u32 = 83,
+};
+const C84 = struct {
+    v: u32 = 84,
+};
+const C85 = struct {
+    v: u32 = 85,
+};
+const C86 = struct {
+    v: u32 = 86,
+};
+const C87 = struct {
+    v: u32 = 87,
+};
+const C88 = struct {
+    v: u32 = 88,
+};
+const C89 = struct {
+    v: u32 = 89,
+};
+const C90 = struct {
+    v: u32 = 90,
+};
+const C91 = struct {
+    v: u32 = 91,
+};
+const C92 = struct {
+    v: u32 = 92,
+};
+const C93 = struct {
+    v: u32 = 93,
+};
+const C94 = struct {
+    v: u32 = 94,
+};
+const C95 = struct {
+    v: u32 = 95,
+};
+const C96 = struct {
+    v: u32 = 96,
+};
+const C97 = struct {
+    v: u32 = 97,
+};
+const C98 = struct {
+    v: u32 = 98,
+};
+const C99 = struct {
+    v: u32 = 99,
+};
+const C100 = struct {
+    v: u32 = 100,
+};
+const C101 = struct {
+    v: u32 = 101,
+};
+const C102 = struct {
+    v: u32 = 102,
+};
+const C103 = struct {
+    v: u32 = 103,
+};
+const C104 = struct {
+    v: u32 = 104,
+};
+const C105 = struct {
+    v: u32 = 105,
+};
+const C106 = struct {
+    v: u32 = 106,
+};
+const C107 = struct {
+    v: u32 = 107,
+};
+const C108 = struct {
+    v: u32 = 108,
+};
+const C109 = struct {
+    v: u32 = 109,
+};
+const C110 = struct {
+    v: u32 = 110,
+};
+const C111 = struct {
+    v: u32 = 111,
+};
+const C112 = struct {
+    v: u32 = 112,
+};
+const C113 = struct {
+    v: u32 = 113,
+};
+const C114 = struct {
+    v: u32 = 114,
+};
+const C115 = struct {
+    v: u32 = 115,
+};
+const C116 = struct {
+    v: u32 = 116,
+};
+const C117 = struct {
+    v: u32 = 117,
+};
+const C118 = struct {
+    v: u32 = 118,
+};
+const C119 = struct {
+    v: u32 = 119,
+};
 
 const Ecs = ecs_module.ECS(.{
     .{ Base0, Base1, C0, C0 },
@@ -1148,14 +1388,24 @@ test "scale: seeded matching equals brute force" {
         const has_b1 = Ecs.hasComponent(id, b1);
         const has_c0 = Ecs.hasComponent(id, c0);
         const has_c1 = Ecs.hasComponent(id, c1);
-        if (has_b0) { expect_all += 1; }
-        if (has_c0) { expect_c0 += 1; }
-        if (has_c0 and has_c1) { expect_c0c1 += 1; }
-        if (has_b0 and !has_b1) { expect_nobase1 += 1; }
+        if (has_b0) {
+            expect_all += 1;
+        }
+        if (has_c0) {
+            expect_c0 += 1;
+        }
+        if (has_c0 and has_c1) {
+            expect_c0c1 += 1;
+        }
+        if (has_b0 and !has_b1) {
+            expect_nobase1 += 1;
+        }
     }
     const all = handler.pages(&[_]type{Base0}, null).allPages();
     try std.testing.expect(all.len == expect_all);
-    for (all[1..], 1..) |p, i| { try std.testing.expect(all[i - 1].arch_id < p.arch_id); }
+    for (all[1..], 1..) |p, i| {
+        try std.testing.expect(all[i - 1].arch_id < p.arch_id);
+    }
     try std.testing.expect(handler.pages(&[_]type{C0}, null).allPages().len == expect_c0);
     try std.testing.expect(handler.pages(&[_]type{ C0, C1 }, null).allPages().len == expect_c0c1);
     try std.testing.expect(handler.pages(&[_]type{Base0}, &[_]type{Base1}).allPages().len == expect_nobase1);
@@ -1169,5 +1419,5 @@ test "scale: seeded matching equals brute force" {
     };
     try Ecs.Schedule(.{S.spawn}).run(allocator);
     try std.testing.expect(handler.pages(&[_]type{Base0}, null).nonEmptyPages().len == 3);
-    try std.testing.expect(handler.pages(&[_]type{ C1 }, null).nonEmptyPages().len == 1);
+    try std.testing.expect(handler.pages(&[_]type{C1}, null).nonEmptyPages().len == 1);
 }
